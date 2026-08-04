@@ -1,0 +1,31 @@
+name = "ltx-credits-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# D1 database (create via: wrangler d1 create ltx-credits, then paste the database_id)
+[[d1_databases]]
+binding = "DB"
+database_name = "ltx-credits"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Plain-text vars (non-secret). Secrets (API keys) go in `wrangler secret put`.
+[vars]
+ALLOWED_ORIGIN = "*"
+
+# ---------------------------------------------------------------------------
+# Environment variable reference (set these as secrets with `wrangler secret put <NAME>`):
+#   STRIPE_SECRET_KEY        sk_test_... / sk_live_...
+#   STRIPE_WEBHOOK_SECRET    whsec_...  (from Stripe dashboard -> Webhooks)
+#   STRIPE_TIERS             JSON tiers: [{"creditsCents":1000,"feeCents":100}, ...]
+#   PYMTHOUSE_BASE_URL       e.g. https://<app>.pymthouse.example  (no trailing slash)
+#   PYMTHOUSE_PUBLIC_CLIENT_ID   app_...
+#   PYMTHOUSE_M2M_CLIENT_ID      m2m_...
+#   PYMTHOUSE_M2M_CLIENT_SECRET  pmth_cs_...
+#   PLATFORM_API_KEY         shared key the desktop sends as `Authorization: Bearer <key>`
+#   RESEND_API_KEY           email delivery (or Mailgun/SES)
+#   EMAIL_FROM               sender address, e.g. credits@yourdomain.com
+#   WEBHOOK_SECRET           (Phase B) DMZ shared secret for POST /authorize
+# ---------------------------------------------------------------------------
