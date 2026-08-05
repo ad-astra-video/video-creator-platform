@@ -56,15 +56,29 @@ grants exactly the **credit** amount (never the fee).
 
 ---
 
-## Prerequisites — gather these first
+## Prerequisites
 
-You need the **Stripe and PymtHouse accounts before any secret can be set**, so set those up
-early (steps 3–4) and have them handy:
+### 1. Accounts — create these FIRST
 
-1. Node.js ≥ 20 (dev on 24), pnpm, and a **Cloudflare account**.
-2. A **Stripe** account (test mode to start) — gives you a secret key + webhook secret.
-3. A **PymtHouse** app (Builder) with its client pair — gives you the base URL + M2M credentials.
-4. A **Resend** account (or swap `src/recovery.ts` for Mailgun/SES).
+Create these accounts **before doing anything else** — you can't configure the worker until you
+have the credentials each one provides:
+
+| # | Account | What it's for | Credentials you'll need from it |
+|---|---|---|---|
+| 1 | **Cloudflare** — dash.cloudflare.com | hosts the Worker + D1 database | your account login (for `wrangler login`) |
+| 2 | **Stripe** — dashboard.stripe.com (test mode to start) | collects the top-up + platform fee | **secret key** (`sk_test_…`) and **webhook signing secret** (`whsec_…`) |
+| 3 | **PymtHouse** — register a Builder app | allowance ledger + remote signer | **base URL** (`https://<app>.pymthouse.example`) + **M2M client pair** (`app_…`, `m2m_…`, `pmth_cs_…`) |
+| 4 | **Resend** *(optional)* — resend.com | sends recovery codes by email | API key (`re_…`) — or swap `src/recovery.ts` for Mailgun/SES |
+
+### 2. Technical requirements
+
+Install these on your machine before the "Stand-up" section below:
+
+- **Node.js ≥ 20** (developed on 24)
+- **pnpm** package manager
+- **git** (you're in a git repo already)
+
+That's it — no other tooling. `wrangler` is installed as a project dev-dependency, not globally.
 
 ---
 
@@ -91,19 +105,22 @@ platform/
 
 ## Stand-up (step by step)
 
+> Assumes the three **accounts** (Cloudflare, Stripe, PymtHouse) from "Prerequisites →
+> Accounts" already exist, and Node/pnpm are installed. Each step names which account it uses.
+
 ### 1. Install
 ```bash
 cd platform
 pnpm install                 # first run: approve build scripts if prompted
 ```
 
-### 2. Create the D1 database
+### 2. Create the D1 database (uses your **Cloudflare** account)
 ```bash
 pnpm d1:list                 # or: wrangler d1 create ltx-credits
 ```
 Copy the returned `database_id` into `wrangler.toml` under `[[d1_databases]]`.
 
-### 3. Set up PymtHouse (get your client pair)
+### 3. Configure PymtHouse (uses the account from Prerequisites — you already have the client pair)
 - Register a **Builder** app. You get a public `app_…` client (no secret) and a confidential
   `m2m_…` client (+ `pmth_cs_…` secret). Keep the M2M secret **only** in the Worker.
 - Scopes: public client `sign:job` (+ `users:token` for per-user billing); M2M `users:read`,
@@ -114,12 +131,27 @@ Copy the returned `database_id` into `wrangler.toml` under `[[d1_databases]]`.
   ```
 - Note `PYMTHOUSE_BASE_URL` (e.g. `https://<app>.pymthouse.example`).
 
-### 4. Set up Stripe (get keys + webhook secret)
+### 4. Configure Stripe (uses the account from Prerequisites)
 - Grab a **secret key** (`sk_test_…` / `sk_live_…`) from Developers → API keys.
 - **Create the webhook before setting secrets** — add endpoint
   `https://<your-worker>.workers.dev/webhook/stripe`, select the **`checkout.session.completed`**
   event, and copy the signing secret (`whsec_…`) — you'll need it in step 5.
-- The Stripe dashboard's "Send test webhook" is also how you'll exercise the grant locally.
+
+**Charging the platform fee — nothing else is needed.** The fee is *not* a separate Stripe
+mechanism. `/checkout` charges **credits + fee as one amount** (e.g. $11.00 for the $10 tier)
+through a plain `payment` mode Checkout Session with an inline `price_data` line item. Since you
+are **the merchant** (not a platform routing money to connected Stripe accounts), there is **no
+Stripe Connect / application-fee setup** — the fee is just part of the single charge, and the
+webhook grants only the credit portion ($10), keeping the $1 fee as your profit.
+
+Optional — none are required for the fee or tiers to work:
+- **Payment methods** — cards are enabled by default; add Apple/Google Pay etc. if you want.
+- **Stripe Tax** — only if you must collect sales tax on digital services (needs an
+  `automatic_tax` param in `src/stripe.ts`); otherwise leave it off.
+- **Live payout** — add a bank/payout method in the dashboard so settled balances reach you
+  (test mode doesn't need this).
+- **Products/Prices** — we use one-off inline `price_data`, so you don't have to pre-create
+  products; create them only if you want cleaner reporting names.
 
 ### 5. Set secrets
 Now that you have real values from steps 3–4, store them:
@@ -194,18 +226,24 @@ Stripe's own dashboard — this table tracks **credits granted** (what flows to 
 ## Local verification
 
 ```bash
-export KEY="<PLATFORM_API_KEY>"
 export BASE="http://localhost:8787"
 
 curl -s "$BASE/health"
-curl -s -H "Authorization: Bearer $KEY" "$BASE/tiers"
-curl -s -H "Authorization: Bearer $KEY" "$BASE/balance?externalUserId=test-1"
+curl -s "$BASE/tiers"
+
+# User routes need a per-user key (see "Per-user keys & the desktop flow"):
+#   PVKEY="<apiKey returned by POST /provision>"
+#   curl -s -H "Authorization: Bearer $PVKEY" "$BASE/balance"
 ```
 
-`POST /webhook/stripe` can be exercised with a **signed** test event by exporting it from the
-Stripe dashboard → Webhooks → "Send test webhook" against your dev URL, then confirming the
-credit lands in PymtHouse (`/usage` / `/balance`). The handler grants only `credit_usd_micros`
-and is idempotent by Stripe `event.id`.
+`POST /webhook/stripe` can be exercised two ways:
+- **Local dev:** `stripe listen --forward-to localhost:8787/webhook/stripe` (Stripe CLI) forwards
+  live test events to your running worker, then complete a test checkout (`4242 4242 4242 4242`).
+- **Deployed:** Stripe dashboard → Webhooks → "Send test webhook" against your worker URL.
+
+In both cases confirm the credit lands in PymtHouse (`/usage` / `/balance`) and that `/admin/payments`
+shows the `topup` row. The handler grants only `credit_usd_micros` and is idempotent by
+Stripe `event.id`.
 
 ---
 
