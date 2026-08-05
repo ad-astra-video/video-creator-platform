@@ -1,8 +1,8 @@
 {
-  "name": "video-creator",
+  "name": "video-creator-platform",
   "version": "0.1.0",
   "private": true,
-  "description": "Serverless credits + platform-fee backend for LTX-Desktop (Stripe checkout -> PymtHouse allowance -> deposit-to-inference)",
+  "description": "Serverless credits + platform-fee backend for the Video Creator desktop app (Stripe checkout -> PymtHouse allowance -> deposit-to-inference)",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

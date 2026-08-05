@@ -1,9 +1,8 @@
-# Video Creator — Serverless Backend
+# Video Creator Platform — Serverless Backend
 
-The **serverless** backend for the **Video Creator** desktop app — a fork of Livepeer's
-**LTX-Desktop** (`../LTX-Desktop`). A single Cloudflare **Worker + D1** that owns all secrets and
-wires services together. **Credits** are the first productized feature, keeping the LTX-Desktop
-deposit-to-inference flow intact:
+The **serverless** backend for the **Video Creator** desktop app (`../video-creator`). A single
+Cloudflare **Worker + D1** that owns all secrets and wires services together. **Credits** are the
+first productized feature, powering the deposit-to-inference flow:
 
 ```
 Video Creator desktop (Electron + Python) ──> this Worker ──> Stripe   (collects top-up + platform fee)
@@ -12,8 +11,7 @@ Video Creator desktop (Electron + Python) ──> this Worker ──> Stripe   (
 
 It does **not** sit in the discovery or inference hot path — it is only hit on deposit/checkout,
 email recovery, job dispatch (minting a signer session), and operator admin. See
-`../ONBOARDING_AND_EXECUTION_PLAN.md` for the full architecture and economics (and the Livepeer
-LTX-Desktop it is forked from).
+`../ONBOARDING_AND_EXECUTION_PLAN.md` for the full architecture and economics.
 
 ---
 
@@ -119,7 +117,7 @@ pnpm install                 # first run: approve build scripts if prompted
 
 ### 2. Create the D1 database (uses your **Cloudflare** account)
 ```bash
-pnpm d1:list                 # or: wrangler d1 create ltx-credits
+pnpm d1:list                 # or: wrangler d1 create video-creator-platform
 ```
 Copy the returned `database_id` into `wrangler.toml` under `[[d1_databases]]`.
 
@@ -265,7 +263,7 @@ Stripe `event.id`.
 
 ## Per-user keys & the desktop flow
 
-What changes for the LTX-Desktop app (vs. a shared key):
+What changes for the Video Creator desktop app (vs. a shared key):
 
 1. **First run:** the Python backend generates a UUID `externalUserId`, then calls
    `POST /provision { externalUserId }` (public) and **stores the returned `apiKey` locally**

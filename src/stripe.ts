@@ -17,7 +17,7 @@ export async function createCheckoutSession(
   params.set("cancel_url", metadata.cancelUrl || "https://example.com/cancel");
   params.append("line_items[0][quantity]", "1");
   params.append("line_items[0][price_data][currency]", "usd");
-  params.append("line_items[0][price_data][product_data][name]", `LTX Credits — $${(tier.creditsCents / 100).toFixed(2)}`);
+  params.append("line_items[0][price_data][product_data][name]", `Video Creator Credits — $${(tier.creditsCents / 100).toFixed(2)}`);
   params.append("line_items[0][price_data][unit_amount]", String(tier.creditsCents + tier.feeCents));
   // Carry the credit amount through so the webhook grants exactly the credits (never the fee).
   for (const [k, v] of Object.entries(metadata)) params.append(`metadata[${k}]`, v);

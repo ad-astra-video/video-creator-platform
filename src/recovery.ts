@@ -6,10 +6,10 @@ import { addMinutesIso, err } from "./utils";
  * Swap this module for Mailgun/SES by replacing `sendEmail` if needed.
  */
 export async function sendCodeEmail(env: Env, to: string, purpose: "link" | "recover", code: string): Promise<Response> {
-  const subject = purpose === "link" ? "Confirm your LTX credits recovery email" : "Your LTX credits recovery code";
+  const subject = purpose === "link" ? "Confirm your Video Creator credits recovery email" : "Your Video Creator credits recovery code";
   const html = `
     <div style="font-family:sans-serif;max-width:480px;margin:auto">
-      <h2>${purpose === "link" ? "Confirm your email" : "Recover your LTX credits"}</h2>
+      <h2>${purpose === "link" ? "Confirm your email" : "Recover your Video Creator credits"}</h2>
       <p>Your one-time code is:</p>
       <p style="font-size:28px;letter-spacing:4px;font-weight:bold">${code}</p>
       <p>It expires in 15 minutes. If you didn't request this, you can ignore this email.</p>
