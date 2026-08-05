@@ -18,6 +18,8 @@ export interface Env {
 
   // Platform auth (shared key the desktop sends as `Authorization: Bearer`)
   PLATFORM_API_KEY: string;
+  // Operator/admin auth (separate, more privileged key; NOT shipped to the desktop)
+  ADMIN_API_KEY: string;
 
   // Email (recovery codes)
   RESEND_API_KEY: string;
@@ -53,6 +55,18 @@ export interface RecoveryCodeRow {
   purpose: string;
   expires_at: string;
   used: number;
+}
+
+export interface PaymentRow {
+  id: number;
+  stripe_event_id: string | null;
+  stripe_session_id: string | null;
+  external_user_id: string;
+  tier_credits_cents: number | null;
+  amount_usd_micros: number;
+  kind: string;
+  reason: string | null;
+  created_at: string;
 }
 
 export interface Balance {

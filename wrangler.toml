@@ -25,6 +25,7 @@ ALLOWED_ORIGIN = "*"
 #   PYMTHOUSE_M2M_CLIENT_ID      m2m_...
 #   PYMTHOUSE_M2M_CLIENT_SECRET  pmth_cs_...
 #   PLATFORM_API_KEY         shared key the desktop sends as `Authorization: Bearer <key>`
+#   ADMIN_API_KEY            operator key for /admin/* (monitoring + manual credit); never ship to desktop
 #   RESEND_API_KEY           email delivery (or Mailgun/SES)
 #   EMAIL_FROM               sender address, e.g. credits@yourdomain.com
 #   WEBHOOK_SECRET           (Phase B) DMZ shared secret for POST /authorize

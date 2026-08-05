@@ -1,4 +1,4 @@
-import type { AccountRow, Env, RecoveryCodeRow } from "./types";
+import type { AccountRow, Env, PaymentRow, RecoveryCodeRow } from "./types";
 import { addMinutesIso, hashSecret, isExpired, nowIso, verifyHash } from "./utils";
 
 /** Upsert an instance account keyed by external_user_id. Returns the row. */
@@ -94,6 +94,53 @@ export async function alreadyApplied(db: D1Database, key: string): Promise<boole
 
 export async function markApplied(db: D1Database, key: string): Promise<void> {
   await db.prepare("INSERT OR IGNORE INTO idempotency (key, applied_at) VALUES (?1, ?2)").bind(key, nowIso()).run();
+}
+
+// ---------------------------------------------------------------------------
+// Payment / credit audit log (monitoring + admin)
+// ---------------------------------------------------------------------------
+
+export type PaymentKind = "topup" | "admin_grant" | "refund";
+
+export interface PaymentLogInput {
+  kind: PaymentKind;
+  externalUserId: string;
+  /** Credits granted in USD micros (never includes the platform fee). */
+  amountUsdMicros: string;
+  stripeEventId?: string;
+  stripeSessionId?: string;
+  tierCreditsCents?: number;
+  reason?: string;
+}
+
+/** Insert one audit row. Called from the Stripe webhook AND admin grants. */
+export async function logPayment(db: D1Database, p: PaymentLogInput): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO payments (stripe_event_id, stripe_session_id, external_user_id, tier_credits_cents, amount_usd_micros, kind, reason)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+    )
+    .bind(
+      p.stripeEventId ?? null,
+      p.stripeSessionId ?? null,
+      p.externalUserId,
+      p.tierCreditsCents ?? null,
+      p.amountUsdMicros,
+      p.kind,
+      p.reason ?? null,
+    )
+    .run();
+}
+
+/** Newest credits first. `sinceIso` filters by created_at (optional). */
+export async function listPayments(db: D1Database, limit = 50): Promise<PaymentRow[]> {
+  const res = await db.prepare("SELECT * FROM payments ORDER BY id DESC LIMIT ?1").bind(limit).all<PaymentRow>();
+  return res.results as PaymentRow[];
+}
+
+export async function listAccounts(db: D1Database, limit = 100): Promise<AccountRow[]> {
+  const res = await db.prepare("SELECT * FROM accounts ORDER BY id DESC LIMIT ?1").bind(limit).all<AccountRow>();
+  return res.results as AccountRow[];
 }
 
 // Re-exported for index.ts convenience
