@@ -11,6 +11,7 @@
     "d1:migrate": "wrangler d1 migrations apply DB --remote",
     "d1:list": "wrangler d1 list",
     "typecheck": "tsc --noEmit",
+    "smoke": "node smoke.mjs",
     "cf-typegen": "wrangler types"
   },
   "devDependencies": {

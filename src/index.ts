@@ -3,7 +3,6 @@ import { PymtHouseClient } from "./pymthouse";
 import {
   consumeRecoveryCode,
   getAccountByEmail,
-  getAccountByExternalUser,
   upsertAccount,
   verifyAccountEmail,
   alreadyApplied,
@@ -12,11 +11,30 @@ import {
   listPayments,
   listAccounts,
   logPayment,
+  createApiKey,
+  getExternalUserByKeyHash,
+  rotateApiKey,
+  revokeApiKey,
+  listApiKeys,
+  setPendingEmail,
+  getPendingEmail,
+  clearPendingEmail,
 } from "./ledger";
 import { sendCodeEmail } from "./recovery";
 import { createCheckoutSession, verifyWebhook } from "./stripe";
 import type { Env } from "./types";
-import { err, generateRecoveryCode, hashSecret, isValidEmail, json, ok, readJson, requireApiKey } from "./utils";
+import {
+  err,
+  generateRecoveryCode,
+  hashSecret,
+  isValidEmail,
+  json,
+  ok,
+  readJson,
+  requireAdminKey,
+  sha256Hex,
+  cryptoRandomHex,
+} from "./utils";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -24,13 +42,10 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // CORS preflight
     if (method === "OPTIONS") return handleOptions(env);
-
-    // Public health
     if (method === "GET" && path === "/health") return ok({ ok: true, ts: Date.now() });
 
-    // Stripe webhook (verified by signature, no API key needed)
+    // Stripe webhook (signature-verified, no API key)
     if (method === "POST" && path === "/webhook/stripe") {
       const raw = await request.text();
       try {
@@ -45,7 +60,7 @@ export default {
       return json({ ok: false, error: "Phase B DMZ /authorize not yet implemented" }, 501);
     }
 
-    // ---- Admin routes: use the ADMIN key independently (never the desktop key) ----
+    // ---- Admin routes: use the ADMIN key independently ----
     if (path.startsWith("/admin/")) {
       try {
         const adminFail = requireAdminKey(request, env);
@@ -54,28 +69,31 @@ export default {
         if (method === "GET" && path === "/admin/users") return await adminUsers(request, env);
         if (method === "GET" && path === "/admin/balance") return await adminBalance(request, env);
         if (method === "POST" && path === "/admin/grant") return await adminGrant(request, env);
+        if (method === "GET" && path === "/admin/api-keys") return await adminApiKeys(env);
+        if (method === "POST" && path === "/admin/revoke-key") return await adminRevokeKey(request, env);
         return err("Not found", 404);
       } catch (e) {
         return err((e as Error).message || "Server error", 500);
       }
     }
 
-    // ---- All routes below require the platform API key ----
-    const authFail = requireApiKey(request, env);
-    if (authFail) return authFail;
+    // ---- Public, identity-free routes ----
+    if (method === "GET" && path === "/tiers") return ok({ tiers: publicTiers(env) });
+    if (method === "POST" && path === "/provision") return await postProvision(request, env);
+    if (method === "POST" && path === "/recover/request") return await postRecoverRequest(request, env);
+    if (method === "POST" && path === "/recover/confirm") return await postRecoverConfirm(request, env);
+
+    // ---- User-key authenticated routes (user resolved FROM the key) ----
+    const user = await authUser(request, env);
+    if (!user) return err("Unauthorized", 401);
 
     try {
-      if (method === "POST" && path === "/checkout") return await postCheckout(request, env);
-      if (method === "GET" && path === "/tiers") return ok({ tiers: publicTiers(env) });
-      if (method === "GET" && path === "/balance") return await getBalance(request, env);
-
-      if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env);
-      if (method === "POST" && path === "/link-email/verify") return await verifyLinkEmail(request, env);
-      if (method === "POST" && path === "/recover/request") return await postRecoverRequest(request, env);
-      if (method === "POST" && path === "/recover/confirm") return await postRecoverConfirm(request, env);
-
-      if (method === "GET" && path === "/usage") return await getUsage(request, env);
-
+      const uid = user.externalUserId;
+      if (method === "POST" && path === "/checkout") return await postCheckout(request, env, uid);
+      if (method === "GET" && path === "/balance") return await getBalance(env, uid);
+      if (method === "GET" && path === "/usage") return await getUsage(env, uid);
+      if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env, uid);
+      if (method === "POST" && path === "/link-email/verify") return await verifyLinkEmail(request, env, uid);
       return err("Not found", 404);
     } catch (e) {
       const msg = (e as Error).message;
@@ -86,64 +104,96 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Auth middleware (per-user key)
 // ---------------------------------------------------------------------------
 
-type CheckoutBody = { externalUserId: string; tier: number; micros?: string; successUrl?: string; cancelUrl?: string };
+async function authUser(req: Request, env: Env): Promise<{ externalUserId: string } | null> {
+  const auth = req.headers.get("authorization") || "";
+  const secret = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!secret || !env.DB) return null;
+  const hash = await sha256Hex(secret);
+  const externalUserId = await getExternalUserByKeyHash(env.DB, hash);
+  return externalUserId ? { externalUserId } : null;
+}
 
-async function postCheckout(request: Request, env: Env): Promise<Response> {
-  const body = await readJson<CheckoutBody>(request);
-  if (!body.externalUserId) return err("externalUserId required", 400);
+// ---------------------------------------------------------------------------
+// Provisioning
+// ---------------------------------------------------------------------------
 
-  // Resolve tier by credits-in-cents (body.tier) OR by credits-in-micros (body.micros).
-  const tier = body.micros ? findTier(env, Math.round(Number(body.micros) / 10000)) : findTier(env, body.tier);
-  if (!tier) return err("Unknown top-up tier", 400);
+type ProvisionBody = { externalUserId: string };
+/** First run of an install: mint a 256-bit per-user key, return it ONCE. */
+async function postProvision(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<ProvisionBody>(request);
+  if (!body?.externalUserId) return err("externalUserId required", 400);
+  if (!env.DB) return err("Server error", 500);
 
   await upsertAccount(env.DB, body.externalUserId);
-  const { url } = await createCheckoutSession(env, body.externalUserId, tier, {
+  const secret = cryptoRandomHex(32); // 64 hex chars, 256 bits
+  const inserted = await createApiKey(env.DB, body.externalUserId, await sha256Hex(secret));
+  if (!inserted) {
+    // Already provisioned — refuse to hand out a new key for this user (prevents
+    // an attacker from seizing a balance by re-provisioning a known UUID).
+    return err("API key already provisioned for this externalUserId; rotate via /recover", 409);
+  }
+  return ok({ apiKey: secret, externalUserId: body.externalUserId });
+}
+
+// ---------------------------------------------------------------------------
+// User handlers
+// ---------------------------------------------------------------------------
+
+type CheckoutBody = { tier?: number; micros?: string; successUrl?: string; cancelUrl?: string };
+async function postCheckout(request: Request, env: Env, externalUserId: string): Promise<Response> {
+  const body = await readJson<CheckoutBody>(request);
+  const tier = body.micros ? findTier(env, Math.round(Number(body.micros) / 10000)) : findTier(env, body.tier ?? NaN);
+  if (!tier) return err("Unknown top-up tier", 400);
+
+  await upsertAccount(env.DB, externalUserId);
+  const { url } = await createCheckoutSession(env, externalUserId, tier, {
     successUrl: body.successUrl || `${new URL(request.url).origin}/success`,
     cancelUrl: body.cancelUrl || `${new URL(request.url).origin}/cancel`,
   });
   return ok({ url });
 }
 
-async function getBalance(request: Request, env: Env): Promise<Response> {
-  const externalUserId = new URL(request.url).searchParams.get("externalUserId") || "";
-  if (!externalUserId) return err("externalUserId required", 400);
-  const client = new PymtHouseClient(env);
-  const balance = await client.getBalance(externalUserId);
-  return ok(balance);
+async function getBalance(env: Env, externalUserId: string): Promise<Response> {
+  return ok(await new PymtHouseClient(env).getBalance(externalUserId));
 }
 
-type LinkEmailBody = { externalUserId: string; email: string };
-async function postLinkEmail(request: Request, env: Env): Promise<Response> {
+async function getUsage(env: Env, externalUserId: string): Promise<Response> {
+  return ok({ externalUserId, balance: await new PymtHouseClient(env).getBalance(externalUserId) });
+}
+
+type LinkEmailBody = { email: string };
+async function postLinkEmail(request: Request, env: Env, externalUserId: string): Promise<Response> {
   const body = await readJson<LinkEmailBody>(request);
-  if (!body.externalUserId || !isValidEmail(body.email || "")) return err("externalUserId and valid email required", 400);
+  if (!body?.email || !isValidEmail(body.email)) return err("valid email required", 400);
   const email = body.email.trim().toLowerCase();
 
-  await upsertAccount(env.DB, body.externalUserId, email);
+  await setPendingEmail(env.DB, externalUserId, email);
   const code = generateRecoveryCode();
-  // Always store + "send" a code; response is generic to prevent enumeration.
   await storeRecoveryCode(env.DB, email, await hashSecret(code), "link");
   await sendCodeEmail(env, email, "link", code);
-  return ok({ ok: true }); // generic
+  return ok({ ok: true });
 }
 
-type VerifyLinkBody = { externalUserId: string; email: string; code: string };
-async function verifyLinkEmail(request: Request, env: Env): Promise<Response> {
+type VerifyLinkBody = { code: string };
+async function verifyLinkEmail(request: Request, env: Env, externalUserId: string): Promise<Response> {
   const body = await readJson<VerifyLinkBody>(request);
-  if (!body.externalUserId || !body.email || !body.code) return err("externalUserId, email and code required", 400);
-  const email = body.email.trim().toLowerCase();
-  const { ok: valid } = await consumeRecoveryCode(env.DB, email, body.code, "link");
+  const pending = await getPendingEmail(env.DB, externalUserId);
+  if (!body?.code || !pending) return err("Invalid or expired code", 400);
+
+  const { ok: valid } = await consumeRecoveryCode(env.DB, pending, body.code, "link");
   if (!valid) return err("Invalid or expired code", 400);
-  await verifyAccountEmail(env.DB, body.externalUserId, email);
-  return ok({ ok: true, email });
+  await verifyAccountEmail(env.DB, externalUserId, pending);
+  await clearPendingEmail(env.DB, externalUserId);
+  return ok({ ok: true, email: pending });
 }
 
 type RecoverRequestBody = { email: string };
 async function postRecoverRequest(request: Request, env: Env): Promise<Response> {
   const body = await readJson<RecoverRequestBody>(request);
-  if (!body.email || !isValidEmail(body.email)) return err("valid email required", 400);
+  if (!body?.email || !isValidEmail(body.email)) return err("valid email required", 400);
   const email = body.email.trim().toLowerCase();
 
   const account = await getAccountByEmail(env.DB, email);
@@ -152,80 +202,69 @@ async function postRecoverRequest(request: Request, env: Env): Promise<Response>
     await storeRecoveryCode(env.DB, email, await hashSecret(code), "recover");
     await sendCodeEmail(env, email, "recover", code);
   }
-  // Generic response regardless: prevents account enumeration.
-  return ok({ ok: true });
+  return ok({ ok: true }); // generic — no account enumeration
 }
 
 type RecoverConfirmBody = { email: string; code: string };
+/**
+ * Email + code prove ownership of the account. Rotate the API key and hand back a
+ * fresh one so a user who lost/compromised their key can re-authenticate.
+ */
 async function postRecoverConfirm(request: Request, env: Env): Promise<Response> {
   const body = await readJson<RecoverConfirmBody>(request);
-  if (!body.email || !body.code) return err("email and code required", 400);
+  if (!body?.email || !body.code) return err("email and code required", 400);
   const email = body.email.trim().toLowerCase();
 
   const { ok: valid, account } = await consumeRecoveryCode(env.DB, email, body.code, "recover");
   if (!valid || !account) return err("Invalid or expired code", 400);
-  return ok({ externalUserId: account.external_user_id });
-}
 
-async function getUsage(request: Request, env: Env): Promise<Response> {
-  const externalUserId = new URL(request.url).searchParams.get("externalUserId") || "";
-  if (!externalUserId) return err("externalUserId required", 400);
-  const client = new PymtHouseClient(env);
-  const balance = await client.getBalance(externalUserId);
-  return ok({ externalUserId, balance });
+  const secret = cryptoRandomHex(32);
+  await rotateApiKey(env.DB, account.external_user_id, await sha256Hex(secret));
+  return ok({ externalUserId: account.external_user_id, apiKey: secret });
 }
 
 // ---------------------------------------------------------------------------
-// Admin (monitoring payments + pushing credits to PymtHouse)
+// Admin
 // ---------------------------------------------------------------------------
 
-function requireAdminKey(req: Request, env: Env): Response | null {
-  const auth = req.headers.get("authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!env.ADMIN_API_KEY || token !== env.ADMIN_API_KEY) return err("Unauthorized", 401);
-  return null;
-}
-
-/** Monitor payments received: the full credit-audit ledger (top-ups + admin grants). */
 async function adminPayments(request: Request, env: Env): Promise<Response> {
   const limit = Math.min(Number(new URL(request.url).searchParams.get("limit") || "50") || 50, 500);
   return ok({ payments: await listPayments(env.DB, limit) });
 }
 
-/** List registered instance accounts (with their recovery email, if any). */
 async function adminUsers(request: Request, env: Env): Promise<Response> {
   const limit = Math.min(Number(new URL(request.url).searchParams.get("limit") || "100") || 100, 1000);
   return ok({ users: await listAccounts(env.DB, limit) });
 }
 
-/** Live PymtHouse allowance for one user (reconciliation view). */
 async function adminBalance(request: Request, env: Env): Promise<Response> {
   const externalUserId = new URL(request.url).searchParams.get("externalUserId") || "";
   if (!externalUserId) return err("externalUserId required", 400);
   return ok({ externalUserId, balance: await new PymtHouseClient(env).getBalance(externalUserId) });
 }
 
+async function adminApiKeys(env: Env): Promise<Response> {
+  return ok({ apiKeys: await listApiKeys(env.DB) });
+}
+
+async function adminRevokeKey(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<{ externalUserId: string }>(request);
+  if (!body?.externalUserId) return err("externalUserId required", 400);
+  await revokeApiKey(env.DB, body.externalUserId);
+  return ok({ ok: true, externalUserId: body.externalUserId, note: "key revoked; user must re-provision via /recover/confirm" });
+}
+
 type AdminGrantBody = { externalUserId: string; amountUsdMicros: string; reason?: string };
-/**
- * Operator-grant credits straight into a user's PymtHouse allowance.
- * Use for: bank-transfer / off-band top-ups, compensations, refunds, reconciliation
- * when a Stripe webhook was missed. Always audited in the payments ledger.
- */
 async function adminGrant(request: Request, env: Env): Promise<Response> {
   const body = await readJson<AdminGrantBody>(request);
-  if (!body.externalUserId) return err("externalUserId required", 400);
+  if (!body?.externalUserId) return err("externalUserId required", 400);
   const micros = BigInt(body.amountUsdMicros ?? "");
   if (micros <= 0n) return err("amountUsdMicros must be a positive integer", 400);
 
   const client = new PymtHouseClient(env);
   await client.upsertUser(body.externalUserId);
   await client.grantAllowance(body.externalUserId, String(micros));
-  await logPayment(env.DB, {
-    kind: "admin_grant",
-    externalUserId: body.externalUserId,
-    amountUsdMicros: String(micros),
-    reason: body.reason,
-  });
+  await logPayment(env.DB, { kind: "admin_grant", externalUserId: body.externalUserId, amountUsdMicros: String(micros), reason: body.reason });
   return ok({ ok: true, externalUserId: body.externalUserId, amountUsdMicros: String(micros) });
 }
 
@@ -241,17 +280,12 @@ async function handleStripeWebhook(raw: string, signature: string | null, env: E
     const externalUserId: string | undefined = s.client_reference_id;
     const creditMicros: string | undefined = s.metadata?.credit_usd_micros;
 
-    if (!externalUserId || !creditMicros) {
-      // Nothing to credit — acknowledge so Stripe stops retrying.
-      return json({ received: true, skipped: true });
-    }
-    // Idempotency: never grant twice for the same event.
-    if (await alreadyApplied(env.DB, event.id)) {
-      return json({ received: true, duplicate: true });
-    }
+    if (!externalUserId || !creditMicros) return json({ received: true, skipped: true });
+    if (await alreadyApplied(env.DB, event.id)) return json({ received: true, duplicate: true });
+
     const client = new PymtHouseClient(env);
     await client.upsertUser(externalUserId);
-    await client.grantAllowance(externalUserId, creditMicros); // grants CREDITS only, never the fee
+    await client.grantAllowance(externalUserId, creditMicros); // CREDITS only, never the fee
     await markApplied(env.DB, event.id);
     await logPayment(env.DB, {
       kind: "topup",
@@ -264,7 +298,6 @@ async function handleStripeWebhook(raw: string, signature: string | null, env: E
     return json({ received: true, credited: { externalUserId, credit_amount_usd_micros: creditMicros } });
   }
 
-  // checkout.session.expired, payment_intent.*, etc. are acknowledged as no-ops.
   return json({ received: true });
 }
 
@@ -284,3 +317,4 @@ function handleOptions(env: Env): Response {
     },
   });
 }
+

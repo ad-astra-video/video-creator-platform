@@ -143,5 +143,64 @@ export async function listAccounts(db: D1Database, limit = 100): Promise<Account
   return res.results as AccountRow[];
 }
 
+// ---------------------------------------------------------------------------
+// Per-user API keys
+// ---------------------------------------------------------------------------
+
+/** Insert a key row. Returns true only if it was newly created (provision-once). */
+export async function createApiKey(db: D1Database, externalUserId: string, keyHash: string): Promise<boolean> {
+  const r = await db
+    .prepare("INSERT OR IGNORE INTO api_keys (external_user_id, key_hash) VALUES (?1, ?2)")
+    .bind(externalUserId, keyHash)
+    .run();
+  return (r.meta.changes ?? 0) > 0;
+}
+
+/** Resolve a user from an (unsalted) SHA-256 of their presented bearer key. */
+export async function getExternalUserByKeyHash(db: D1Database, keyHash: string): Promise<string | null> {
+  const row = await db
+    .prepare("SELECT external_user_id FROM api_keys WHERE key_hash = ?1 AND revoked = 0")
+    .bind(keyHash)
+    .first<{ external_user_id: string }>();
+  return row?.external_user_id ?? null;
+}
+
+/** Upsert a fresh key (used by email-verified rotation). */
+export async function rotateApiKey(db: D1Database, externalUserId: string, keyHash: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO api_keys (external_user_id, key_hash, revoked) VALUES (?1, ?2, 0)
+       ON CONFLICT(external_user_id) DO UPDATE SET key_hash = excluded.key_hash, revoked = 0, created_at = datetime('now')`,
+    )
+    .bind(externalUserId, keyHash)
+    .run();
+}
+
+export async function revokeApiKey(db: D1Database, externalUserId: string): Promise<void> {
+  await db.prepare("UPDATE api_keys SET revoked = 1 WHERE external_user_id = ?1").bind(externalUserId).run();
+}
+
+export async function listApiKeys(db: D1Database): Promise<{ external_user_id: string; created_at: string; last_used_at: string | null; revoked: number }[]> {
+  const res = await db.prepare("SELECT external_user_id, created_at, last_used_at, revoked FROM api_keys ORDER BY created_at DESC").all();
+  return res.results as any;
+}
+
+// ---------------------------------------------------------------------------
+// Pending email (link-email two-step)
+// ---------------------------------------------------------------------------
+
+export async function setPendingEmail(db: D1Database, externalUserId: string, email: string): Promise<void> {
+  await db.prepare("UPDATE accounts SET pending_email = ?1 WHERE external_user_id = ?2").bind(email.toLowerCase().trim(), externalUserId).run();
+}
+
+export async function getPendingEmail(db: D1Database, externalUserId: string): Promise<string | null> {
+  const row = await db.prepare("SELECT pending_email FROM accounts WHERE external_user_id = ?1").bind(externalUserId).first<{ pending_email: string | null }>();
+  return row?.pending_email ?? null;
+}
+
+export async function clearPendingEmail(db: D1Database, externalUserId: string): Promise<void> {
+  await db.prepare("UPDATE accounts SET pending_email = NULL WHERE external_user_id = ?1").bind(externalUserId).run();
+}
+
 // Re-exported for index.ts convenience
 export { hashSecret, generateRecoveryCode as _gen } from "./utils";

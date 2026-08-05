@@ -16,13 +16,13 @@ export function err(message: string, status: number): Response {
 }
 
 /**
- * Guard for non-webhook routes. The desktop must send
- * `Authorization: Bearer <PLATFORM_API_KEY>`.
+ * Guard for admin routes (`/admin/*`). Operator must send
+ * `Authorization: Bearer <ADMIN_API_KEY>`; never shipped to the desktop.
  */
-export function requireApiKey(req: Request, env: Env): Response | null {
+export function requireAdminKey(req: Request, env: Env): Response | null {
   const auth = req.headers.get("authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!env.PLATFORM_API_KEY || token !== env.PLATFORM_API_KEY) {
+  if (!env.ADMIN_API_KEY || token !== env.ADMIN_API_KEY) {
     return err("Unauthorized", 401);
   }
   return null;
@@ -52,6 +52,16 @@ function constantTimeEq(a: string, b: string): boolean {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+/**
+ * Unsalted SHA-256 hex of a high-entropy secret (API keys). Storage is plain-SHA
+ * only because the key is 256-bit random (no rainbow-table concern) and it lets
+ * us look a token up directly by hash — the salted `hashSecret` would break lookup.
+ */
+export async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return toHex(new Uint8Array(digest));
 }
 
 export function toHex(bytes: Uint8Array): string {

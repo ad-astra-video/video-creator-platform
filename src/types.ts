@@ -16,9 +16,8 @@ export interface Env {
   PYMTHOUSE_M2M_CLIENT_ID: string;
   PYMTHOUSE_M2M_CLIENT_SECRET: string;
 
-  // Platform auth (shared key the desktop sends as `Authorization: Bearer`)
-  PLATFORM_API_KEY: string;
-  // Operator/admin auth (separate, more privileged key; NOT shipped to the desktop)
+  // Operator/admin auth (separate, more privileged key; NOT shipped to the desktop).
+  // User routes authenticate with PER-USER keys provisioned via POST /provision.
   ADMIN_API_KEY: string;
 
   // Email (recovery codes)

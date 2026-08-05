@@ -19,21 +19,27 @@ email recovery, job dispatch (minting a signer session), and operator admin. See
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /health` | public | liveness |
-| `POST /checkout { externalUserId, tier }` | API key | create a Stripe hosted Checkout Session (credits + platform fee) |
-| `GET /tiers` | API key | the 4 top-up tiers (for the desktop picker) |
-| `GET /balance?externalUserId=` | API key | current PymtHouse allowance (USD micros) |
-| `POST /link-email` / `POST /link-email/verify` | API key | attach & verify a recovery email |
-| `POST /recover/request` / `POST /recover/confirm` | API key | recover a lost install's UUID via emailed one-time code |
-| `GET /usage?externalUserId=` | API key | balance-backed usage view |
+| `GET /tiers` | public | the 4 top-up tiers (for the desktop picker) |
+| `POST /provision { externalUserId }` | public | mint a **per-user** key (first run); `409` if already provisioned |
+| `POST /checkout { tier }` | **user key** | Stripe Checkout (credits + platform fee); user resolved from key |
+| `GET /balance` | **user key** | current PymtHouse allowance (USD micros) |
+| `GET /usage` | **user key** | balance-backed usage view |
+| `POST /link-email { email }` / `POST /link-email/verify { code }` | **user key** | attach & verify a recovery email |
+| `POST /recover/request { email }` / `POST /recover/confirm { email, code }` | public | lost/compromised key: email one-time code; confirm **rotates** to a fresh key |
 | `POST /webhook/stripe` | signature | grants `credits` only (never the fee) — idempotent |
 | `POST /authorize` | — | (Phase B) go-livepeer DMZ identity webhook — stubbed |
 | `GET /admin/payments` | **admin** key | monitor payments received (credit-audit ledger) |
 | `GET /admin/users` | **admin** key | list registered accounts |
 | `GET /admin/balance?externalUserId=` | **admin** key | live PymtHouse allowance (reconciliation) |
 | `POST /admin/grant` | **admin** key | manually credit a user's PymtHouse allowance (send funds) |
+| `GET /admin/api-keys` | **admin** key | list issued per-user keys (hash only) |
+| `POST /admin/revoke-key` | **admin** key | revoke a user's key (forces re-provision via recovery) |
 
-Two distinct keys:
-- `PLATFORM_API_KEY` — shipped in the desktop app; can create checkouts, read balances, do recovery.
+Two distinct auth models:
+- **Per-user API key** — one per install, minted once by `POST /provision` (only the SHA-256 is
+  stored). The desktop sends `Authorization: Bearer <key>`; the user is resolved **from the key**
+  server-side, so no client-supplied `externalUserId` can be spoofed. Rotate via email recovery;
+  revoke per-user from `/admin/revoke-key`. **This replaces the old single shared key.**
 - `ADMIN_API_KEY` — operator-only; **never** ships to the desktop; unlocks `/admin/*`.
 
 The 4 tiers (only these are offered):
@@ -70,6 +76,8 @@ platform/
   package.json           # scripts: dev / deploy / d1 migrate / typecheck
   migrations/0001_init.sql   # accounts, recovery_codes, idempotency
   migrations/0002_payments.sql # credit-audit ledger (top-ups + admin grants)
+  migrations/0003_api_keys.sql # per-user API keys + pending_email
+  smoke.mjs                    # dev: in-memory per-user key flow self-test (pnpm smoke)
   src/
     index.ts             # router + handlers (incl. /admin/*)
     config.ts            # STRIPE_TIERS + tier helpers
@@ -125,7 +133,6 @@ pnpm wrangler secret put PYMTHOUSE_BASE_URL         # https://<app>.pymthouse.ex
 pnpm wrangler secret put PYMTHOUSE_PUBLIC_CLIENT_ID # app_...
 pnpm wrangler secret put PYMTHOUSE_M2M_CLIENT_ID    # m2m_...
 pnpm wrangler secret put PYMTHOUSE_M2M_CLIENT_SECRET# pmth_cs_...
-pnpm wrangler secret put PLATFORM_API_KEY           # shared key the desktop uses
 pnpm wrangler secret put ADMIN_API_KEY              # operator key for /admin/* (never ship)
 pnpm wrangler secret put RESEND_API_KEY             # re_...
 pnpm wrangler secret put EMAIL_FROM                 # credits@yourdomain.com
@@ -216,6 +223,33 @@ and is idempotent by Stripe `event.id`.
    is an operator step, out of scope of this Worker.
 
 ---
+
+## Per-user keys & the desktop flow
+
+What changes for the LTX-Desktop app (vs. a shared key):
+
+1. **First run:** the Python backend generates a UUID `externalUserId`, then calls
+   `POST /provision { externalUserId }` (public) and **stores the returned `apiKey` locally**
+   (electron-store / secure settings). `/provision` returns a key **once** — re-calling it for
+   the same UUID returns `409`, so a stolen UUID can't be used to seize a balance.
+2. **Every user-route call** sends `Authorization: Bearer <apiKey>` (`/checkout`, `/balance`,
+   `/usage`, `/link-email`…). There is **no `externalUserId` in the body** — the server derives
+   the user from the key, so a client can't claim to be someone else.
+3. **Key loss or compromise:** `POST /recover/request { email }` emails a one-time code, then
+   `POST /recover/confirm { email, code }` proves ownership and **rotates** to a fresh key
+   (returned in the response). No new provisioning needed.
+4. **Operators** can see which keys exist (`GET /admin/api-keys`, hashes only — never plaintext)
+   and revoke one (`POST /admin/revoke-key { externalUserId }`); a revoked user must re-prove
+   themselves via `/recover/confirm`.
+
+Security notes:
+- Only the **SHA-256 of each key is stored**; `/provision` never returns a key twice.
+- Keys are 256-bit random (64 hex chars) — un-guessable and unsalted-hash lookup is safe.
+- Revoking a key is instant and per-user, which the single shared key never allowed.
+
+Self-test the whole flow locally with `pnpm smoke` (in-memory D1 + mocked PymtHouse/Stripe):
+it exercises provision → dup-409 → authenticated balance → wrong-key 401 → checkout → admin
+list → revoke-invalidates.
 
 ## Phase B (not yet implemented)
 
