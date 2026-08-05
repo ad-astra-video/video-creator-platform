@@ -1,16 +1,19 @@
-# LTX Credits Platform (Serverless Backend)
+# Video Creator — Serverless Backend
 
-The **serverless** part of the LTX-Desktop deposit-to-inference stack. A single Cloudflare
-**Worker + D1** that owns all secrets and wires four services together:
+The **serverless** backend for the **Video Creator** desktop app — a fork of Livepeer's
+**LTX-Desktop** (`../LTX-Desktop`). A single Cloudflare **Worker + D1** that owns all secrets and
+wires services together. **Credits** are the first productized feature, keeping the LTX-Desktop
+deposit-to-inference flow intact:
 
 ```
-LTX-Desktop (Electron + Python) ──> this Worker ──> Stripe   (collects top-up + platform fee)
-                                              └──> PymtHouse (allowance ledger + remote signer DMZ -> orchestrators)
+Video Creator desktop (Electron + Python) ──> this Worker ──> Stripe   (collects top-up + platform fee)
+                                            └──> PymtHouse (allowance ledger + remote signer DMZ -> orchestrators)
 ```
 
 It does **not** sit in the discovery or inference hot path — it is only hit on deposit/checkout,
 email recovery, job dispatch (minting a signer session), and operator admin. See
-`../ONBOARDING_AND_EXECUTION_PLAN.md` for the full architecture and economics.
+`../ONBOARDING_AND_EXECUTION_PLAN.md` for the full architecture and economics (and the Livepeer
+LTX-Desktop it is forked from).
 
 ---
 

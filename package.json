@@ -1,5 +1,5 @@
 {
-  "name": "ltx-credits-worker",
+  "name": "video-creator",
   "version": "0.1.0",
   "private": true,
   "description": "Serverless credits + platform-fee backend for LTX-Desktop (Stripe checkout -> PymtHouse allowance -> deposit-to-inference)",
