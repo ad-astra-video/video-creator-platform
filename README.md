@@ -74,9 +74,7 @@ early (steps 3–4) and have them handy:
 platform/
   wrangler.toml          # Worker + D1 configuration (edit database_id)
   package.json           # scripts: dev / deploy / d1 migrate / typecheck
-  migrations/0001_init.sql   # accounts, recovery_codes, idempotency
-  migrations/0002_payments.sql # credit-audit ledger (top-ups + admin grants)
-  migrations/0003_api_keys.sql # per-user API keys + pending_email
+  migrations/0001_init.sql   # full schema (accounts, codes, idempotency, payments, api_keys)
   smoke.mjs                    # dev: in-memory per-user key flow self-test (pnpm smoke)
   src/
     index.ts             # router + handlers (incl. /admin/*)
