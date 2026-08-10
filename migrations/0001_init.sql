@@ -55,3 +55,27 @@ CREATE TABLE IF NOT EXISTS api_keys (
   last_used_at     TEXT,
   revoked          INTEGER DEFAULT 0
 );
+
+-- Phase B: signed-payment authorization scopes (one per generation job) for audit/reconciliation.
+CREATE TABLE IF NOT EXISTS authz_sessions (
+  id                       TEXT PRIMARY KEY,                    -- authz_…
+  external_user_id         TEXT NOT NULL,
+  job_id                   TEXT NOT NULL,
+  orchestrator_id          TEXT NOT NULL,
+  max_face_value_usd_micros INTEGER NOT NULL,
+  expires_at               TEXT NOT NULL,
+  status                   TEXT NOT NULL DEFAULT 'active',      -- active|consumed|expired|refunded
+  created_at               TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_authz_sessions_user ON authz_sessions (external_user_id);
+
+-- Phase B: signed payment tickets (debit/reversal reconciled by PymtHouse metering; audit here).
+CREATE TABLE IF NOT EXISTS tickets (
+  ticket_hash            TEXT PRIMARY KEY,
+  session_id             TEXT NOT NULL,
+  face_value_usd_micros  INTEGER NOT NULL,
+  signed_at              TEXT DEFAULT (datetime('now')),
+  status                 TEXT NOT NULL DEFAULT 'signed',        -- signed|redeemed|refunded
+  redeemed_at            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tickets_session ON tickets (session_id);
