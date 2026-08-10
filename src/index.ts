@@ -23,6 +23,7 @@ import {
 import { sendCodeEmail } from "./recovery";
 import { createCheckoutSession, verifyWebhook } from "./stripe";
 import type { Env } from "./types";
+import { getPayerAddress, getSignerProxy, handleAuthorize } from "./signer";
 import {
   err,
   generateRecoveryCode,
@@ -55,9 +56,14 @@ export default {
       }
     }
 
-    // Phase B: go-livepeer identity webhook (DMZ). Carved out; implement in Phase B.
+    // Phase B: go-livepeer remote-signer identity webhook (called by the DMZ,
+    // authenticated by the shared WEBHOOK_SECRET — NOT a per-user route).
     if (method === "POST" && path === "/authorize") {
-      return json({ ok: false, error: "Phase B DMZ /authorize not yet implemented" }, 501);
+      try {
+        return await handleAuthorize(env, request);
+      } catch (e) {
+        return err(`authorize error: ${(e as Error).message}`, 401);
+      }
     }
 
     // ---- Admin routes: use the ADMIN key independently ----
@@ -92,6 +98,8 @@ export default {
       if (method === "POST" && path === "/checkout") return await postCheckout(request, env, uid);
       if (method === "GET" && path === "/balance") return await getBalance(env, uid);
       if (method === "GET" && path === "/usage") return await getUsage(env, uid);
+      if (method === "POST" && path === "/sign-ticket") return await getSignerProxy(env)(request);
+      if (method === "GET" && path === "/signer/address") return await getPayerAddress(env, uid);
       if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env, uid);
       if (method === "POST" && path === "/link-email/verify") return await verifyLinkEmail(request, env, uid);
       return err("Not found", 404);

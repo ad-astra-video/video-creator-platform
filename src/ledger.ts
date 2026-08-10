@@ -202,5 +202,36 @@ export async function clearPendingEmail(db: D1Database, externalUserId: string):
   await db.prepare("UPDATE accounts SET pending_email = NULL WHERE external_user_id = ?1").bind(externalUserId).run();
 }
 
+// ---------------------------------------------------------------------------
+// Phase B: signed-payment audit (authz sessions + tickets)
+// ---------------------------------------------------------------------------
+
+export async function createAuthzSession(
+  db: D1Database,
+  row: { id: string; external_user_id: string; job_id: string; orchestrator_id: string; max_face_value_usd_micros: number; expires_at: string },
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO authz_sessions (id, external_user_id, job_id, orchestrator_id, max_face_value_usd_micros, expires_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+    )
+    .bind(row.id, row.external_user_id, row.job_id, row.orchestrator_id, row.max_face_value_usd_micros, row.expires_at)
+    .run();
+}
+
+/** Record one signed ticket. `INSERT OR IGNORE` makes it idempotent by ticketHash. */
+export async function recordSignedTicket(
+  db: D1Database,
+  row: { ticket_hash: string; session_id: string; face_value_usd_micros: number },
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO tickets (ticket_hash, session_id, face_value_usd_micros)
+       VALUES (?1, ?2, ?3)`,
+    )
+    .bind(row.ticket_hash, row.session_id, row.face_value_usd_micros)
+    .run();
+}
+
 // Re-exported for index.ts convenience
 export { hashSecret, generateRecoveryCode as _gen } from "./utils";
