@@ -28,7 +28,9 @@ email recovery, job dispatch (minting a signer session), and operator admin. See
 | `POST /link-email { email }` / `POST /link-email/verify { code }` | **user key** | attach & verify a recovery email |
 | `POST /recover/request { email }` / `POST /recover/confirm { email, code }` | public | lost/compromised key: email one-time code; confirm **rotates** to a fresh key |
 | `POST /webhook/stripe` | signature | grants `credits` only (never the fee) — idempotent |
-| `POST /authorize` | — | (Phase B) go-livepeer DMZ identity webhook — stubbed |
+| `POST /sign-ticket { paymentParams, type, manifestId, state? }` | **user key** | PymtHouse signer DMZ proxy → returns `{ payment, segCreds, state }` (the `Livepeer-Payment` / `Livepeer-Segment` header values) |
+| `GET /signer/address` | **user key** | payer/broadcaster address for the `Livepeer-Payer-Address` header |
+| `POST /authorize` | **webhook secret** | go-livepeer remote-signer identity webhook (verifies the end-user signer JWT) |
 | `GET /admin/payments` | **admin** key | monitor payments received (credit-audit ledger) |
 | `GET /admin/users` | **admin** key | list registered accounts |
 | `GET /admin/balance?externalUserId=` | **admin** key | live PymtHouse allowance (reconciliation) |
@@ -288,11 +290,16 @@ Self-test the whole flow locally with `pnpm smoke` (in-memory D1 + mocked PymtHo
 it exercises provision → dup-409 → authenticated balance → wrong-key 401 → checkout → admin
 list → revoke-invalidates.
 
-## Phase B (not yet implemented)
+## Phase B (browser → orchestrator, billed by signed tickets)
 
-`POST /authorize` (the go-livepeer identity webhook) and the direct-DMZ signer proxy are stubbed
-in `src/index.ts` and `src/pymthouse.ts#getSignerRouting`. Wire them with
-`@pymthouse/builder-sdk/signer/server` and `/signer/webhook` when orchestrator payment is live.
+`POST /sign-ticket` (direct DMZ proxy via `@pymthouse/builder-sdk/signer/server`), `GET /signer/address`,
+and `POST /authorize` (the go-livepeer identity webhook) are implemented in `src/signer.ts`.
+The browser submits generation to the orchestrator directly, with payment in the
+`Livepeer-Payment` / `Livepeer-Segment` / `Livepeer-Payer-Address` headers; the Worker only ever
+does control-plane work (auth, balance gate, signer proxy, identity webhook). See
+`plans/PHASE_B_BROWSER_TICKET_FLOW.md` for the full flow and contracts. **Invariant: every balance
+debit is authorized through PymtHouse** (DMZ signs on `/generate-live-payment`, PymtHouse metering
+debits); this Worker never writes to a stored balance.
 
 ---
 
