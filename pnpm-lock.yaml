@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      '@pymthouse/builder-sdk':
+        specifier: ^0.6.3
+        version: 0.6.3
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4.20241106.0
@@ -346,6 +350,10 @@ packages:
   '@jridgewell/trace-mapping@0.3.9':
     resolution: {integrity: sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ==}
 
+  '@pymthouse/builder-sdk@0.6.3':
+    resolution: {integrity: sha512-ex+qcGknv6gs+FqvmgoQgR5Trwy/yQ7UIO91jlGVPpgwSccFqTunP/Lmi+ABY9Gz1F0xN+U9C6AYOhkFSb/Nsw==}
+    engines: {node: '>=20'}
+
   acorn-walk@8.3.2:
     resolution: {integrity: sha512-cjkyv4OtNCIeqhHrfS81QWXoCBPExR/J62oyEqepVw8WaQeSqpW2uhuLPh1m9eWhDuOo/jUXVTlifvesOWp/4A==}
     engines: {node: '>=0.4.0'}
@@ -438,6 +446,9 @@ packages:
   mustache@4.2.0:
     resolution: {integrity: sha512-71ippSywq5Yb7/tVYyGbkBggbU8H3u5Rz56fH60jGFgr8uHwxs+aSKeqmluIVzM0m0kB7xQjKS6qPfd0b2ZoqQ==}
     hasBin: true
+
+  oauth4webapi@3.8.6:
+    resolution: {integrity: sha512-iwemM91xz8nryHti2yTmg5fhyEMVOkOXwHNqbvcATjyajb5oQxCQzrNOA6uElRHuMhQQTKUyFKV9y/CNyg25BQ==}
 
   ohash@2.0.11:
     resolution: {integrity: sha512-RdR9FQrFwNBNXAr4GixM8YaRZRJ5PUWbKYbE5eOsrwAjJW0q2REGcf79oYPsLyskQCZG1PLN+S/K1V00joZAoQ==}
@@ -739,6 +750,10 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
+  '@pymthouse/builder-sdk@0.6.3':
+    dependencies:
+      oauth4webapi: 3.8.6
+
   acorn-walk@8.3.2: {}
 
   acorn@8.14.0: {}
@@ -848,6 +863,8 @@ snapshots:
       - utf-8-validate
 
   mustache@4.2.0: {}
+
+  oauth4webapi@3.8.6: {}
 
   ohash@2.0.11: {}
 

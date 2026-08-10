@@ -3,3 +3,7 @@ dist/
 .wrangler/
 .dev.vars
 *.log
+.wrangler-check/
+
+# local planning notes (not version-controlled)
+plans/
