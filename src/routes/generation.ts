@@ -44,17 +44,17 @@ const restyleSchema = z.object({
   subjectMask: z.unknown().optional(),
 });
 const frameExtractSchema = z.object({
-  projectId: z.string().min(1),
-  videoPath: z.string().min(1).optional(),
+  projectId: z.string().min(1).optional(),
+  video_path: z.string().min(1).optional(),
   timestampSec: z.number().min(0).optional(),
 });
 const segmentSchema = z.object({
-  projectId: z.string().min(1),
-  imagePath: z.string().min(1),
+  projectId: z.string().min(1).optional(),
+  image_path: z.string().min(1),
 });
 const styleFrameSchema = z.object({
-  projectId: z.string().min(1),
-  imagePath: z.string().min(1),
+  projectId: z.string().min(1).optional(),
+  image_path: z.string().min(1),
 });
 const cancelSchema = z.object({ jobId: z.string().min(1) });
 
@@ -99,14 +99,24 @@ export async function postRestyleSegmentSubject(request: Request, env: Env): Pro
   // In the serverless/web path the image exists only as a browser-local web:// blob
   // key, which a remote runner cannot fetch — automatic subject segmentation (SAM3)
   // can't run. Skip it gracefully instead of returning a 400 from the runner.
-  if (body.data.imagePath.startsWith("web://")) {
+  if (body.data.image_path.startsWith("web://")) {
     return ok({ ok: true, skipped: true, note: "auto subject segmentation unavailable in browser" });
   }
   const result = await dispatchJob(env, u.userId, "restyle:segment-subject", body.data, ["restyle", "sam3"]);
   return result.response;
 }
 export async function postRestyleStyleFrame(request: Request, env: Env): Promise<Response> {
-  return makeDispatch("restyle:style-frame", styleFrameSchema, ["restyle"])(request, env);
+  const u = await resolveUserFromRequest(request, env);
+  if (!u.ok) return u.response;
+  const body = await parseBody(request, styleFrameSchema);
+  if (!body.ok) return body.response;
+  // A browser-local web:// blob can't be fetched by a remote runner yet (asset
+  // handoff pending) — signal it gracefully instead of a 400/502 from the runner.
+  if (body.data.image_path.startsWith("web://")) {
+    return ok({ ok: true, skipped: true, note: "style-frame unavailable in browser without asset upload" });
+  }
+  const result = await dispatchJob(env, u.userId, "restyle:style-frame", body.data, ["restyle"]);
+  return result.response;
 }
 export async function postIcLoraGenerate(request: Request, env: Env): Promise<Response> {
   return makeDispatch("ic-lora", imageSchema, ["ic-lora"])(request, env);
