@@ -92,7 +92,18 @@ export async function postRestyleExtractFirstFrame(request: Request, env: Env): 
   return makeDispatch("restyle:extract-first-frame", frameExtractSchema, ["restyle"])(request, env);
 }
 export async function postRestyleSegmentSubject(request: Request, env: Env): Promise<Response> {
-  return makeDispatch("restyle:segment-subject", segmentSchema, ["restyle", "sam3"])(request, env);
+  const u = await resolveUserFromRequest(request, env);
+  if (!u.ok) return u.response;
+  const body = await parseBody(request, segmentSchema);
+  if (!body.ok) return body.response;
+  // In the serverless/web path the image exists only as a browser-local web:// blob
+  // key, which a remote runner cannot fetch — automatic subject segmentation (SAM3)
+  // can't run. Skip it gracefully instead of returning a 400 from the runner.
+  if (body.data.imagePath.startsWith("web://")) {
+    return ok({ ok: true, skipped: true, note: "auto subject segmentation unavailable in browser" });
+  }
+  const result = await dispatchJob(env, u.userId, "restyle:segment-subject", body.data, ["restyle", "sam3"]);
+  return result.response;
 }
 export async function postRestyleStyleFrame(request: Request, env: Env): Promise<Response> {
   return makeDispatch("restyle:style-frame", styleFrameSchema, ["restyle"])(request, env);
@@ -135,10 +146,14 @@ export async function getGenerationProgress(request: Request, env: Env): Promise
   if (!u.ok) return u.response;
   if (!env.DB) return err("Server error", 500);
   const jobId = new URL(request.url).searchParams.get("jobId") || "";
-  if (!jobId) return err("jobId query param required", 400);
+  if (!jobId) {
+    // The frontend calls once without a jobId to capture the baseline generation
+    // id before starting a new generation (see GenSpace.writeRecoveryContext).
+    return ok({ id: null, status: "idle", phase: "idle", runner: null, updatedAt: null });
+  }
   const job = await getOwnedJob(env.DB, jobId, u.userId);
   if (!job) return err("job not found", 404);
-  return ok({ jobId: job.id, status: job.status, phase: progressPhase(job.status), runner: job.runner, updatedAt: job.updated_at });
+  return ok({ id: job.id, jobId: job.id, status: job.status, phase: progressPhase(job.status), runner: job.runner, updatedAt: job.updated_at });
 }
 
 /** DERIVED from the jobs row (persisted status drives the WS + REST fallback). */
