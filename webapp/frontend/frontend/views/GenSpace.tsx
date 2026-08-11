@@ -1583,7 +1583,7 @@ export function GenSpace() {
   // Restyle Image | Video tab + first-frame (step-1) edit settings, driven from the
   // main prompt bar instead of an inline First-Frame settings panel.
   const restylePanelRef = useRef<RestylePanelHandle>(null)
-  const [restyleTab, setRestyleTab] = useState<'image' | 'video'>('image')
+  const [restyleTab, setRestyleTab] = useState<'image' | 'video'>('video')
   // id-v2v model variant: "fast" = FusionX (~8 steps), "regular" = original (30).
   const [restyleModel, setRestyleModel] = useState<'fast' | 'regular'>('fast')
   // Default the restyle Enhance checkbox to match the Prompt Enhancer setting:
@@ -2760,6 +2760,7 @@ export function GenSpace() {
   const handleRestyle = (videoAsset: Asset) => {
     setMode('restyle')
     setPrompt('')
+    setRestyleTab('video')
     setRestyleInitial({
       videoPath: videoAsset.path,
       stylizedImagePath: null,

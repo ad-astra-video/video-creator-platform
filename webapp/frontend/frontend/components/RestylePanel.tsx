@@ -85,7 +85,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     isProcessing = false,
     processingStatus = '',
     enforceApiConstraints = true,
-    activeTab: activeTabProp = 'image',
+    activeTab: activeTabProp = 'video',
     onTabChange,
     onStateChange,
     onChange,
@@ -179,8 +179,8 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     setVideoDuration(data.videoDuration)
     setDimensions({ width: data.width, height: data.height })
 
-    // New/updated source video: surface the first-frame workflow (image tab).
-    setTab('image')
+    // New/updated source video: keep the user on the Video tab; they switch to
+    // Image to run the first-frame restyle.
 
     // Auto-extract the first frame whenever a new source video lands.
     if (data.videoPath && data.videoPath !== videoKnownRef.current) {
