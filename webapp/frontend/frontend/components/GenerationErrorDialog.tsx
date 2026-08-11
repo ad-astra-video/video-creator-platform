@@ -42,23 +42,32 @@ function getDialogModel(error: GenerationError): {
     onClick: () => void
   }
 } {
+  const body = error.error
+  const technicalDetails = JSON.stringify(body, null, 2) ?? String(body)
   switch (error.status) {
-    case 402:
-      switch (error.error.code) {
-        case 'LTX_INSUFFICIENT_FUNDS':
-          return {
-            humanMessage: 'Insufficient credits for this generation. Top up to continue.',
-            technicalDetails: JSON.stringify(error.error, null, 2),
-          }
+    case 402: {
+      // The error body can be a string, an object {code,message}, or absent —
+      // never assume shape (a 502 from the remote dispatch arrives as a string).
+      const code = body && typeof body === 'object' ? (body as { code?: string }).code : undefined
+      if (code === 'LTX_INSUFFICIENT_FUNDS') {
+        return {
+          humanMessage: 'Insufficient credits for this generation. Top up to continue.',
+          technicalDetails,
+        }
       }
-      return assertNever(error.error.code)
+      return { humanMessage: 'Insufficient credits for this generation. Top up to continue.', technicalDetails }
+    }
     case '4XX':
     case '5XX':
-    case 'default':
+    case 'default': {
+      const raw = typeof body === 'string' ? body : body && typeof body === 'object'
+        ? (body as { message?: unknown }).message
+        : body
       return {
-        humanMessage: getGenericHumanMessage(error.error.message),
-        technicalDetails: JSON.stringify(error.error, null, 2),
+        humanMessage: getGenericHumanMessage(typeof raw === 'string' ? raw : ''),
+        technicalDetails,
       }
+    }
     default:
       return assertNever(error)
   }

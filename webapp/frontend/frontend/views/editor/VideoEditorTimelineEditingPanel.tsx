@@ -772,11 +772,12 @@ export function VideoEditorTimelineEditingPanel(props: VideoEditorTimelineEditin
         signal: abortController.signal,
       })
       if (!result.ok) {
+        const errStr = (JSON.stringify(result.error) ?? '').toLowerCase()
         const isApiKeyError = result.status === 401 || result.status === 403
-          || JSON.stringify(result.error).toLowerCase().includes('api_key')
-          || JSON.stringify(result.error).toLowerCase().includes('gemini')
-          || JSON.stringify(result.error).toLowerCase().includes('no api key')
-          || JSON.stringify(result.error).toLowerCase().includes('api key')
+          || errStr.includes('api_key')
+          || errStr.includes('gemini')
+          || errStr.includes('no api key')
+          || errStr.includes('api key')
         if (isApiKeyError) {
           setGapSuggestionNoApiKey(true)
         } else {
