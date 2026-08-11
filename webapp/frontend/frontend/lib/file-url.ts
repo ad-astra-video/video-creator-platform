@@ -21,3 +21,24 @@ export function pathToFileUrl(filePath: string): string {
 
   return 'file://' + encoded
 }
+
+/**
+ * Web-aware asset URL resolver.
+ *
+ * In the browser (serverless web app) there is no real filesystem — media is stored in
+ * the in-memory web asset store under `web://<uuid>` keys mapped to Blob/object URLs.
+ * `pathToFileUrl` would turn those into unplayable `file://` URLs, so anything rendered
+ * (`<video src>`, `<img src>`) must resolve web keys to their blob URL first. Plain disk
+ * paths (the Electron/desktop case) fall back to `pathToFileUrl`.
+ *
+ * Returns '' for an unknown/blank web key (caller should treat as no source).
+ */
+import { isWebPath, getBlobUrl } from './runtime/web-store'
+
+export function webAssetUrl(p: string | null | undefined): string {
+  if (!p) return ''
+  if (isWebPath(p)) {
+    return getBlobUrl(p) ?? ''
+  }
+  return pathToFileUrl(p)
+}

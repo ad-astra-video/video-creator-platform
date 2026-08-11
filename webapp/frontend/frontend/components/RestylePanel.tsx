@@ -1,7 +1,8 @@
 ﻿import { useState, useEffect, useCallback, useRef, useMemo, forwardRef, useImperativeHandle } from 'react'
 import { VideoPreviewPanel } from './VideoPreviewPanel'
 import { validateVideoSource } from '../lib/video-constraints'
-import { pathToFileUrl } from '../lib/file-url'
+import { webAssetUrl } from '../lib/file-url'
+import { isWebPath } from '../lib/runtime/web-store'
 import { ApiClient } from '../lib/api-client'
 import { Image, X, Loader2, Check, Film, Wand2, Upload } from 'lucide-react'
 import { logger } from '../lib/logger'
@@ -198,17 +199,31 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     setIsExtracting(true)
     setStylingError(null)
     try {
-      const res = await ApiClient.extractFirstFrame({ video_path: path })
-      if (!res.ok) {
-        logger.error(`First-frame extraction failed: ${res.error?.message}`)
-        setStylingError(res.error?.message ?? 'Could not extract the first frame')
-        return
+      let imagePath: string | null = null
+      if (isWebPath(path)) {
+        // Browser: draw the first frame with the canvas web API (HTMLVideoElement +
+        // drawImage) — no local Python / ffmpeg needed. Returns a new web:// blob key.
+        const res = await window.electronAPI.extractVideoFrame({ videoPath: path, seekTime: 0 })
+        imagePath = res?.path || null
+        if (!imagePath) {
+          setStylingError('Could not extract the first frame')
+          return
+        }
+      } else {
+        // Desktop: extract via the local backend.
+        const res = await ApiClient.extractFirstFrame({ video_path: path })
+        if (!res.ok) {
+          logger.error(`First-frame extraction failed: ${res.error?.message}`)
+          setStylingError(res.error?.message ?? 'Could not extract the first frame')
+          return
+        }
+        imagePath = res.data.imagePath
       }
-      setExtractedFramePath(res.data.imagePath)
+      setExtractedFramePath(imagePath)
       // Auto-segment the subject to keep as soon as the first frame is pulled.
       setSegmentingSubject(true)
       try {
-        const segRes = await ApiClient.segmentSubject({ image_path: res.data.imagePath })
+        const segRes = await ApiClient.segmentSubject({ image_path: imagePath })
         if (segRes.ok && segRes.data.mask_b64) {
           setSubjectMaskB64(segRes.data.mask_b64)
         } else {
@@ -353,7 +368,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                     }`}
                   >
                     {a.bigThumbnailPath ? (
-                      <img src={pathToFileUrl(a.bigThumbnailPath)} alt="" className="w-full h-full object-cover" />
+                      <img src={webAssetUrl(a.bigThumbnailPath)} alt="" className="w-full h-full object-cover" />
                     ) : (
                       <div className="w-full h-full bg-zinc-800 flex items-center justify-center">
                         <Film className="h-4 w-4 text-zinc-500" />
@@ -377,7 +392,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                       stylizedImagePath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
                     }`}
                   >
-                    <img src={pathToFileUrl(a.path)} alt="" className="w-full h-full object-cover" />
+                    <img src={webAssetUrl(a.path)} alt="" className="w-full h-full object-cover" />
                   </button>
                 ))}
               </div>
@@ -445,7 +460,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
               </div>
               <div className="flex-1 min-h-0 rounded-xl border border-zinc-800 bg-black flex items-center justify-center overflow-hidden">
                 {displayFramePath ? (
-                  <img src={pathToFileUrl(displayFramePath)} alt="" className="w-full h-full object-contain" />
+                  <img src={webAssetUrl(displayFramePath)} alt="" className="w-full h-full object-contain" />
                 ) : (
                   <div className="flex flex-col items-center gap-2 text-zinc-600 px-3 text-center">
                     <Image className="h-6 w-6" />
@@ -473,7 +488,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                 </div>
               ) : displayFramePath ? (
                 <>
-                  <img src={pathToFileUrl(displayFramePath)} alt="" className="w-full h-full object-contain" />
+                  <img src={webAssetUrl(displayFramePath)} alt="" className="w-full h-full object-contain" />
                   {subjectMaskB64 && (
                     <img
                       src={`data:image/png;base64,${subjectMaskB64}`}
@@ -559,7 +574,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                         activeCandidate === c ? 'border-emerald-500' : 'border-zinc-700 hover:border-zinc-500'
                       }`}
                     >
-                      <img src={pathToFileUrl(c)} alt="" className="w-full h-full object-cover" />
+                      <img src={webAssetUrl(c)} alt="" className="w-full h-full object-cover" />
                       <span className="absolute bottom-0 inset-x-0 bg-black/60 text-[8px] text-zinc-300 text-center">#{i + 1}</span>
                     </button>
                   ))}

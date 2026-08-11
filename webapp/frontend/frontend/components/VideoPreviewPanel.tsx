@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { Film, Play, Pause, Volume2, VolumeX, Loader2, Upload, Trash2, RefreshCw } from 'lucide-react'
 import { logger } from '../lib/logger'
-import { pathToFileUrl } from '../lib/file-url'
+import { webAssetUrl } from '../lib/file-url'
 
 // Shared video source + preview surface used by RetakePanel and ExtendPanel. Owns the
 // video file (drop/browse/clear), playback, mute, the timecode transport bar, and the
@@ -87,7 +87,7 @@ export function VideoPreviewPanel({
   const filmstripRef = filmstripRefProp ?? internalFilmstripRef
 
   const [videoPath, setVideoPath] = useState<string | null>(initialVideoPath || null)
-  const videoUrl = videoPath ? pathToFileUrl(videoPath) : null
+  const videoUrl = videoPath ? webAssetUrl(videoPath) : null
   const [videoDuration, setVideoDuration] = useState<number>(initialDuration || 0)
 
   const [isPlaying, setIsPlaying] = useState(false)
