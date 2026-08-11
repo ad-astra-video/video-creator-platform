@@ -23,6 +23,7 @@ export interface RunnerInfo {
   capabilities: RunnerCapabilities;
   priceUsdMicrosPerSec?: number;
   location?: string;
+  gpu?: { name?: string; vram_mb?: number };
 }
 
 export interface JobPayload {
@@ -58,6 +59,18 @@ export interface OrchestratorOptions {
 
 const DEFAULT_HEADERS = { "content-type": "application/json" };
 
+/** Parse heartbeat/discovery `metadata` which may be an object or a JSON string. */
+function parseMeta(v: unknown): Record<string, unknown> {
+  if (!v) return {};
+  if (typeof v === "object") return v as Record<string, unknown>;
+  try {
+    const p = JSON.parse(String(v));
+    return p && typeof p === "object" ? (p as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
 /** Livepeer orchestrator client. */
 export class OrchestratorClient {
   private baseUrl: string;
@@ -76,25 +89,108 @@ export class OrchestratorClient {
    * GET the orchestrator discovery endpoint and filter to runners that are
    * `ready` and advertise the requested capability (task) set.
    */
-  async discoverRunners(
-    requiredCapabilities: string[] = [],
-  ): Promise<RunnerInfo[]> {
-    const res = await this.fetchImpl(this.endpoint("/api/discovery"), {
-      method: "GET",
-      headers: { accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`orchestrator discovery ${res.status}: ${await res.text()}`);
-    const data = (await res.json()) as { runners?: RunnerInfo[] };
-    const runners = Array.isArray(data.runners) ? data.runners : [];
+  /**
+   * GET the orchestrator discovery endpoint and normalize to RunnerInfo[].
+   *
+   * The stored discovery URL is tried verbatim first (the desktop uses it
+   * verbatim), then with the /discovery and /api/discovery suffixes and the
+   * `app=video-creator` query param, so a bare host (e.g.
+   * `https://orchestrator-5090-3.dpn.gg`) resolves against the real service.
+   * Handles both the go-livepeer shape `[{address, runners:[{url, gpu,
+   * metadata, ...}]}]` and the flat `[{runner_id, runner_url, ...}]` mock shape.
+   * Prices are read from the orchestrator payload ONLY — never synthesized.
+   */
+  async discoverRunners(requiredCapabilities: string[] = []): Promise<RunnerInfo[]> {
     const caps = new Set(requiredCapabilities);
-    return runners.filter(
-      (r) =>
-        r &&
-        r.status === "ready" &&
-        r.capabilities?.tasks &&
-        (caps.size === 0 || caps.size <= new Set(r.capabilities.tasks).size) &&
-        [...caps].every((c) => r.capabilities.tasks.includes(c)),
-    );
+    let lastErr: unknown = null;
+    for (const url of this.discoveryCandidates()) {
+      try {
+        const res = await this.fetchImpl(url, {
+          method: "GET",
+          headers: { accept: "application/json" },
+        });
+        if (!res.ok) {
+          lastErr = new Error(`discovery ${res.status}: ${await res.text()}`);
+          continue;
+        }
+        const data: unknown = await res.json();
+        const parsed = this.parseDiscovery(data);
+        if (parsed.length > 0) {
+          return parsed.filter(
+            (r) => r && (caps.size === 0 || [...caps].every((c) => (r.capabilities?.tasks ?? []).includes(c))),
+          );
+        }
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    void lastErr;
+    return [];
+  }
+
+  private discoveryCandidates(): string[] {
+    const base = this.baseUrl;
+    const withApp = (u: string): string =>
+      u.includes("app=") ? u : u + (u.includes("?") ? "&app=video-creator" : "?app=video-creator");
+    return [base, withApp(base), withApp(`${base}/discovery`), withApp(`${base}/api/discovery`)];
+  }
+
+  parseDiscovery(data: unknown): RunnerInfo[] {
+    if (!Array.isArray(data)) return [];
+    const out: RunnerInfo[] = [];
+    for (const entry of data as Record<string, unknown>[]) {
+      if (!entry) continue;
+      if (Array.isArray(entry.runners)) {
+        for (const r of entry.runners as Record<string, unknown>[]) out.push(this.normalizeRunner(r));
+      } else if (entry.runner_id !== undefined || entry.url !== undefined || entry.runner_url !== undefined) {
+        out.push(this.normalizeRunner(entry));
+      }
+    }
+    return out;
+  }
+
+  normalizeRunner(raw: Record<string, unknown>): RunnerInfo {
+    const url = String(raw.url ?? raw.runner_url ?? "");
+    let id = raw.runner_id ? String(raw.runner_id) : "";
+    if (!id && url) {
+      const seg = url.replace(/\/+$/, "").split("/");
+      id = seg.length >= 2 ? seg[seg.length - 2] : seg[seg.length - 1] || url;
+    }
+    if (!id) id = "runner";
+    const gpuRaw = raw.gpu && typeof raw.gpu === "object" ? (raw.gpu as Record<string, unknown>) : {};
+    const gpu: { name?: string; vram_mb?: number } = {};
+    if (gpuRaw.name !== undefined) gpu.name = String(gpuRaw.name);
+    if (typeof gpuRaw.vram_mb === "number") gpu.vram_mb = gpuRaw.vram_mb;
+    const label = raw.label !== undefined ? String(raw.label) : "";
+    const name = gpu.name || label || id;
+    let caps: string[] = [];
+    if (Array.isArray(raw.capabilities)) caps = (raw.capabilities as unknown[]).map(String);
+    if (caps.length === 0) {
+      const meta = parseMeta(raw.metadata);
+      if (Array.isArray(meta.capabilities)) caps = (meta.capabilities as unknown[]).map(String);
+    }
+    // Price is taken from the upstream payload only. And only when it is
+    // actually present — we never invent one.
+    let micros: number | undefined;
+    if (raw.priceUsdMicrosPerSec !== undefined) micros = Number(raw.priceUsdMicrosPerSec);
+    else if (raw.price_info && typeof raw.price_info === "object") {
+      const pi = raw.price_info as Record<string, unknown>;
+      if (typeof pi.price === "number") {
+        micros = String(pi.unit).includes("sec")
+          ? Math.round(pi.price * 1_000_000)
+          : Math.round((pi.price / 60) * 1_000_000);
+      }
+    }
+    const status = raw.status === "busy" ? "busy" : raw.status === "offline" ? "offline" : "ready";
+    return {
+      id,
+      name,
+      url,
+      status,
+      capabilities: { tasks: caps },
+      ...(micros !== undefined && Number.isFinite(micros) ? { priceUsdMicrosPerSec: micros } : {}),
+      ...(gpu.name !== undefined || gpu.vram_mb !== undefined ? { gpu } : {}),
+    };
   }
 
   /** Pick the cheapest eligible runner by price; fall back to load-round-robin. */

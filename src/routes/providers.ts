@@ -15,9 +15,10 @@
 import { z } from "zod";
 import { err, ok } from "../utils";
 import { makeOrchestrator, parseBody, resolveUserFromRequest } from "./lib";
-import { deleteProvider, getProvider, setProvider } from "../jobs";
+import { deleteProvider, getProvider, setProvider, getSettings } from "../jobs";
 import type { Env } from "../types";
-import type { RunnerInfo } from "../orchestrator";
+import { OrchestratorClient, type RunnerInfo } from "../orchestrator";
+import { DEFAULT_ORCHESTRATOR_URL } from "./lib";
 
 const capsSchema = z.object({ capabilities: z.array(z.string()).optional() });
 const selectSchema = z.object({ runnerId: z.string().min(1) });
@@ -29,8 +30,15 @@ const TASK_LABELS: Record<string, string> = {
   retake: "Retake",
   restyle: "Restyle",
   "ic-lora": "IC-LoRA",
+  "ic-lora-generate": "IC-LoRA",
   sam3: "Segment",
   prompt: "Prompt Enhance",
+  "prompt-enhance": "Prompt Enhance",
+  "suggest-gap-prompt": "Script Gap Fill",
+  i2v: "Image-to-Video",
+  edit: "Masked Edit",
+  "extract-conditioning": "Extract Conditioning",
+  chat: "Chat",
 };
 
 /** Demo runners used when the orchestrator isn't stood up yet (DEMO_RUNNERS=1, local). */
@@ -45,7 +53,6 @@ function demoRunners(caps: string[]): RunnerInfo[] {
       url: "livepeer://runner.demo/demo-rtx-4090-1",
       status: "ready",
       capabilities: { tasks: ["t2v", "extend", "retake", "prompt"] },
-      priceUsdMicrosPerSec: 600, // $0.0006/s ≈ $0.036/min
       location: "demo",
     });
   }
@@ -56,7 +63,6 @@ function demoRunners(caps: string[]): RunnerInfo[] {
       url: "livepeer://runner.demo/demo-rtx-5090-1",
       status: "ready",
       capabilities: { tasks: ["t2v", "image", "restyle", "extend", "ic-lora", "sam3"] },
-      priceUsdMicrosPerSec: 900, // $0.0009/s ≈ $0.054/min
       location: "demo",
     });
   }
@@ -72,7 +78,7 @@ function toProviderDto(
     runner_id: r.id,
     url: r.url,
     status: r.status,
-    gpu: undefined,
+    gpu: r.gpu ?? null,
     price_info:
       typeof r.priceUsdMicrosPerSec === "number"
         ? { price: r.priceUsdMicrosPerSec / 1_000_000, currency: "USD", unit: "per_second" }
@@ -88,10 +94,28 @@ function toProviderDto(
 }
 
 /** GET /api/providers — discover ready runners (user's saved choice surfaced first). */
+/**
+ * Build an orchestrator client from the user's configured discovery URL (drives
+ * which orchestrator we discover), falling back to env then the local default.
+ */
+async function orchestratorFor(env: Env, userId: string): Promise<OrchestratorClient> {
+  let base = env.ORCHESTRATOR_BASE_URL || DEFAULT_ORCHESTRATOR_URL;
+  if (env.DB) {
+    try {
+      const st = await getSettings(env.DB, userId);
+      const du = st && typeof (st as Record<string, unknown>).livepeerDiscoveryUrl === "string"
+        ? String((st as Record<string, unknown>).livepeerDiscoveryUrl).trim()
+        : "";
+      if (du) base = du;
+    } catch { /* fall back to env/default */ }
+  }
+  return new OrchestratorClient({ baseUrl: base });
+}
+
 export async function getProviders(request: Request, env: Env): Promise<Response> {
   const u = await resolveUserFromRequest(request, env);
   if (!u.ok) return u.response;
-  const orch = makeOrchestrator(env);
+  const orch = await orchestratorFor(env, u.userId);
   const caps = (new URL(request.url).searchParams.get("capabilities") || "").split(",").filter(Boolean);
   let runners: RunnerInfo[] = [];
   let discoveryError: string | null = null;
@@ -123,7 +147,7 @@ export async function postDiscoverProviders(request: Request, env: Env): Promise
   if (!u.ok) return u.response;
   const body = await parseBody(request, capsSchema);
   const caps = body.ok ? body.data.capabilities ?? [] : [];
-  const orch = makeOrchestrator(env);
+  const orch = await orchestratorFor(env, u.userId);
   let runners: RunnerInfo[] = [];
   let discoveryError: string | null = null;
   try {
