@@ -223,6 +223,39 @@ export class OrchestratorClient {
     return runners[0];
   }
 
+  /**
+   * POST a job payload DIRECTLY to a runner's API endpoint
+   * (`runner.url + <task endpoint>`). There is NO job API between runners — the
+   * webapp/WWW targets the runner itself and the task endpoint resolves the
+   * task (e.g. `/video-creator/v1/{endpoint}`). Returns the HTTP status + body.
+   */
+  async postToRunner(
+    runner: RunnerInfo,
+    endpoint: string,
+    body: unknown,
+    timeoutMs = 120000,
+  ): Promise<{ status: number; data: any }> {
+    const url = runner.url.replace(/\/+$/, "") + endpoint;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await this.fetchImpl(url, {
+        method: "POST",
+        headers: DEFAULT_HEADERS,
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      const text = await res.text();
+      let data: any = null;
+      if (text) {
+        try { data = JSON.parse(text); } catch { data = null; }
+      }
+      return { status: res.status, data };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
   /** Submit a job to a specific runner; returns the orchestrator's job id. */
   async submitJob(runner: RunnerInfo, payload: JobPayload): Promise<SubmittedJob> {
     const res = await this.fetchImpl(this.endpoint(`/api/jobs`), {

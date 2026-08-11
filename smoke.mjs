@@ -76,14 +76,17 @@ globalThis.fetch = async (url, opts = {}) => {
   if (u.includes('pymthouse.example')) return new Response(JSON.stringify({ ok: true, remainingUsdMicros: '9000000' }), { status: 200 });
   if (u.includes('api.stripe.com')) return new Response(JSON.stringify({ url: 'https://pay.example/checkout', id: 'cs_1' }), { status: 200 });
   if (u.startsWith(ORCH + '/api/discovery')) {
-    return new Response(JSON.stringify({ runners: [
-      { id: 'r1', name: 'runner-1', url: 'http://runner-1:8000', status: 'ready',
-        capabilities: { tasks: ['t2v','image','prompt','extend','retake','restyle','ic-lora','sam3'] },
+    // go-livepeer array discovery: one capable runner that advertises a price
+    // (>0 => dispatch exercises the PymtHouse ledger path).
+    return new Response(JSON.stringify([{ address: ORCH, runners: [
+      { url: 'http://runner-1:8000', gpu: { name: 'RTX 5090', vram_mb: 32607 },
+        capabilities: ['t2v','image','prompt','extend','retake','restyle','ic-lora','sam3'],
         priceUsdMicrosPerSec: 1200 },
-    ] }), { status: 200 });
+    ] }]), { status: 200 });
   }
-  if (u.startsWith(ORCH + '/api/jobs')) {
-    if ((opts.method || 'GET') === 'POST') return new Response(JSON.stringify({ jobId: 'job-1', status: 'queued' }), { status: 201 });
+  // Direct-to-runner POST (no /api/jobs intermediary).
+  if (u.startsWith('http://runner-1:8000')) {
+    if ((opts.method || 'GET') === 'POST') return new Response(JSON.stringify({ ok: true, jobId: 'job-1' }), { status: 200 });
     return new Response(JSON.stringify({ id: 'job-1', status: 'running' }), { status: 200 });
   }
   return realFetch(url, opts);

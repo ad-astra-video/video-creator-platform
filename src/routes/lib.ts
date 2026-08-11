@@ -10,7 +10,7 @@ import { getExternalUserByKeyHash } from "../ledger";
 import { logPayment } from "../ledger";
 import { PymtHouseClient } from "../pymthouse";
 import { OrchestratorClient, type RunnerInfo } from "../orchestrator";
-import { createJob, updateJob } from "../jobs";
+import { createJob, updateJob, getSettings } from "../jobs";
 import { sha256Hex, cryptoRandomHex } from "../utils";
 import type { Env } from "../types";
 
@@ -30,6 +30,40 @@ export function jobCostMicros(env: Env): bigint {
   const raw = env.JOB_COST_USD_MICROS || DEFAULT_JOB_COST_USD_MICROS;
   const n = BigInt(raw);
   return n > 0n ? n : BigInt(DEFAULT_JOB_COST_USD_MICROS);
+}
+
+/**
+ * Task -> runner API endpoint. The webapp posts a job directly to the runner at
+ * `runner.url + endpoint` (there is NO job API / intermediary between runners).
+ */
+const TASK_ENDPOINTS: Record<string, string> = {
+  generate: "/video-creator/v1/t2v",
+  "generate-image": "/video-creator/v1/image",
+  "enhance-prompt": "/video-creator/v1/prompt-enhance",
+  extend: "/video-creator/v1/extend",
+  retake: "/video-creator/v1/retake",
+  restyle: "/video-creator/v1/restyle",
+  "restyle:extract-first-frame": "/video-creator/v1/extract-first-frame",
+  "restyle:segment-subject": "/video-creator/v1/sam3",
+  "restyle:style-frame": "/video-creator/v1/style",
+  "ic-lora": "/video-creator/v1/ic-lora-generate",
+  "ic-lora:extract-conditioning": "/video-creator/v1/extract-conditioning",
+  edit: "/video-creator/v1/edit",
+};
+
+export function endpointForTask(type: string): string {
+  return TASK_ENDPOINTS[type] || `/video-creator/v1/${type}`;
+}
+
+/**
+ * True when a runner advertises a non-zero price. PymtHouse should be called
+ * ONLY when this is true — a free runner is dispatched with no ledger touch.
+ */
+export function runnerChargesPrice(runner: RunnerInfo): boolean {
+  if (typeof runner.priceUsdMicrosPerSec === "number" && runner.priceUsdMicrosPerSec > 0) return true;
+  const ppu = runner.priceInfo?.pricePerUnit;
+  if (typeof ppu === "number" && ppu > 0) return true;
+  return false;
 }
 
 /** Parse + zod-validate a JSON body. Returns { ok:false } response on failure. */
@@ -84,47 +118,62 @@ export async function dispatchJob(
   requiredCaps: string[] = [],
 ): Promise<DispatchResult> {
   if (!env.DB) return { ok: false, response: err("Server error: DB unavailable", 500) };
+
+  // Resolve the orchestrator base from THIS user's configured Discovery URL
+  // (fall back to env, then the local default), then discover + select a
+  // capable runner FIRST — we need its advertised price to decide on the ledger.
+  const settings = (await getSettings(env.DB, externalUserId).catch(() => null)) as
+    { livepeerDiscoveryUrl?: unknown } | null;
+  const toTrim = settings?.livepeerDiscoveryUrl ?? "";
+  const discoveryBase = (typeof toTrim === "string" ? toTrim.trim() : "") || env.ORCHESTRATOR_BASE_URL || DEFAULT_ORCHESTRATOR_URL;
+  const orch = new OrchestratorClient({ baseUrl: discoveryBase });
+
+  let runner: RunnerInfo;
+  try {
+    const runners = await orch.discoverRunners(requiredCaps);
+    const picked = orch.selectRunner(runners, requiredCaps);
+    if (!picked) throw new Error("no ready runner available for the requested capabilities");
+    runner = picked;
+  } catch (e) {
+    return { ok: false, response: err(`dispatch failed: ${(e as Error).message}`, 502) };
+  }
+
+  // ONLY charge through PymtHouse if this runner advertises a non-zero price.
+  // A free runner dispatches with no ledger call at all.
   const client = new PymtHouseClient(env);
-  const cost = jobCostMicros(env);
+  const charges = runnerChargesPrice(runner);
+  const cost = charges ? jobCostMicros(env) : 0n;
+  if (charges) {
+    try {
+      const balance = await client.getBalance(externalUserId);
+      const remaining = BigInt(balance?.remainingUsdMicros ?? "0");
+      if (remaining < cost) return { ok: false, response: err("insufficient credits — please top up", 402) };
+      await client.consumeCredits(externalUserId, cost.toString());
+    } catch (e) {
+      return { ok: false, response: err(`debit failed: ${(e as Error).message}`, 502) };
+    }
+    await logPayment(env.DB, { kind: "job_debit", externalUserId, amountUsdMicros: cost.toString(), reason: type });
+  }
 
-  // 1 + 2: check then decrement the ledger BEFORE dispatch.
-  let balance;
-  try {
-    balance = await client.getBalance(externalUserId);
-  } catch (e) {
-    return { ok: false, response: err(`balance check failed: ${(e as Error).message}`, 502) };
-  }
-  const remaining = BigInt(balance?.remainingUsdMicros ?? "0");
-  if (remaining < cost) {
-    return { ok: false, response: err("insufficient credits — please top up", 402) };
-  }
-  try {
-    await client.consumeCredits(externalUserId, cost.toString());
-  } catch (e) {
-    return { ok: false, response: err(`debit failed: ${(e as Error).message}`, 402) };
-  }
-  await logPayment(env.DB, { kind: "job_debit", externalUserId, amountUsdMicros: cost.toString(), reason: type });
-
-  // 3: persist the job.
+  // Persist the job (our local id is canonical for progress in D1).
   const jobId = cryptoRandomHex(12);
   await createJob(env.DB, { id: jobId, user_id: externalUserId, type, request_json: requestBody });
 
-  // 4: dispatch via the orchestrator.
-  const orch = makeOrchestrator(env);
+  // POST the job DIRECTLY to the runner (no orchestrator job intermediary).
   try {
-    const runners = await orch.discoverRunners(requiredCaps);
-    const runner = orch.selectRunner(runners, requiredCaps);
-    if (!runner) throw new Error("no ready runner available for the requested capabilities");
-    const submitted = await orch.submitJob(runner, { type, jobId, request: requestBody });
+    const endpoint = endpointForTask(type);
+    const res = await orch.postToRunner(runner, endpoint, { jobId, ...(requestBody as Record<string, unknown>) });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`runner ${res.status}: ${res.data !== null ? JSON.stringify(res.data) : ""}`);
+    }
     await updateJob(env.DB, jobId, { status: "running", runner: runner.id });
-    // The local jobId is canonical (shared with the orchestrator as jobId, per the jobs schema).
     return { ok: true, jobId, response: ok({ jobId }) };
   } catch (e) {
-    // 5 (failure): refund + mark failed.
-    try {
-      await client.refundCredits(externalUserId, cost.toString());
-    } catch { /* best-effort refund */ }
-    await logPayment(env.DB, { kind: "job_refund", externalUserId, amountUsdMicros: cost.toString(), reason: `${type} dispatch failure` });
+    // Failure: refund (only if we charged) + mark failed.
+    if (charges) {
+      try { await client.refundCredits(externalUserId, cost.toString()); } catch { /* best-effort */ }
+      await logPayment(env.DB, { kind: "job_refund", externalUserId, amountUsdMicros: cost.toString(), reason: `${type} dispatch failure` });
+    }
     await updateJob(env.DB, jobId, { status: "failed" });
     return { ok: false, response: err(`dispatch failed: ${(e as Error).message}`, 502) };
   }
