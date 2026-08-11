@@ -1,18 +1,16 @@
 /**
- * Settings (keep (Worker/D1, per-user)): per-user app settings stored as JSON
- * in D1. GET returns the current settings; POST merges the provided fields.
+ * Settings (keep (Worker/D1, per-user)): per-user app settings stored as JSON in D1.
+ *
+ * The vendored desktop frontend expects the desktop backend's FLAT settings contract:
+ * GET /api/settings returns the settings object at the top level
+ * (e.g. `{ livepeerDiscoveryUrl, remoteInferenceEnabled, ... })`, and updates POST the
+ * same flat object. We match that exactly so settings save and re-load through the UI.
  */
 
-import { z } from "zod";
 import { err, ok } from "../utils";
 import { getSettings, setSettings } from "../jobs";
-import { parseBody, resolveUserFromRequest } from "./lib";
+import { resolveUserFromRequest } from "./lib";
 import type { Env } from "../types";
-
-const settingsSchema = z.object({
-  // Arbitrary per-user settings; we validate it's a JSON object.
-  settings: z.record(z.string(), z.unknown()),
-});
 
 export async function getSettingsRoute(request: Request, env: Env): Promise<Response> {
   const u = await resolveUserFromRequest(request, env);
@@ -20,24 +18,35 @@ export async function getSettingsRoute(request: Request, env: Env): Promise<Resp
   if (!env.DB) return err("Server error", 500);
   const stored = await getSettings(env.DB, u.userId);
   return ok({
-    settings: {
-      ...stored,
-      // Serverless web app: inference is ALWAYS remote (Worker -> orchestrator -> runners),
-      // so report remote mode so the desktop's local-install / API-key first-run gates are skipped.
-      remoteInferenceEnabled: true,
-      hasLivepeerDiscoveryUrl: true,
-      hasLtxApiKey: false,
-      hasFalApiKey: false,
-    },
+    ...stored,
+    // Serverless web app: inference is ALWAYS remote (Worker -> orchestrator -> runners),
+    // so report remote mode so the desktop's local-install / API-key first-run gates are skipped.
+    livepeerDiscoveryUrl: (stored.livepeerDiscoveryUrl as string) ?? "",
+    remoteInferenceEnabled: true,
+    hasLivepeerDiscoveryUrl: Boolean(stored.livepeerDiscoveryUrl),
+    hasLtxApiKey: false,
+    hasFalApiKey: false,
   });
 }
 
 export async function postSettingsRoute(request: Request, env: Env): Promise<Response> {
   const u = await resolveUserFromRequest(request, env);
   if (!u.ok) return u.response;
-  const body = await parseBody(request, settingsSchema);
-  if (!body.ok) return body.response;
   if (!env.DB) return err("Server error", 500);
-  await setSettings(env.DB, u.userId, body.data.settings);
-  return ok({ ok: true, settings: body.data.settings });
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return err("Invalid JSON body", 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return err("settings must be a JSON object", 400);
+  }
+
+  // Merge so a partial save (e.g. just the Discovery URL) never wipes other settings.
+  const stored = await getSettings(env.DB, u.userId);
+  const merged: Record<string, unknown> = { ...stored, ...(body as Record<string, unknown>) };
+  await setSettings(env.DB, u.userId, merged);
+  return ok(merged);
 }
