@@ -13,7 +13,7 @@ interface ProviderDto {
   url: string
   status: string
   gpu?: { name?: string; vram_mb?: number } | null
-  price_info?: { price: number; currency: string; unit: string } | null
+  price_info?: { usdPerSec?: number; pricePerUnit?: number; pixelsPerUnit?: number } | null
   selected: boolean
   excluded: boolean
   demo?: boolean
@@ -24,6 +24,21 @@ function fmtPrice(priceUsdPerSec: number): string {
   if (priceUsdPerSec >= 0.1) return `$${priceUsdPerSec.toFixed(2)}/sec`
   if (priceUsdPerSec >= 0.001) return `$${priceUsdPerSec.toFixed(4)}/sec`
   return `$${priceUsdPerSec.toFixed(6)}/sec`
+}
+
+/** Render the price for a runner. A present-but-zero price is real (free) and shown,
+ *  never blank. Handles USD/sec and the canonical go-livepeer PriceInfo
+ *  (pricePerUnit wei + pixelsPerUnit). Returns null when no price was advertised. */
+function formatPrice(pi: NonNullable<ProviderDto['price_info']>): string {
+  if (pi.usdPerSec !== undefined) {
+    if (pi.usdPerSec === 0) return 'Free ($0.00/sec)'
+    return fmtPrice(pi.usdPerSec)
+  }
+  if (pi.pricePerUnit !== undefined) {
+    if (pi.pricePerUnit === 0) return 'Free'
+    return `${pi.pricePerUnit} wei / ${pi.pixelsPerUnit ?? 1} px`
+  }
+  return ''
 }
 
 /**
@@ -121,7 +136,7 @@ export function RunnersSection() {
 
               <div className="flex items-center gap-2 text-xs text-zinc-300">
                 <DollarSign className="h-3.5 w-3.5 text-green-400 flex-shrink-0" />
-                {p.price_info ? fmtPrice(p.price_info.price) : 'Pricing unavailable'}
+                {p.price_info ? formatPrice(p.price_info) || 'Pricing unavailable' : 'Pricing not advertised'}
               </div>
 
               {(p.capabilities?.length ?? 0) > 0 && (
