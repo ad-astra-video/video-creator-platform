@@ -26,15 +26,30 @@ export interface CatalogModel {
   source?: string;
 }
 
-export interface CatalogLora {
+export interface CatalogLoraVariant {
   id: string;
-  name: string;
-  description: string;
-  /** Whether it ships pre-fetched on runners or must be downloaded on demand. */
-  offline: boolean;
-  recommended?: boolean;
-  tags: string[];
+  label: string;
+  filename: string;
+  size_bytes: number;
 }
+/** Full LoraCatalogItem / IcLoraCatalogItem-shape catalog entry (what the frontend's
+ *  `catalogItemToEntry` reads: download.repo_id + download.variants + name/desc/strength). */
+export interface CatalogLora {
+  allows_empty_prompt?: boolean;
+  /** Only on IC-LoRAs (IcLoraCatalogItem). */
+  allows_reference_image?: boolean;
+  author?: { name: string; url?: string | null } | null;
+  description: string;
+  download: { repo_id: string; variants: CatalogLoraVariant[] };
+  id: string;
+  license?: { name: string; url?: string | null } | null;
+  media?: { thumbnail?: string | null; demo_video?: string | null } | null;
+  name: string;
+  recommended_strength?: number | null;
+  requires_hf_login: boolean;
+  tags?: string[];
+}
+export { };
 
 export interface Catalog {
   models: CatalogModel[];
@@ -101,14 +116,14 @@ const DEFAULT_CATALOG: Catalog = {
     },
   ],
   loras: [
-    { id: "cinesuit", name: "CineSuit", description: "Cinematic color + film grain style", offline: true, recommended: true, tags: ["style"] },
-    { id: "bokeh", name: "Bokeh", description: "Shallow depth-of-field portrait look", offline: true, tags: ["style"] },
-    { id: "anime", name: "Anime", description: "Anime illustration style", offline: false, tags: ["style"] },
-    { id: "macro", name: "Macro", description: "Macro / close-up detail boost", offline: false, tags: ["style"] },
+    { id: "cinesuit", name: "CineSuit", description: "Cinematic color + film grain style", allows_empty_prompt: true, requires_hf_login: false, tags: ["style"], recommended_strength: 0.8, download: { repo_id: "Lightricks/ltx-models", variants: [{ id: "cinesuit", label: "CineSuit", filename: "cinesuit.safetensors", size_bytes: 260_000_000 }] } },
+    { id: "bokeh", name: "Bokeh", description: "Shallow depth-of-field portrait look", allows_empty_prompt: true, requires_hf_login: false, tags: ["style"], recommended_strength: 0.6, download: { repo_id: "Lightricks/ltx-models", variants: [{ id: "bokeh", label: "Bokeh", filename: "bokeh.safetensors", size_bytes: 260_000_000 }] } },
+    { id: "anime", name: "Anime", description: "Anime illustration style", allows_empty_prompt: true, requires_hf_login: false, tags: ["style"], recommended_strength: 0.7, download: { repo_id: "Lightricks/ltx-models", variants: [{ id: "anime", label: "Anime", filename: "anime.safetensors", size_bytes: 260_000_000 }] } },
+    { id: "macro", name: "Macro", description: "Macro / close-up detail boost", allows_empty_prompt: true, requires_hf_login: false, tags: ["style"], recommended_strength: 0.75, download: { repo_id: "Lightricks/ltx-models", variants: [{ id: "macro", label: "Macro", filename: "macro.safetensors", size_bytes: 260_000_000 }] } },
   ],
   icLoras: [
-    { id: "subject-preserve", name: "Subject Preserve", description: "Identity-consistent subject restyle (IC-LoRA)", offline: true, recommended: true, tags: ["identity"] },
-    { id: "style-transfer", name: "Style Transfer", description: "Reference style transfer to the subject", offline: true, tags: ["style"] },
+    { id: "subject-preserve", name: "Subject Preserve", description: "Identity-consistent subject restyle (IC-LoRA)", allows_empty_prompt: false, allows_reference_image: true, requires_hf_login: false, tags: ["identity"], recommended_strength: 1.0, download: { repo_id: "Lightricks/ltx-models", variants: [{ id: "subject-preserve", label: "Subject Preserve", filename: "subject-preserve.safetensors", size_bytes: 320_000_000 }] } },
+    { id: "style-transfer", name: "Style Transfer", description: "Reference style transfer to the subject", allows_empty_prompt: false, allows_reference_image: true, requires_hf_login: false, tags: ["style"], recommended_strength: 1.0, download: { repo_id: "Lightricks/ltx-models", variants: [{ id: "style-transfer", label: "Style Transfer", filename: "style-transfer.safetensors", size_bytes: 320_000_000 }] } },
   ],
 };
 
@@ -153,5 +168,55 @@ export function catalogService() {
       if (!m) return null;
       return { name: m.name, id: m.id, recommended: true, versions: m.versions };
     },
+  };
+}
+
+
+/** Contract shape for GET /api/generate/models-specs (GenerateVideoModelsSpecsResponse). */
+export interface VideoGenerationModelSpecItem {
+  pipeline: "fast" | "pro";
+  spec: {
+    display_name: string;
+    supported_resolutions_durations: Record<string, { fps_to_durations: Record<string, number[]> }>;
+    a2v_supported_resolutions_durations?: Record<string, { fps_to_durations: Record<string, number[]> }> | null;
+  };
+}
+
+const _fullDurations = [6, 8, 10, 12, 14, 16, 18, 20];
+const _shortDurations = [6, 8, 10];
+const _fps = (d24: number[], d25: number[]) => ({
+  "24": d24,
+  "25": d25,
+  "48": _shortDurations,
+  "50": _shortDurations,
+});
+const _res = (r24: number[], r25: number[]) => ({
+  "1080p": { fps_to_durations: _fps(r24, r25) },
+  "1440p": { fps_to_durations: _fps(_shortDurations, _shortDurations) },
+  "2160p": { fps_to_durations: _fps(_shortDurations, _shortDurations) },
+});
+
+/**
+ * Real LTX-2 video-generation capability specs (mirrored from the desktop backend's
+ * api_model_specs.py) so the browser timeline editor can build its resolution/fps/duration
+ * pickers. There are no local models in the web app — inference runs on remote runners.
+ */
+export function getVideoGenerationModelSpecs(): { api_models: VideoGenerationModelSpecItem[]; local_models: VideoGenerationModelSpecItem[] } {
+  const fastSpec: VideoGenerationModelSpecItem["spec"] = {
+    display_name: "LTX-2.3 Fast (API)",
+    supported_resolutions_durations: _res(_fullDurations, _fullDurations),
+    a2v_supported_resolutions_durations: _res(_fullDurations, _fullDurations),
+  };
+  const proSpec: VideoGenerationModelSpecItem["spec"] = {
+    display_name: "LTX-2.3 Pro (API)",
+    supported_resolutions_durations: _res(_shortDurations, _shortDurations),
+    a2v_supported_resolutions_durations: _res(_shortDurations, _shortDurations),
+  };
+  return {
+    local_models: [],
+    api_models: [
+      { pipeline: "fast", spec: fastSpec },
+      { pipeline: "pro", spec: proSpec },
+    ],
   };
 }

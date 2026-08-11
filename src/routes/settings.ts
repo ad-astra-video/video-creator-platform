@@ -18,7 +18,18 @@ export async function getSettingsRoute(request: Request, env: Env): Promise<Resp
   const u = await resolveUserFromRequest(request, env);
   if (!u.ok) return u.response;
   if (!env.DB) return err("Server error", 500);
-  return ok({ settings: await getSettings(env.DB, u.userId) });
+  const stored = await getSettings(env.DB, u.userId);
+  return ok({
+    settings: {
+      ...stored,
+      // Serverless web app: inference is ALWAYS remote (Worker -> orchestrator -> runners),
+      // so report remote mode so the desktop's local-install / API-key first-run gates are skipped.
+      remoteInferenceEnabled: true,
+      hasLivepeerDiscoveryUrl: true,
+      hasLtxApiKey: false,
+      hasFalApiKey: false,
+    },
+  });
 }
 
 export async function postSettingsRoute(request: Request, env: Env): Promise<Response> {

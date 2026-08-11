@@ -71,8 +71,7 @@ import { getSettingsRoute, postSettingsRoute } from "./routes/settings";
 import { getPlatformStatus } from "./routes/platform";
 import { postHfLogin, getHfCallback, getHfStatus, postHfLogout } from "./routes/hf-auth";
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+async function handle(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -135,6 +134,12 @@ export default {
 
     try {
       const uid = user.externalUserId;
+
+      // Runtime policy + GPU info (web app: no local GPU; generation is Worker-dispatched).
+      if (method === "GET" && path === "/api/runtime-policy")
+        return ok({ force_api_generations: false, wait_for_model_download: false, allow_cuda_backend: true });
+      if (method === "GET" && path === "/api/gpu-info")
+        return ok({ pretty_name: "none", vram_bytes: 0, torch_backend: "none", cuda_available: false });
 
       // Worker-reimplemented API surface (api-contract.md).
       // Catalog:
@@ -207,6 +212,23 @@ export default {
       if (/unauthorized|invalid|not found/i.test(msg)) return err(msg, 400);
       return err(msg || "Server error", 500);
     }
+}
+
+// CORS: apply allow-origin on ALL responses (not just the OPTIONS preflight) so a
+// browser app served on a different origin can call this Worker directly.
+function withCors(request: Request, env: Env, res: Response): Response {
+  const origin = request.headers.get("origin");
+  if (!origin) return res;
+  res.headers.set("access-control-allow-origin", origin);
+  res.headers.set("access-control-expose-headers", "content-type, content-length");
+  res.headers.set("vary", "Origin");
+  return res;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const res = await handle(request, env);
+    return withCors(request, env, res);
   },
 };
 
