@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { DollarSign, Info, RefreshCw, Server, X } from 'lucide-react'
+import { DollarSign, Info, RefreshCw, Server } from 'lucide-react'
 import { ApiClient } from '../../lib/api-client'
 import { Button } from '../ui/button'
 
@@ -20,11 +20,11 @@ interface ProviderDto {
   capabilities?: RunnerCap[]
 }
 
-// Browser-local list of runner addresses the user has chosen not to use ("skipped").
-// Persisted so the choice is remembered for the same orchestrator/runner across sessions.
-const STORAGE_KEY = 'vc-skipped-providers'
+// Browser-local list of runner addresses the user has chosen not to use ("excluded"),
+// persisted so the choice is remembered for the same orchestrator/runner across sessions.
+const STORAGE_KEY = 'vc-excluded-providers'
 
-function loadSkipped(): string[] {
+function loadExcluded(): string[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     const parsed = raw ? JSON.parse(raw) : []
@@ -34,7 +34,7 @@ function loadSkipped(): string[] {
   }
 }
 
-function saveSkipped(list: string[]) {
+function saveExcluded(list: string[]) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
   } catch {
@@ -59,17 +59,17 @@ function formatPrice(pi: NonNullable<ProviderDto['price_info']>): string | null 
 
 export function RunnersSection() {
   const [providers, setProviders] = useState<ProviderDto[]>([])
-  const [skipped, setSkipped] = useState<string[]>(() => loadSkipped())
+  const [excluded, setExcluded] = useState<string[]>(() => loadExcluded())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [discoveryUrl, setDiscoveryUrl] = useState('')
 
-  const isSkipped = useCallback((p: ProviderDto) => p.excluded || skipped.includes(p.url), [skipped])
+  const isExcluded = useCallback((p: ProviderDto) => p.excluded || excluded.includes(p.url), [excluded])
 
-  const toggleSkip = (p: ProviderDto) => {
-    setSkipped(prev => {
+  const toggleExclude = (p: ProviderDto) => {
+    setExcluded(prev => {
       const next = prev.includes(p.url) ? prev.filter(u => u !== p.url) : [...prev, p.url]
-      saveSkipped(next)
+      saveExcluded(next)
       return next
     })
   }
@@ -93,7 +93,7 @@ export function RunnersSection() {
   }, [refresh])
 
   const demo = providers.length > 0 && providers.every(p => p.demo)
-  const skippedCount = providers.filter(isSkipped).length
+  const excludedCount = providers.filter(isExcluded).length
 
   return (
     <div className="space-y-3">
@@ -102,19 +102,13 @@ export function RunnersSection() {
           <Server className="h-4 w-4 text-blue-400" />
           <h3 className="text-sm font-semibold text-white">Available Runners</h3>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="border-zinc-700"
-          onClick={() => void refresh()}
-          disabled={loading}
-        >
+        <Button variant="outline" size="sm" className="border-zinc-700" onClick={() => void refresh()} disabled={loading}>
           <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} /> Refresh
         </Button>
       </div>
 
       <p className="text-xs text-zinc-500 leading-relaxed">
-        Runners advertise the models they can execute and the price to run them. You can Skip a runner to
+        Runners advertise the models they can execute and the price to run them. You can exclude a runner to
         stop it being used.
         {demo ? ' No live runner is connected yet — showing reference runners from the platform catalog.' : ''}
       </p>
@@ -126,9 +120,9 @@ export function RunnersSection() {
         </div>
       ) : null}
 
-      {skippedCount > 0 ? (
+      {excludedCount > 0 ? (
         <div className="text-[11px] text-amber-400/90">
-          {skippedCount} runner{skippedCount === 1 ? '' : 's'} skipped — they won't be used.
+          {excludedCount} runner{excludedCount === 1 ? '' : 's'} excluded — they won't be used.
         </div>
       ) : null}
 
@@ -144,12 +138,9 @@ export function RunnersSection() {
       ) : (
         <div className="space-y-2">
           {providers.map(p => {
-            const sk = isSkipped(p)
+            const ex = isExcluded(p)
             return (
-              <div
-                key={p.runner_id}
-                className={`rounded-lg bg-zinc-800/50 p-3 space-y-2 ${sk ? 'opacity-55' : ''}`}
-              >
+              <div key={p.runner_id} className={`rounded-lg bg-zinc-800/50 p-3 space-y-2 ${ex ? 'opacity-55' : ''}`}>
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="text-sm text-white truncate">{p.gpu?.name || p.runner_id}</span>
@@ -158,9 +149,9 @@ export function RunnersSection() {
                         demo
                       </span>
                     )}
-                    {sk && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-700 text-zinc-300 flex-shrink-0">
-                        skipped
+                    {ex && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 flex-shrink-0">
+                        excluded
                       </span>
                     )}
                   </div>
@@ -172,14 +163,21 @@ export function RunnersSection() {
                     >
                       {p.status}
                     </span>
-                    <button
-                      onClick={() => toggleSkip(p)}
-                      className="flex items-center gap-1 text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:bg-zinc-700/60"
-                      title={sk ? 'Use this runner again' : 'Do not use this runner'}
-                    >
-                      {sk && <X className="h-3 w-3" />}
-                      {sk ? 'Un-skip' : 'Skip this runner'}
-                    </button>
+                    <label className="flex items-center gap-1.5 cursor-pointer select-none" title={ex ? 'Allow this runner' : 'Exclude this runner'}>
+                      <span className={`text-[11px] ${ex ? 'text-red-400' : 'text-zinc-300'}`}>Exclude</span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={ex}
+                        aria-label="Exclude runner"
+                        onClick={() => toggleExclude(p)}
+                        className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/50 ${ex ? 'bg-red-500' : 'bg-zinc-700'}`}
+                      >
+                        <span
+                          className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${ex ? 'translate-x-3' : 'translate-x-0.5'}`}
+                        />
+                      </button>
+                    </label>
                   </div>
                 </div>
 
