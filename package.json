@@ -10,6 +10,7 @@
     "d1:migrate:local": "wrangler d1 migrations apply DB --local",
     "d1:migrate": "wrangler d1 migrations apply DB --remote",
     "d1:list": "wrangler d1 list",
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/worker.js",
     "typecheck": "tsc --noEmit",
     "smoke": "node smoke.mjs",
     "cf-typegen": "wrangler types"
@@ -20,6 +21,7 @@
     "wrangler": "^3.86.0"
   },
   "dependencies": {
-    "@pymthouse/builder-sdk": "^0.6.3"
+    "@pymthouse/builder-sdk": "^0.6.3",
+    "zod": "^4.4.3"
   }
 }

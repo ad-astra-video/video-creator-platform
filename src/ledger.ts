@@ -100,7 +100,7 @@ export async function markApplied(db: D1Database, key: string): Promise<void> {
 // Payment / credit audit log (monitoring + admin)
 // ---------------------------------------------------------------------------
 
-export type PaymentKind = "topup" | "admin_grant" | "refund";
+export type PaymentKind = "topup" | "admin_grant" | "refund" | "job_debit" | "job_refund";
 
 export interface PaymentLogInput {
   kind: PaymentKind;

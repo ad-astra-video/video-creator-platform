@@ -42,6 +42,27 @@ export class PymtHouseClient {
     return data as Balance;
   }
 
+  /**
+   * Debit/consume credits for a generation job (the "decrement before dispatch"
+   * step of the worker-dispatch routes). Calls the measure/consume metering
+   * endpoint so the provider records the spend against the user's allowance.
+   * Throws if the debit is rejected (bad balance / provider error).
+   */
+  async consumeCredits(externalUserId: string, amountUsdMicros: string): Promise<void> {
+    await this.request("POST", `${this.base()}/users/${encodeURIComponent(externalUserId)}/usage/consume`, {
+      amountUsdMicros,
+      source: "job",
+    });
+  }
+
+  /** Reversal/settlement after a job that failed and was refunded. */
+  async refundCredits(externalUserId: string, amountUsdMicros: string): Promise<void> {
+    await this.request("POST", `${this.base()}/users/${encodeURIComponent(externalUserId)}/usage/refund`, {
+      amountUsdMicros,
+      source: "job",
+    });
+  }
+
   /** DMZ / identity-webhook URLs (Phase B). */
   async getSignerRouting(): Promise<{ dmzUrl: string; webhookUrl: string; jwksUrl: string; meteringMode: string }> {
     const data = await this.request("GET", `${this.base()}/signer/routing`);

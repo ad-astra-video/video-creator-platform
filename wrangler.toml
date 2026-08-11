@@ -26,10 +26,21 @@ ALLOWED_ORIGIN = "*"
 #   PYMTHOUSE_M2M_CLIENT_ID      m2m_...
 #   PYMTHOUSE_M2M_CLIENT_SECRET  pmth_cs_...
 #   REMOTE_SIGNER_URL         direct signer DMZ base URL (from PymtHouse /signer/routing)
-#   PLATFORM_API_KEY         shared key the desktop sends as `Authorization: Bearer ***
+#   PLATFORM_API_KEY         shared key the desktop sends as `Authorization: Bearer <key>`
 #   ADMIN_API_KEY            operator key for /admin/* (monitoring + manual credit); never ship to desktop
 #   RESEND_API_KEY           email delivery (or Mailgun/SES)
 #   EMAIL_FROM               sender address, e.g. credits@yourdomain.com
 #   WEBHOOK_SECRET           shared secret with go-livepeer DMZ (-remoteSignerWebhookSecret) for POST /authorize
 #   JWT_AUDIENCE             expected `aud` on end-user signer JWTs (optional)
+#
+# ---- Video Creator API + dispatch layer (Phase 2) ----
+#   ORCHESTRATOR_BASE_URL    Livepeer orchestrator base URL (e.g. https://orch.example.com).
+#                            Used for runner discovery + job submission. Omit for local/dev.
+#   JOB_COST_USD_MICROS      cost (USD micros) debited per dispatched job (default 100000 = $0.10)
+#   HF_CLIENT_ID             Hugging Face OAuth client id (https://huggingface.co/settings/applications)
+#   HF_CLIENT_SECRET         Hugging Face OAuth client secret
+#   HF_REDIRECT_URI          e.g. https://<worker>/api/auth/huggingface/callback
+#
+# WebSocket: the Worker handles the `/ws` upgrade itself (see src/ws.ts); with
+# `main = "src/index.ts"` routing there is no separate route entry needed.
 # ---------------------------------------------------------------------------

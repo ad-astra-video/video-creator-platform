@@ -36,6 +36,19 @@ export interface Env {
   JWT_AUDIENCE?: string;
 
   ALLOWED_ORIGIN?: string;
+
+  // ---- Video Creator API + dispatch layer (Phase 2) ----
+  /** Livepeer orchestrator base URL (e.g. https://orch.example.com). Used by the
+   *  orchestrator client for runner discovery + job submission. */
+  ORCHESTRATOR_BASE_URL?: string;
+  /** Cost charged (USD micros) per dispatched generation job, debited from the
+   *  ledger before dispatch. Set as a secret; defaults to 100000 ($0.10). */
+  JOB_COST_USD_MICROS?: string;
+
+  // Hugging Face OAuth (Worker-served flow)
+  HF_CLIENT_ID?: string;
+  HF_CLIENT_SECRET?: string;
+  HF_REDIRECT_URI?: string;
 }
 
 /** A single top-up tier definition. */

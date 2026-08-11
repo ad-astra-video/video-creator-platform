@@ -36,6 +36,40 @@ import {
   sha256Hex,
   cryptoRandomHex,
 } from "./utils";
+import { getHealth } from "./routes/health";
+import { handleWebSocket } from "./ws";
+import {
+  postGenerate,
+  postGenerateImage,
+  postEnhancePrompt,
+  postExtend,
+  postRetake,
+  postRestyle,
+  postRestyleExtractFirstFrame,
+  postRestyleSegmentSubject,
+  postRestyleStyleFrame,
+  postIcLoraGenerate,
+  postIcLoraExtractConditioning,
+  postCancel,
+  getGenerationProgress,
+  getDownloadProgress,
+} from "./routes/generation";
+import {
+  getModels,
+  getModelSpecs,
+  getLtxVersions,
+  getLtxRecommendation,
+  getIcLoraRecommendation,
+  getImgGenRecommendation,
+  getTextEncoderRecommendation,
+  getLoras,
+  getIcLoras,
+  getLocalCatalog,
+} from "./routes/catalog";
+import { getProviders, postDiscoverProviders, postSelectProvider, postExcludeProvider } from "./routes/providers";
+import { getSettingsRoute, postSettingsRoute } from "./routes/settings";
+import { getPlatformStatus } from "./routes/platform";
+import { postHfLogin, getHfCallback, getHfStatus, postHfLogout } from "./routes/hf-auth";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -44,7 +78,12 @@ export default {
     const method = request.method;
 
     if (method === "OPTIONS") return handleOptions(env);
-    if (method === "GET" && path === "/health") return ok({ ok: true, ts: Date.now() });
+
+    // Liveness (keep-remote).
+    if (method === "GET" && path === "/health") return await getHealth();
+
+    // WebSocket relay (authenticates itself via ?token= or Authorization).
+    if (path === "/ws") return await handleWebSocket(request, env);
 
     // Stripe webhook (signature-verified, no API key)
     if (method === "POST" && path === "/webhook/stripe") {
@@ -56,8 +95,7 @@ export default {
       }
     }
 
-    // Phase B: go-livepeer remote-signer identity webhook (called by the DMZ,
-    // authenticated by the shared WEBHOOK_SECRET — NOT a per-user route).
+    // Phase B: go-livepeer remote-signer identity webhook (DMZ, shared WEBHOOK_SECRET).
     if (method === "POST" && path === "/authorize") {
       try {
         return await handleAuthorize(env, request);
@@ -88,6 +126,8 @@ export default {
     if (method === "POST" && path === "/provision") return await postProvision(request, env);
     if (method === "POST" && path === "/recover/request") return await postRecoverRequest(request, env);
     if (method === "POST" && path === "/recover/confirm") return await postRecoverConfirm(request, env);
+    // HF OAuth callback is a redirect target (no per-user key header present).
+    if (method === "GET" && path === "/api/auth/huggingface/callback") return await getHfCallback(request, env);
 
     // ---- User-key authenticated routes (user resolved FROM the key) ----
     const user = await authUser(request, env);
@@ -95,6 +135,64 @@ export default {
 
     try {
       const uid = user.externalUserId;
+
+      // Worker-reimplemented API surface (api-contract.md).
+      // Catalog:
+      if (method === "GET" && path === "/api/models") return await getModels();
+      if (method === "GET" && path === "/api/generate/models-specs") return await getModelSpecs();
+      if (method === "GET" && path === "/api/models/ltx-versions") return await getLtxVersions();
+      if (method === "GET" && path === "/api/models/ltx-recommendation") return await getLtxRecommendation();
+      if (method === "GET" && path === "/api/models/ltx-ic-lora-recommendation") return await getIcLoraRecommendation();
+      if (method === "GET" && path === "/api/models/img-gen-recommendation") return await getImgGenRecommendation();
+      if (method === "GET" && path === "/api/models/text-encoder-recommendation") return await getTextEncoderRecommendation();
+      if (method === "GET" && path === "/api/loras") return await getLoras();
+      if (method === "GET" && path === "/api/ic-loras") return await getIcLoras();
+      if (method === "GET" && path === "/api/catalog") return await getLocalCatalog();
+
+      // Dispatch (worker-dispatch):
+      if (method === "POST" && path === "/api/generate") return await postGenerate(request, env);
+      if (method === "POST" && path === "/api/generate/cancel") return await postCancel(request, env);
+      if (method === "POST" && path === "/api/generate-image") return await postGenerateImage(request, env);
+      if (method === "POST" && path === "/api/enhance-prompt") return await postEnhancePrompt(request, env);
+      if (method === "POST" && path === "/api/extend") return await postExtend(request, env);
+      if (method === "POST" && path === "/api/retake") return await postRetake(request, env);
+      if (method === "POST" && path === "/api/restyle") return await postRestyle(request, env);
+      if (method === "POST" && path === "/api/restyle/extract-first-frame") return await postRestyleExtractFirstFrame(request, env);
+      if (method === "POST" && path === "/api/restyle/segment-subject") return await postRestyleSegmentSubject(request, env);
+      if (method === "POST" && path === "/api/restyle/style-frame") return await postRestyleStyleFrame(request, env);
+      if (method === "POST" && path === "/api/ic-lora/generate") return await postIcLoraGenerate(request, env);
+      if (method === "POST" && path === "/api/ic-lora/extract-conditioning") return await postIcLoraExtractConditioning(request, env);
+
+      // REST progress fallbacks (WS supersedes):
+      if (method === "GET" && path === "/api/generation/progress") return await getGenerationProgress(request, env);
+      if (
+        method === "GET" &&
+        (path === "/api/loras/download/progress" ||
+          path === "/api/ic-loras/download/progress" ||
+          path === "/api/models/download/progress")
+      ) {
+        return await getDownloadProgress(request, env);
+      }
+
+      // Providers (orchestrator discovery):
+      if (method === "GET" && path === "/api/providers") return await getProviders(request, env);
+      if (method === "POST" && path === "/api/providers/discover") return await postDiscoverProviders(request, env);
+      if (method === "POST" && path === "/api/providers/select") return await postSelectProvider(request, env);
+      if (method === "POST" && path === "/api/providers/exclude") return await postExcludeProvider(request, env);
+
+      // Settings:
+      if (method === "GET" && path === "/api/settings") return await getSettingsRoute(request, env);
+      if (method === "POST" && path === "/api/settings") return await postSettingsRoute(request, env);
+
+      // Platform:
+      if (method === "GET" && path === "/api/platform/status") return await getPlatformStatus(request, env);
+
+      // Hugging Face auth (authed endpoints; callback handled above):
+      if (method === "POST" && path === "/api/auth/huggingface/login") return await postHfLogin(request, env);
+      if (method === "GET" && path === "/api/auth/huggingface/status") return await getHfStatus(request, env);
+      if (method === "POST" && path === "/api/auth/huggingface/logout") return await postHfLogout(request, env);
+
+      // Existing money/auth routes (unchanged):
       if (method === "POST" && path === "/checkout") return await postCheckout(request, env, uid);
       if (method === "GET" && path === "/balance") return await getBalance(env, uid);
       if (method === "GET" && path === "/usage") return await getUsage(env, uid);
@@ -102,6 +200,7 @@ export default {
       if (method === "GET" && path === "/signer/address") return await getPayerAddress(env, uid);
       if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env, uid);
       if (method === "POST" && path === "/link-email/verify") return await verifyLinkEmail(request, env, uid);
+
       return err("Not found", 404);
     } catch (e) {
       const msg = (e as Error).message;
@@ -214,10 +313,6 @@ async function postRecoverRequest(request: Request, env: Env): Promise<Response>
 }
 
 type RecoverConfirmBody = { email: string; code: string };
-/**
- * Email + code prove ownership of the account. Rotate the API key and hand back a
- * fresh one so a user who lost/compromised their key can re-authenticate.
- */
 async function postRecoverConfirm(request: Request, env: Env): Promise<Response> {
   const body = await readJson<RecoverConfirmBody>(request);
   if (!body?.email || !body.code) return err("email and code required", 400);
@@ -325,4 +420,3 @@ function handleOptions(env: Env): Response {
     },
   });
 }
-
