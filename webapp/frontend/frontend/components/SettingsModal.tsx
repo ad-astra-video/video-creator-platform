@@ -1,4 +1,4 @@
-﻿import { AlertCircle, Check, Download, Film, Folder, HardDrive, Info, KeyRound, Layers, Settings, Sparkles, X, Zap } from 'lucide-react'
+﻿import { AlertCircle, Check, Download, Film, Folder, HardDrive, Info, KeyRound, Settings, Sparkles, X, Zap } from 'lucide-react'
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { RunnersSection } from './settings/RunnersSection'
@@ -141,7 +141,7 @@ function LivepeerToggle({ enabled, onToggle, disabled, label, description }: {
 }
 
 export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProps) {
-  const { settings, updateSettings, refreshSettings, saveLtxApiKey, saveFalApiKey, saveGeminiApiKey, saveLivepeerDiscoveryUrl, saveLivepeerApiKey, forceApiGenerations, cudaAvailable } = useAppSettings()
+  const { settings, updateSettings, saveLtxApiKey, saveFalApiKey, saveGeminiApiKey, saveLivepeerDiscoveryUrl, saveLivepeerApiKey, forceApiGenerations, cudaAvailable } = useAppSettings()
   const onSettingsChange = (next: AppSettings) => updateSettings(next)
   const [activeTab, setActiveTab] = useState<TabId>('general')
   const ltxApiKey = useApiKeyFocus(isOpen, activeTab, setActiveTab)
@@ -173,14 +173,6 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
   // Remote inference state
   const [livepeerDiscoveryUrlInput, setLivepeerDiscoveryUrlInput] = useState('')
   const [livepeerApiKeyInput, setLivepeerApiKeyInput] = useState('')
-  const [showProviders, setShowProviders] = useState(false)
-  const [providers, setProviders] = useState<Array<{
-    runner_id: string; url: string;
-    gpu: { name?: string; vram_mb?: number };
-    price_info?: { price: number; currency: string; unit: string } | null;
-    selected: boolean; excluded: boolean; status: string
-  }>>([])
-  const [discovering, setDiscovering] = useState(false)
   const [projectAssetsPath, setProjectAssetsPath] = useState('')
 
   // Sync active tab with initialTab prop when modal opens
@@ -285,56 +277,6 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     }
   }
 
-  // ── Provider discovery + management ──────────────────────────────
-
-  // Fetch providers when remote inference is enabled and modal is open
-  const fetchProviders = async () => {
-    const result = await ApiClient.getProviders()
-    if (!result.ok) return
-    setProviders(result.data.providers || [])
-  }
-
-  useEffect(() => {
-    if (!isOpen || !settings.hasLivepeerDiscoveryUrl) return
-    void fetchProviders()
-    const interval = setInterval(() => { void fetchProviders() }, 30000)
-    return () => clearInterval(interval)
-  }, [isOpen, settings.hasLivepeerDiscoveryUrl])
-
-  const discoverProviders = async () => {
-    setDiscovering(true)
-    try {
-      const result = await ApiClient.discoverProviders()
-      if (result.ok) {
-        setProviders(result.data.providers || [])
-        // Refresh settings in case auto-select changed
-        await refreshSettings()
-      }
-    } finally {
-      setDiscovering(false)
-    }
-  }
-
-  const selectProvider = async (runnerId: string) => {
-    const result = await ApiClient.selectProvider(runnerId)
-    if (result.ok) {
-      setProviders(prev => prev.map(p => ({ ...p, selected: p.runner_id === runnerId })))
-    }
-  }
-
-  const toggleExclude = async (runnerId: string) => {
-    const result = await ApiClient.excludeProvider(runnerId)
-    if (result.ok) {
-      const provider = providers.find(p => p.runner_id === runnerId)
-      if (provider) {
-        setProviders(prev => prev.map(p =>
-          p.runner_id === runnerId ? { ...p, excluded: !p.excluded, selected: false } : p
-        ))
-      }
-    }
-  }
-
-  // ── End provider management ──────────────────────────────────────
 
   if (!isOpen) return null
 
@@ -1066,102 +1008,6 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                     )}
                   </div>
 
-                  {/* View available providers */}
-                  <div className="pt-1">
-                    <button
-                      onClick={() => setShowProviders(s => !s)}
-                      disabled={!settings.hasLivepeerDiscoveryUrl}
-                      className="w-full flex items-center justify-between px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-emerald-300 hover:bg-zinc-800 disabled:text-zinc-600 disabled:bg-zinc-900 disabled:cursor-not-allowed transition-colors"
-                    >
-                      <span className="inline-flex items-center gap-2">
-                        <Layers className="h-4 w-4" />
-                        View Available Providers
-                        {providers.length > 0 && (
-                          <span className="text-xs text-zinc-500">({providers.length})</span>
-                        )}
-                      </span>
-                      <span>{showProviders ? 'Hide' : 'Show'}</span>
-                    </button>
-
-                    {showProviders && (
-                      <div className="mt-3 space-y-2">
-                        <div className="flex items-center justify-between">
-                          <p className="text-xs text-zinc-500">
-                            Choose a runner for generation. Excluded runners are never selected.
-                          </p>
-                          <button
-                            onClick={discoverProviders}
-                            disabled={discovering}
-                            className="text-xs text-emerald-400 hover:text-emerald-300 disabled:text-zinc-500"
-                          >
-                            {discovering ? 'Scanning...' : 'Refresh'}
-                          </button>
-                        </div>
-
-                        {providers.length === 0 && (
-                          <p className="text-xs text-zinc-500">
-                            No providers found. Set a Discovery URL above and click Refresh.
-                          </p>
-                        )}
-
-                        <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                          {providers.map(p => (
-                            <div
-                              key={p.runner_id}
-                              className={`flex items-center gap-3 rounded-lg p-2.5 border transition-colors ${
-                                p.selected
-                                  ? 'border-emerald-500 bg-emerald-500/5'
-                                  : p.excluded
-                                    ? 'border-red-500/30 bg-red-500/5 opacity-60'
-                                    : 'border-zinc-800 bg-zinc-800/30'
-                              }`}
-                            >
-                              <input
-                                type="radio"
-                                name="provider"
-                                checked={p.selected}
-                                onChange={() => selectProvider(p.runner_id)}
-                                className="accent-emerald-500"
-                              />
-                              <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-2">
-                                  <span className="text-sm text-white truncate">
-                                    {p.gpu?.name || 'Unknown GPU'}
-                                  </span>
-                                  <span className="text-xs text-zinc-500">
-                                    {p.gpu?.vram_mb ? `${Math.round(p.gpu.vram_mb / 1024)} GB` : ''}
-                                  </span>
-                                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${
-                                    p.status === 'online' || p.status === 'ready'
-                                      ? 'bg-green-500/10 text-green-400'
-                                      : 'bg-zinc-800 text-zinc-500'
-                                  }`}>{p.status}</span>
-                                </div>
-                                <span className="text-xs text-zinc-500 font-mono truncate block">
-                                  {p.url}
-                                </span>
-                                <span className="text-xs text-zinc-500">
-                                  {p.price_info
-                                    ? `$${p.price_info.price}/${p.price_info.unit}`
-                                    : 'Price TBD'}
-                                </span>
-                              </div>
-                              <button
-                                onClick={() => toggleExclude(p.runner_id)}
-                                className={`text-xs px-2 py-1 rounded transition-colors ${
-                                  p.excluded
-                                    ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20'
-                                    : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700'
-                                }`}
-                              >
-                                {p.excluded ? 'Excluded' : 'Exclude'}
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
                 </div>
               </div>
 

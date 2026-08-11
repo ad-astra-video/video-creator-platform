@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { DollarSign, Info, RefreshCw, Server } from 'lucide-react'
+import { DollarSign, Info, RefreshCw, Server, X } from 'lucide-react'
 import { ApiClient } from '../../lib/api-client'
 import { Button } from '../ui/button'
 
@@ -18,6 +18,27 @@ interface ProviderDto {
   excluded: boolean
   demo?: boolean
   capabilities?: RunnerCap[]
+}
+
+/** Browser-local exclude list: runner/orchestrator addresses the user does not want used. */
+const EXCLUDE_KEY = 'vc-excluded-providers'
+
+function loadExcluded(): string[] {
+  try {
+    const raw = localStorage.getItem(EXCLUDE_KEY)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function saveExcluded(list: string[]) {
+  try {
+    localStorage.setItem(EXCLUDE_KEY, JSON.stringify(list))
+  } catch {
+    /* storage unavailable — ignore */
+  }
 }
 
 function fmtPrice(priceUsdPerSec: number): string {
@@ -45,12 +66,15 @@ function formatPrice(pi: NonNullable<ProviderDto['price_info']>): string {
  * "Available Runners" — shows the runners the orchestrator discovered, which models
  * (capabilities/tasks) each can run, and the price to run them. Backed by the real
  * GET /api/providers (orchestrator discovery; demo set in local dev until runners exist).
+ * Exclusions are persisted in the browser (localStorage) keyed by orchestrator/runner
+ * address so they survive across sessions.
  */
 export function RunnersSection() {
   const [providers, setProviders] = useState<ProviderDto[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [discoveryUrl, setDiscoveryUrl] = useState('')
+  const [excluded, setExcluded] = useState<string[]>(() => loadExcluded())
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -70,7 +94,18 @@ export function RunnersSection() {
     void refresh()
   }, [refresh])
 
+  const isExcluded = (url: string) => excluded.includes(url)
+
+  const toggleExclude = (url: string) => {
+    setExcluded((prev) => {
+      const next = prev.includes(url) ? prev.filter((u) => u !== url) : [...prev, url]
+      saveExcluded(next)
+      return next
+    })
+  }
+
   const demo = providers.length > 0 && providers.every((p) => p.demo)
+  const excludedCount = providers.filter((p) => isExcluded(p.url)).length
 
   return (
     <div className="space-y-3">
@@ -91,7 +126,9 @@ export function RunnersSection() {
       </div>
 
       <p className="text-xs text-zinc-500 leading-relaxed">
-        Runners advertise the models they can execute and the price to run them.
+        Runners advertise the models they can execute and the price to run them. Excluded
+        runners are kept per-browser so they are never used for your projects.
+        {excludedCount > 0 ? ` ${excludedCount} excluded.` : ''}
         {demo
           ? ' No live runner is connected yet — showing reference models and pricing from the platform catalog.'
           : ''}
@@ -114,42 +151,71 @@ export function RunnersSection() {
         </div>
       ) : (
         <div className="space-y-2">
-          {providers.map((p) => (
-            <div key={p.runner_id} className="rounded-lg bg-zinc-800/50 p-3 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-sm text-white truncate">{p.gpu?.name || p.runner_id}</span>
-                  {p.demo && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 flex-shrink-0">
-                      demo
+          {providers.map((p) => {
+            const excludedThis = isExcluded(p.url)
+            return (
+              <div
+                key={p.runner_id}
+                className={`rounded-lg p-3 space-y-2 ${
+                  excludedThis ? 'bg-zinc-900/60 border border-red-500/30 opacity-70' : 'bg-zinc-800/50'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-sm text-white truncate">{p.gpu?.name || p.runner_id}</span>
+                    {p.demo && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 flex-shrink-0">
+                        demo
+                      </span>
+                    )}
+                    {excludedThis && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 flex-shrink-0">
+                        excluded
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 rounded ${
+                        p.status === 'ready' ? 'bg-green-500/10 text-green-400' : 'bg-zinc-700 text-zinc-300'
+                      }`}
+                    >
+                      {p.status}
                     </span>
-                  )}
+                    <button
+                      onClick={() => toggleExclude(p.url)}
+                      title={excludedThis ? 'Remove from exclusions' : 'Exclude this runner'}
+                      className={`text-[11px] px-2 py-1 rounded inline-flex items-center gap-1 transition-colors ${
+                        excludedThis
+                          ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20'
+                          : 'text-zinc-400 hover:text-white hover:bg-zinc-700'
+                      }`}
+                    >
+                      <X className="h-3 w-3" />
+                      {excludedThis ? 'Un-exclude' : 'Exclude'}
+                    </button>
+                  </div>
                 </div>
-                <span
-                  className={`text-[10px] px-1.5 py-0.5 rounded flex-shrink-0 ${
-                    p.status === 'ready' ? 'bg-green-500/10 text-green-400' : 'bg-zinc-700 text-zinc-300'
-                  }`}
-                >
-                  {p.status}
-                </span>
-              </div>
 
-              <div className="flex items-center gap-2 text-xs text-zinc-300">
-                <DollarSign className="h-3.5 w-3.5 text-green-400 flex-shrink-0" />
-                {p.price_info ? formatPrice(p.price_info) || 'Pricing unavailable' : 'Pricing not advertised'}
-              </div>
-
-              {(p.capabilities?.length ?? 0) > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {p.capabilities!.map((c) => (
-                    <span key={c.id} className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400">
-                      {c.label}
-                    </span>
-                  ))}
+                <div className="flex items-center gap-2 text-xs text-zinc-300">
+                  <DollarSign className="h-3.5 w-3.5 text-green-400 flex-shrink-0" />
+                  {p.price_info ? formatPrice(p.price_info) || 'Pricing unavailable' : 'Pricing not advertised'}
                 </div>
-              )}
-            </div>
-          ))}
+
+                <div className="text-[11px] text-zinc-500 font-mono truncate">{p.url}</div>
+
+                {(p.capabilities?.length ?? 0) > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {p.capabilities!.map((c) => (
+                      <span key={c.id} className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400">
+                        {c.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          })}
         </div>
       )}
     </div>
