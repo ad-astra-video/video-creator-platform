@@ -4,14 +4,13 @@ import { DEFAULT_TRACKS } from '../../types/project-model'
 import { migrateClip, migrateTracks } from './video-editor-utils'
 
 function normalizeTimeline(timeline: Timeline): Timeline {
-  const sourceTracks = timeline.tracks.length > 0
-    ? timeline.tracks
-    : DEFAULT_TRACKS.map(track => ({ ...track }))
+  const tracks = timeline.tracks ?? []
+  const sourceTracks = tracks.length > 0 ? tracks : DEFAULT_TRACKS.map(track => ({ ...track }))
 
   return {
     ...timeline,
     tracks: migrateTracks(sourceTracks),
-    clips: timeline.clips.map(migrateClip),
+    clips: (timeline.clips ?? []).map(migrateClip),
     subtitles: timeline.subtitles || [],
   }
 }

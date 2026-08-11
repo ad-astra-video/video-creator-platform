@@ -12,9 +12,7 @@ export default defineConfig({
     },
   },
   base: './', // relative asset paths so dist/ deploys under any path
-  build: {
-    outDir: 'dist',
-  },
+  build: { outDir: 'dist' },
   server: {
     // SPA fallback so deep links (/project/...) return index.html in dev.
     // API + WebSocket traffic is handled by the Worker; point VITE_API_BASE at it (Phase 2).

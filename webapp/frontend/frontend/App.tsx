@@ -21,6 +21,7 @@ import { SettingsModal, type SettingsTabId } from './components/SettingsModal'
 import { LogViewer } from './components/LogViewer'
 import { ApiGatewayModal, type ApiGatewaySection } from './components/ApiGatewayModal'
 import { Button } from './components/ui/button'
+import { ProjectAssetsFolderModal } from './components/ProjectAssetsFolderModal'
 
 type SetupState = 'loading' | { needsSetup: boolean; needsLicense: boolean }
 type RequiredModelsGateState = 'checking' | 'missing' | 'ready'
@@ -53,6 +54,8 @@ function AppContent() {
   // session so the blocking modal does not instantly re-open. Any later explicit
   // "open api gateway" action resets it.
   const gatewayDismissedRef = useRef(false)
+  const [assetsFolderOpen, setAssetsFolderOpen] = useState(false)
+  const assetsFolderShownRef = useRef(false)
 
   type ApiGatewayRequest = {
     requiredKeys: Array<'ltx' | 'fal' | 'livepeer'>
@@ -191,7 +194,27 @@ function AppContent() {
   )
 
   // When remote inference is enabled with a Discovery URL, skip GPU/model setup
-  const isRemoteMode = isLoaded && settings.remoteInferenceEnabled && settings.hasLivepeerDiscoveryUrl
+  // The static web app is ALWAYS remote (inference runs on the Worker + orchestrator), so it
+  // must skip the desktop's local model-install / API-key first-run gates regardless of settings.
+  const isWebApp = typeof window !== 'undefined' && window.electronAPI?.platform === 'web'
+  const isRemoteMode = isLoaded && (isWebApp || (settings.remoteInferenceEnabled && settings.hasLivepeerDiscoveryUrl))
+
+  // Web app: prompt once (right after first-run) to choose where project assets are saved.
+  useEffect(() => {
+    if (!isWebApp) return
+    if (setupState === 'loading' || setupState.needsLicense || setupState.needsSetup) return
+    if (assetsFolderShownRef.current) return
+    assetsFolderShownRef.current = true
+    const run = async () => {
+      try {
+        const path = await window.electronAPI.getProjectAssetsPath()
+        if (!path) setAssetsFolderOpen(true)
+      } catch {
+        // non-fatal: user can set the folder later via Settings
+      }
+    }
+    void run()
+  }, [setupState, isWebApp])
 
   // A configured Livepeer Discovery URL satisfies the API-key requirement for the
   // LTX/FAL providers, so those keys are no longer required.
@@ -610,6 +633,11 @@ function AppContent() {
         title={apiGatewayRequest?.title ?? 'Connect API Keys'}
         description={apiGatewayRequest?.description ?? 'Add the required API keys to continue.'}
         sections={gatewaySections}
+      />
+      <ProjectAssetsFolderModal
+        isOpen={assetsFolderOpen}
+        onClose={() => setAssetsFolderOpen(false)}
+        onChosen={() => setAssetsFolderOpen(false)}
       />
       {ltxUpgradeRecommendation && (
         <LtxUpgradePrompt

@@ -124,6 +124,21 @@ export async function measureMedia(key: string, kind: 'video' | 'image'): Promis
 }
 
 /** Extract a frame from a video at seekTime using an offscreen canvas (real, no ffmpeg). */
+export const store = {
+  isWebPath,
+  registerBlob,
+  registerFile,
+  getAsset,
+  getBlobUrl,
+  listAssetKeys,
+  removeAsset,
+  readDataUrl,
+  setDimensions,
+  setDuration,
+  measureMedia,
+  extractFrame,
+}
+
 export async function extractFrame(
   key: string,
   seekTime: number,

@@ -7,7 +7,8 @@
 // orchestrator; anything that fundamentally needs an OS shell (open a system folder,
 // kill a process) resolves to a safe no-op that returns a clear result.
 import type { BackendHealthStatus, ElectronAPI } from '../../../shared/electron-api-schema'
-import * as store from './web-store'
+import { store } from './web-store'
+import { getProjectAssetsName, pickProjectAssetsFolder } from './fs-access'
 
 // ---- config / credentials ------------------------------------------------
 
@@ -268,7 +269,10 @@ export function createWebElectronAPI(): ElectronAPI {
     getModelsPath: async () => '',
     getDownloadsPath: async () => '',
     getResourcePath: async () => null,
-    getProjectAssetsPath: async () => 'web://assets',
+    getProjectAssetsPath: async () => {
+      const name = await getProjectAssetsName()
+      return name ? `web://project-assets/${name}` : ''
+    },
     readLocalFile: async ({ filePath }) => store.readDataUrl(filePath),
 
     checkGpu: async () => ({ available: false }),
@@ -403,7 +407,14 @@ export function createWebElectronAPI(): ElectronAPI {
         return { success: false, error: e instanceof Error ? e.message : 'Could not read dimensions' }
       }
     },
-    openProjectAssetsPathChangeDialog: async () => ({ success: true, path: 'web://assets' }),
+    openProjectAssetsPathChangeDialog: async () => {
+      try {
+        const handle = await pickProjectAssetsFolder()
+        return { success: true, path: `web://project-assets/${handle.name}` }
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) }
+      }
+    },
 
     // Video processing ------------------------------------------------------------------
     extractVideoFrame: async ({ videoPath, seekTime, width, quality }) => {
