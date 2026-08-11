@@ -14,6 +14,8 @@ migrations_dir = "migrations"
 # Plain-text vars (non-secret). Secrets (API keys) go in `wrangler secret put`.
 [vars]
 ALLOWED_ORIGIN = "*"
+# Seed demo runners in /api/providers when the orchestrator is unreachable (local/dev).
+DEMO_RUNNERS = "1"
 
 # ---------------------------------------------------------------------------
 # Environment variable reference (set these as secrets with `wrangler secret put <NAME>`):

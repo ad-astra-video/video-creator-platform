@@ -1,39 +1,120 @@
 /**
- * Providers (rework per api-contract.md): backed by REAL orchestrator runner
- * discovery. GET /api/providers returns discovered runners for the user (their
- * saved choice surfaced first); POST /discover re-runs discovery; POST /select
- * persists the chosen provider per-user in D1; POST /exclude removes it.
+ * Providers (api-contract.md): backed by REAL orchestrator runner discovery. The
+ * response shape matches the desktop contract the frontend's ApiClient.getProviders()
+ * expects:
+ *
+ *   { providers: [{ runner_id, url, status, gpu?, price_info?, selected, excluded, capabilities }],
+ *     total, online, chosenId, error? }
+ *
+ * Discovery failures are non-fatal here (the tab should render, not 500). When the
+ * orchestrator isn't reachable yet (architecture.md Decision 5) and DEMO_RUNNERS=1
+ * (wrangler dev / local only), we seed a clearly-labelled demo runner set from the
+ * platform model/price catalog so the Models tab is demonstrable. Production (no
+ * DEMO_RUNNERS) shows real discovery (possibly empty).
  */
-
 import { z } from "zod";
 import { err, ok } from "../utils";
 import { makeOrchestrator, parseBody, resolveUserFromRequest } from "./lib";
 import { deleteProvider, getProvider, setProvider } from "../jobs";
 import type { Env } from "../types";
+import type { RunnerInfo } from "../orchestrator";
 
-const capsSchema = z.object({
-  capabilities: z.array(z.string()).optional(),
-});
-const selectSchema = z.object({
-  runnerId: z.string().min(1),
-});
+const capsSchema = z.object({ capabilities: z.array(z.string()).optional() });
+const selectSchema = z.object({ runnerId: z.string().min(1) });
 
-/** GET /api/providers — discover ready runners, surface the user's saved choice first. */
+const TASK_LABELS: Record<string, string> = {
+  t2v: "Text-to-Video",
+  image: "Image",
+  extend: "Extend",
+  retake: "Retake",
+  restyle: "Restyle",
+  "ic-lora": "IC-LoRA",
+  sam3: "Segment",
+  prompt: "Prompt Enhance",
+};
+
+/** Demo runners used when the orchestrator isn't stood up yet (DEMO_RUNNERS=1, local). */
+function demoRunners(caps: string[]): RunnerInfo[] {
+  const want = new Set(caps);
+  const ok = (tasks: string[]) => want.size === 0 || [...want].every((t) => tasks.includes(t));
+  const out: RunnerInfo[] = [];
+  if (ok(["t2v", "extend", "retake", "prompt"])) {
+    out.push({
+      id: "demo-rtx-4090-1",
+      name: "RTX 4090 runner (demo)",
+      url: "livepeer://runner.demo/demo-rtx-4090-1",
+      status: "ready",
+      capabilities: { tasks: ["t2v", "extend", "retake", "prompt"] },
+      priceUsdMicrosPerSec: 600, // $0.0006/s ≈ $0.036/min
+      location: "demo",
+    });
+  }
+  if (ok(["t2v", "image", "restyle", "extend", "ic-lora", "sam3"])) {
+    out.push({
+      id: "demo-rtx-5090-1",
+      name: "RTX 5090 runner (demo)",
+      url: "livepeer://runner.demo/demo-rtx-5090-1",
+      status: "ready",
+      capabilities: { tasks: ["t2v", "image", "restyle", "extend", "ic-lora", "sam3"] },
+      priceUsdMicrosPerSec: 900, // $0.0009/s ≈ $0.054/min
+      location: "demo",
+    });
+  }
+  return out;
+}
+
+function toProviderDto(
+  r: RunnerInfo,
+  chosenId: string | null,
+  demo: boolean,
+): Record<string, unknown> {
+  return {
+    runner_id: r.id,
+    url: r.url,
+    status: r.status,
+    gpu: undefined,
+    price_info:
+      typeof r.priceUsdMicrosPerSec === "number"
+        ? { price: r.priceUsdMicrosPerSec / 1_000_000, currency: "USD", unit: "per_second" }
+        : null,
+    capabilities: (r.capabilities?.tasks ?? []).map((t) => ({
+      id: t,
+      label: TASK_LABELS[t] ?? t,
+    })),
+    selected: r.id === chosenId,
+    excluded: false,
+    demo,
+  };
+}
+
+/** GET /api/providers — discover ready runners (user's saved choice surfaced first). */
 export async function getProviders(request: Request, env: Env): Promise<Response> {
   const u = await resolveUserFromRequest(request, env);
   if (!u.ok) return u.response;
   const orch = makeOrchestrator(env);
   const caps = (new URL(request.url).searchParams.get("capabilities") || "").split(",").filter(Boolean);
-  let runners;
+  let runners: RunnerInfo[] = [];
+  let discoveryError: string | null = null;
   try {
     runners = await orch.discoverRunners(caps);
   } catch (e) {
-    return err(`discovery failed: ${(e as Error).message}`, 502);
+    discoveryError = (e as Error).message;
+  }
+  let demo = false;
+  if (runners.length === 0 && env.DEMO_RUNNERS === "1") {
+    runners = demoRunners(caps);
+    demo = true;
   }
   const chosen = env.DB ? await getProvider(env.DB, u.userId) : null;
   const chosenId = chosen?.id ? String(chosen.id) : null;
   const ordered = [...runners].sort((a, b) => (a.id === chosenId ? -1 : b.id === chosenId ? 1 : 0));
-  return ok({ providers: ordered, chosenId });
+  return ok({
+    providers: ordered.map((r) => toProviderDto(r, chosenId, demo)),
+    total: ordered.length,
+    online: ordered.filter((r) => r.status === "ready").length,
+    chosenId,
+    ...(discoveryError ? { error: discoveryError } : {}),
+  });
 }
 
 /** POST /api/providers/discover — run discovery now and return fresh ready runners. */
@@ -43,13 +124,24 @@ export async function postDiscoverProviders(request: Request, env: Env): Promise
   const body = await parseBody(request, capsSchema);
   const caps = body.ok ? body.data.capabilities ?? [] : [];
   const orch = makeOrchestrator(env);
-  let runners;
+  let runners: RunnerInfo[] = [];
+  let discoveryError: string | null = null;
   try {
     runners = await orch.discoverRunners(caps);
   } catch (e) {
-    return err(`discovery failed: ${(e as Error).message}`, 502);
+    discoveryError = (e as Error).message;
   }
-  return ok({ providers: runners });
+  let demo = false;
+  if (runners.length === 0 && env.DEMO_RUNNERS === "1") {
+    runners = demoRunners(caps);
+    demo = true;
+  }
+  return ok({
+    providers: runners.map((r) => toProviderDto(r, null, demo)),
+    total: runners.length,
+    online: runners.filter((r) => r.status === "ready").length,
+    ...(discoveryError ? { error: discoveryError } : {}),
+  });
 }
 
 /** POST /api/providers/select — persist the user's chosen provider in D1. */

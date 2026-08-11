@@ -36,6 +36,8 @@ export interface Env {
   JWT_AUDIENCE?: string;
 
   ALLOWED_ORIGIN?: string;
+  /** Set to '1' in dev to seed demo runners when the orchestrator is unreachable. */
+  DEMO_RUNNERS?: string;
 
   // ---- Video Creator API + dispatch layer (Phase 2) ----
   /** Livepeer orchestrator base URL (e.g. https://orch.example.com). Used by the
