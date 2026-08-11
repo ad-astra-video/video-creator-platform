@@ -2,6 +2,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { BaseModelSection } from './settings/BaseModelSection'
+import { RunnersSection } from './settings/RunnersSection'
 import { CreditsPanel } from './settings/CreditsPanel'
 import { useAppSettings, type AppSettings } from '../contexts/AppSettingsContext'
 import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
@@ -972,7 +973,12 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
             </>
           )}
 
-          {activeTab === 'models' && !forceApiGenerations && <BaseModelSection />}
+          {activeTab === 'models' && !forceApiGenerations && (
+            <div className="space-y-8">
+              <RunnersSection />
+              <BaseModelSection />
+            </div>
+          )}
 
           {activeTab === 'apiKeys' && (
             <>
