@@ -1,0 +1,7 @@
+allowBuilds:
+  esbuild: set this to true or false
+# pnpm 10 reads build-script approvals from here (not package.json).
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - workerd
