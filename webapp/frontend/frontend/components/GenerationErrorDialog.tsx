@@ -11,8 +11,8 @@ function assertNever(value: never): never {
   throw new Error(`Unexpected generation error variant: ${JSON.stringify(value)}`)
 }
 
-function getGenericHumanMessage(message: string): string {
-  const lower = message.toLowerCase()
+function getGenericHumanMessage(message: string | undefined): string {
+  const lower = (message ?? '').toLowerCase()
   if (lower.includes('409') || lower.includes('already')) {
     return 'A generation is already in progress. Please wait for it to finish or cancel it.'
   }
@@ -29,7 +29,7 @@ function getGenericHumanMessage(message: string): string {
     return 'Failed to prepare the input image. The file may be corrupted or inaccessible.'
   }
   if (lower.includes('could not auto-generate') || lower.includes('send to genspace')) {
-    return message
+    return message ?? ''
   }
   return 'Something went wrong during generation. Please try again.'
 }
