@@ -22,6 +22,8 @@ export interface RunnerInfo {
   status: "ready" | "busy" | "offline";
   capabilities: RunnerCapabilities;
   priceUsdMicrosPerSec?: number;
+  /** go-livepeer PriceInfo (see github.com/livepeer/go-livepeer net/lp_rpc): pricePerUnit (wei) + pixelsPerUnit. */
+  priceInfo?: { pricePerUnit?: number; pixelsPerUnit?: number };
   location?: string;
   gpu?: { name?: string; vram_mb?: number };
 }
@@ -181,6 +183,23 @@ export class OrchestratorClient {
           : Math.round((pi.price / 60) * 1_000_000);
       }
     }
+    // go-livepeer OrchestratorInfo priceInfo / price_info { pricePerUnit (wei), pixelsPerUnit }.
+    const glSource =
+      raw.priceInfo && typeof raw.priceInfo === "object"
+        ? (raw.priceInfo as Record<string, unknown>)
+        : raw.price_info && typeof raw.price_info === "object"
+          ? (raw.price_info as Record<string, unknown>)
+          : undefined;
+    const glPpu = glSource ? glSource.pricePerUnit : raw.pricePerUnit;
+    const glPix = glSource ? glSource.pixelsPerUnit : raw.pixelsPerUnit;
+    const glPrice =
+      glPpu !== undefined || glPix !== undefined
+        ? {
+            ...(glPpu !== undefined ? { pricePerUnit: Number(glPpu) } : {}),
+            ...(glPix !== undefined ? { pixelsPerUnit: Number(glPix) } : {}),
+          }
+        : undefined;
+
     const status = raw.status === "busy" ? "busy" : raw.status === "offline" ? "offline" : "ready";
     return {
       id,
@@ -189,6 +208,7 @@ export class OrchestratorClient {
       status,
       capabilities: { tasks: caps },
       ...(micros !== undefined && Number.isFinite(micros) ? { priceUsdMicrosPerSec: micros } : {}),
+    ...(glPrice ? { priceInfo: glPrice } : {}),
       ...(gpu.name !== undefined || gpu.vram_mb !== undefined ? { gpu } : {}),
     };
   }

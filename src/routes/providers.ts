@@ -69,6 +69,20 @@ function demoRunners(caps: string[]): RunnerInfo[] {
   return out;
 }
 
+function buildPrice(r: RunnerInfo): { usdPerSec?: number; pricePerUnit?: number; pixelsPerUnit?: number } | null {
+  // Never invent a price. Surface USD/sec when advertised, else the canonical
+  // go-livepeer PriceInfo (pricePerUnit wei + pixelsPerUnit) verbatim. A value of 0
+  // is a real "free" price and is shown, never blanked.
+  if (typeof r.priceUsdMicrosPerSec === "number" && Number.isFinite(r.priceUsdMicrosPerSec)) {
+    return { usdPerSec: r.priceUsdMicrosPerSec / 1_000_000 };
+  }
+  if (r.priceInfo && (r.priceInfo.pricePerUnit !== undefined || r.priceInfo.pixelsPerUnit !== undefined)) {
+    return { ...(r.priceInfo.pricePerUnit !== undefined ? { pricePerUnit: r.priceInfo.pricePerUnit } : {}),
+             ...(r.priceInfo.pixelsPerUnit !== undefined ? { pixelsPerUnit: r.priceInfo.pixelsPerUnit } : {}) };
+  }
+  return null;
+}
+
 function toProviderDto(
   r: RunnerInfo,
   chosenId: string | null,
@@ -79,10 +93,7 @@ function toProviderDto(
     url: r.url,
     status: r.status,
     gpu: r.gpu ?? null,
-    price_info:
-      typeof r.priceUsdMicrosPerSec === "number"
-        ? { price: r.priceUsdMicrosPerSec / 1_000_000, currency: "USD", unit: "per_second" }
-        : null,
+    price_info: buildPrice(r),
     capabilities: (r.capabilities?.tasks ?? []).map((t) => ({
       id: t,
       label: TASK_LABELS[t] ?? t,
