@@ -16,6 +16,14 @@
 
 import { ApiClient } from './api-client'
 import { getBlob, getBlobUrl } from './runtime/web-store'
+import { logger } from './logger'
+
+/** Fetch with an AbortSignal.timeout guard so a hung hop surfaces as an error instead of a silent await. */
+function fetchWithTimeout(ms: number): RequestInit['signal'] {
+  return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+    ? AbortSignal.timeout(ms)
+    : undefined
+}
 
 // Task -> runner endpoint (must match the live-runner /video-creator/v1 route table that the
 // runner service exposes. See orchestrator.ts TASK_ENDPOINTS — we mirror the same shape here
@@ -167,13 +175,16 @@ export async function postToRunnerWithTicket(
   let manifestId = makeJobId()
 
   // 1) Payer-address-only probe -> expect 402 + payment_params.
+  const t0 = Date.now()
   const addressRes = await ApiClient.getSignerAddress()
+  logger.info(`[direct] getSignerAddress ok=${addressRes.ok} (${Date.now() - t0}ms)`)
   if (!addressRes.ok || !addressRes.data.address) {
     throw new Error('No Livepeer payer address available (is the platform / platform API key configured?)')
   }
   let paymentParams: unknown = null
   let state: string | undefined
   try {
+    logger.info(`[direct] probe POST ${url}`)
     const probe = await fetch(url, {
       method: 'POST',
       headers: {
@@ -181,8 +192,9 @@ export async function postToRunnerWithTicket(
         'Livepeer-Payer-Address': addressRes.data.address,
       },
       body: JSON.stringify(body),
-      signal: opts?.signal,
+      signal: opts?.signal ?? fetchWithTimeout(20000),
     })
+    logger.info(`[direct] probe status=${probe.status} (${Date.now() - t0}ms)`)
     if (probe.status === 402) {
       const probeJson = await probe.json().catch(() => null)
       paymentParams = probeJson?.payment_params ?? probeJson?.paymentParams ?? probeJson ?? {}
@@ -207,12 +219,14 @@ export async function postToRunnerWithTicket(
 
   // 2) Sign the payment ticket via the Worker (the only Worker involvement in the media path).
   const type = ticketTypeForUnit(runner.price_info?.unit)
+  const t1 = Date.now()
   const signed = await ApiClient.signTicket({
     paymentParams,
     type,
     manifestId,
     state,
   })
+  logger.info(`[direct] signTicket ok=${signed.ok} (${Date.now() - t1}ms)`)
   if (!signed.ok) {
     throw new Error(`Could not obtain payment ticket (${signed.status}): ${JSON.stringify(signed.error)}`)
   }
@@ -224,6 +238,7 @@ export async function postToRunnerWithTicket(
     'Livepeer-Segment': signed.data.segCreds,
     Origin: window.location.origin,
   }
+  logger.info(`[direct] paid retry POST ${url}`)
 
   return fetch(url, {
     method: 'POST',
