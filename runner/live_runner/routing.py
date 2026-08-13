@@ -34,10 +34,11 @@ ROUTES = {
     "ic-lora-generate": "ltx-worker",
     "edit": "ltx-worker",
     "restyle": "idv2v-worker",
+    "style-frame": "idv2v-worker",
     "sam3": "idv2v-worker",
 }
 
-CAPABILITIES = sorted({"restyle", "t2v", "i2v", "image", "edit", "sam3",
+CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", "sam3",
                        "extend", "retake", "prompt-enhance", "suggest-gap-prompt",
                        "chat", "extract-conditioning", "ic-lora-generate"})
 

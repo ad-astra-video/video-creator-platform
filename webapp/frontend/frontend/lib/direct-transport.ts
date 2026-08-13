@@ -37,7 +37,7 @@ const TASK_ENDPOINTS: Record<string, string> = {
   restyle: '/video-creator/v1/restyle',
   'restyle:extract-first-frame': '/video-creator/v1/extract-first-frame',
   'restyle:segment-subject': '/video-creator/v1/sam3',
-  'restyle:style-frame': '/video-creator/v1/style',
+  'restyle:style-frame': '/video-creator/v1/style-frame',
   'ic-lora': '/video-creator/v1/ic-lora-generate',
   'ic-lora:extract-conditioning': '/video-creator/v1/extract-conditioning',
   edit: '/video-creator/v1/edit',
@@ -143,6 +143,54 @@ function isFetchableRunnerUrl(url: string): boolean {
     return p.protocol === 'http:' || p.protocol === 'https:'
   } catch {
     return false
+  }
+}
+
+
+/**
+ * Style the restyle first frame DIRECTLY on a runner (paid Livepeer rail): hand the actual
+ * image bytes (base64) to the id-v2v worker's /video-creator/v1/style-frame (FLUX.2 klein 4B)
+ * instead of the Worker rail, which can't read a browser web:// asset key and simply skips
+ * ("style-frame unavailable in browser without asset upload").
+ */
+export async function styleFrameViaRunner(
+  runner: RunnerDto,
+  imageBase64: string,
+  prompt: string,
+  opts?: { seed?: number; enhance?: boolean; signal?: AbortSignal },
+): Promise<{ styledImageUrl: string; width?: number; height?: number; enhancedPrompt?: string }> {
+  const res = await postToRunnerWithTicket(
+    runner,
+    'restyle:style-frame',
+    {
+      image: imageBase64,
+      prompt,
+      seed: opts?.seed,
+      enhance_prompt: opts?.enhance ?? false,
+    },
+    opts,
+  )
+  if (!res.ok) {
+    let detail = `First-frame style failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (j && typeof j.error === 'string') detail = j.error
+    } catch { /* keep status message */ }
+    throw new Error(detail)
+  }
+  const data = (await res.json().catch(() => null)) as
+    | { styled_image?: unknown; width?: unknown; height?: unknown; enhanced_prompt?: unknown } | null
+  const styledB64 = data?.styled_image
+  if (typeof styledB64 !== 'string' || !styledB64) throw new Error('First-frame style completed without an image')
+  const bin = atob(styledB64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }))
+  return {
+    styledImageUrl: url,
+    width: typeof data?.width === 'number' ? data.width : undefined,
+    height: typeof data?.height === 'number' ? data.height : undefined,
+    enhancedPrompt: typeof data?.enhanced_prompt === 'string' ? data.enhanced_prompt : undefined,
   }
 }
 

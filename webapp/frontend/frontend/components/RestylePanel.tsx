@@ -4,7 +4,7 @@ import { validateVideoSource } from '../lib/video-constraints'
 import { webAssetUrl } from '../lib/file-url'
 import { isWebPath, getBlob } from '../lib/runtime/web-store'
 import { ApiClient } from '../lib/api-client'
-import { resolveRunner, segmentSubjectViaRunner } from '../lib/direct-transport'
+import { resolveRunner, segmentSubjectViaRunner, styleFrameViaRunner } from '../lib/direct-transport'
 import { Image, X, Loader2, Check, Film, Wand2, Upload } from 'lucide-react'
 import { logger } from '../lib/logger'
 import type { Asset } from '../types/project-model'
@@ -293,6 +293,29 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     setIsStyling(true)
     setStylingError(null)
     try {
+      // Browser path: the extracted frame is a web:// blob a remote runner can't read, so the
+      // Worker rail would skip ("style-frame unavailable in browser without asset upload"). Hand
+      // the actual bytes to the runner over the direct paid rail when one is up (same as SAM3).
+      if (isWebPath(extractedFramePath)) {
+        const runner = await resolveRunner(['restyle'])
+        const blob = getBlob(extractedFramePath)
+        if (runner && blob) {
+          try {
+            const styled = await styleFrameViaRunner(
+              runner,
+              await blobToBase64(blob),
+              opts.prompt.trim(),
+              { seed: opts.seed ?? Math.floor(Math.random() * 2 ** 31), enhance: opts.enhance ?? false },
+            )
+            setCandidates(prev => prev.includes(styled.styledImageUrl) ? prev : [...prev, styled.styledImageUrl])
+            setActiveCandidate(styled.styledImageUrl)
+            setTab('image')
+            return true
+          } catch (e) {
+            logger.warn(`Direct style-frame failed (${e}); falling back to Worker rail`)
+          }
+        }
+      }
       // First-frame styling routes to FLUX.2 [klein] 4B on the id-v2v worker
       // (/api/restyle/style-frame). FLUX.2 klein is a fixed 4-step distilled
       // single-reference editor: correct inputs are just the reference frame +
