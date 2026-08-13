@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { resolveRunner, postRunnerTaskWithTicket, pathToBase64 } from '../lib/direct-transport'
 
 export type RetakeMode = 'replace_audio_and_video' | 'replace_video' | 'replace_audio'
 
@@ -53,12 +53,24 @@ export function useRetake() {
         return
       }
 
+      // The remote worker needs the source clip's actual bytes (video_base64); it cannot read
+      // a browser-local web:// key. Without this the worker 500s with KeyError('video_base64').
+      const videoBase64 = await pathToBase64(params.videoPath)
+      if (!videoBase64) {
+        const msg = 'The source video must be a browser asset before it can be retaken.'
+        logger.error(`Retake error: ${msg}`)
+        setState({ isRetaking: false, retakeStatus: '', retakeError: msg, result: null })
+        return
+      }
+
       const res = await postRunnerTaskWithTicket(runner, 'retake', {
-        video_path: params.videoPath,
-        start_time: params.startTime,
+        video_base64: videoBase64,
+        startTime: params.startTime,
         duration: params.duration,
         prompt: params.prompt,
         mode: params.mode,
+        seed: 42,
+        fps: 24,
         resolution: params.resolution,
       }, {
         onProgress: (ev) => {

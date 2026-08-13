@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { resolveRunner, postRunnerTaskWithTicket, pathToBase64 } from '../lib/direct-transport'
 
 export type IcLoraConditioningType = 'canny' | 'depth' | 'custom'
 export type IcLoraAudioMode = 'source' | 'generated' | 'off'
@@ -93,8 +93,13 @@ export function useIcLora() {
         return
       }
 
+      // The remote worker needs the source clip's bytes (video_base64) to condition on — it
+      // cannot read a browser-local web:// key. Convert when we have a browser video; keep
+      // video_path for catalog mode where the source is supplied another way.
+      const videoBase64 = params.videoPath ? await pathToBase64(params.videoPath) : null
+
       const res = await postRunnerTaskWithTicket(runner, 'ic-lora', {
-        video_path: params.videoPath,
+        ...(videoBase64 ? { video_base64: videoBase64 } : { video_path: params.videoPath }),
         conditioning_type: params.conditioningType,
         conditioning_strength: params.conditioningStrength,
         prompt: params.prompt,

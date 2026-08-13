@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { resolveRunner, postRunnerTaskWithTicket, pathToBase64 } from '../lib/direct-transport'
 
 export type ExtendDirection = 'start' | 'end'
 
@@ -51,11 +51,24 @@ export function useExtend() {
         return
       }
 
+      // The remote worker cannot fetch a browser-local web:// source video — it requires the
+      // actual bytes as video_base64 in the body (otherwise worker 500s with KeyError).
+      const videoBase64 = await pathToBase64(params.videoPath)
+      if (!videoBase64) {
+        const msg = 'The source video must be a browser asset before it can be extended.'
+        logger.error(`Extend error: ${msg}`)
+        setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
+        return
+      }
+
       const res = await postRunnerTaskWithTicket(runner, 'extend', {
-        video_path: params.videoPath,
-        duration: params.duration,
+        video_base64: videoBase64,
         prompt: params.prompt,
+        // Worker extends by FRAMES, not seconds. 24fps (LTX band) preserves the chosen duration.
+        extendFrames: Math.round(params.duration * 24),
         mode: params.mode,
+        seed: 42,
+        fps: 24,
         resolution: params.resolution,
       }, {
         onProgress: (ev) => {

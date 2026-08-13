@@ -15,6 +15,7 @@
  */
 
 import { ApiClient } from './api-client'
+import { getBlob } from './runtime/web-store'
 
 // Task -> runner endpoint (must match the live-runner /video-creator/v1 route table that the
 // runner service exposes. See orchestrator.ts TASK_ENDPOINTS — we mirror the same shape here
@@ -52,6 +53,35 @@ export interface SignTicketMaterial {
   payment: string
   segCreds: string
   state?: string
+}
+
+
+/** Clip a base64 data-URL payload down to just the base64 body (strip the data: prefix). */
+function stripDataPrefix(url: string): string {
+  const comma = url.indexOf(',')
+  return comma >= 0 ? url.slice(comma + 1) : url
+}
+
+/**
+ * Read a browser web:// asset's bytes as a base64 payload. Remote live-runner workers (extend,
+ * retake, ic-lora, extract-conditioning, ...) cannot fetch a browser-local web:// key — they
+ * require the actual media as base64 in the request body (e.g. `video_base64`). Returns null
+ * when the path is not a readable web:// blob (caller should treat as a missing/unsupported source).
+ */
+export async function pathToBase64(path: string): Promise<string | null> {
+  if (!path || !path.startsWith('web://')) return null
+  const blob = getBlob(path)
+  if (!blob) return null
+  return await new Promise<string>((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => {
+      const url = fr.result
+      if (typeof url === 'string') resolve(stripDataPrefix(url))
+      else reject(new Error('Could not read media blob'))
+    }
+    fr.onerror = () => reject(fr.error ?? new Error('Could not read media blob'))
+    fr.readAsDataURL(blob)
+  })
 }
 
 export function makeJobId(): string {
