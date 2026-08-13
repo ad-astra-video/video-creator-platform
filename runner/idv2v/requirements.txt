@@ -51,9 +51,11 @@ bitsandbytes>=0.43.0
 
 # --- fine-grained FP8 (FLUX.2 klein 4B styler) ---
 # Qwen3 fp8_linear in transformers.integrations.finegrained_fp8 needs NVIDIA's
-# `kernels` package to actually run the fp8 matmul on-demand. 0.16 removed the
-# API the installed transformers expects; pin 0.15.2 (0.15.2 <= v < 0.16.0).
-kernels==0.15.2
+# `kernels` package to actually run the fp8 matmul on-demand. The version gate
+# is tied to the transformers build: transformers 5.15 (this image) wants
+# 0.16.0 <= v < 0.17.0. (The box's older image wanted 0.15.2 — an older
+# transformers; keep these two in lockstep if the box reuses an old image.)
+kernels==0.16.0
 
 # --- ID-V2V video model (Wan2.1 I2V 14B DiT + VACE) build notes ---
 # diffsynth (the Wan pipeline fork) + SAM3 are NOT pip-index packages: they come
