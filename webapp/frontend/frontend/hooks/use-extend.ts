@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicket, pathToBase64 } from '../lib/direct-transport'
+import { GENERATION_RECOVERY_KEY } from './use-generation'
 
 export type ExtendDirection = 'start' | 'end'
 
@@ -106,6 +107,12 @@ export function useExtend() {
         const msg = err instanceof Error ? err.message : 'Extend failed'
         logger.error(`Extend error: ${msg}`)
         setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
+      } finally {
+        // Always clear the in-flight marker on settle so a failed/oversized extend can't
+        // leak GENERATION_RECOVERY_KEY and wedge the global generation lock (every Generate
+        // button greys out until localStorage is manually cleared). The GenSpace completion
+        // effect clears it on success too; this guarantees the error path is covered.
+        window.localStorage.removeItem(GENERATION_RECOVERY_KEY)
       }
     })
   }, [])
