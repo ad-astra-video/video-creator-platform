@@ -94,7 +94,7 @@ export function useIcLora() {
         return
       }
 
-      const runner = await resolveRunner(['ic-lora'])
+      const runner = await resolveRunner(['ic-lora-generate'])  // runner advertises ic-lora-generate, not ic-lora
       if (!runner) {
         const msg = 'No capable Livepeer runner is currently available for IC-LoRA generation.'
         logger.error(`IC-LoRA error: ${msg}`)

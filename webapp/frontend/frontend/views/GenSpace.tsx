@@ -2393,7 +2393,7 @@ export function GenSpace() {
     const directEnhanceActive = (appSettings.livepeerDiscoveryUrl || '').trim().length > 0
     const result = await withGenerationActive(async () => {
       if (directEnhanceActive) {
-        const runner = await resolveRunner(['prompt'])
+        const runner = await resolveRunner(['prompt-enhance'])  // runner advertises prompt-enhance, not prompt
         if (!runner) return { ok: false, status: '4XX', error: { code: 'NO_RUNNER', message: 'No capable Livepeer runner available for prompt enhancement' } as any }
         try {
           const enhancedPrompt = await enhancePromptViaRunner(runner, {
