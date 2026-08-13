@@ -43,56 +43,64 @@ export function useExtend() {
     setState({ isExtending: true, extendStatus: 'Generating', extendError: null, result: null })
 
     await withGenerationActive(async () => {
-      const runner = await resolveRunner(['extend'])
-      if (!runner) {
-        const msg = 'No capable Livepeer runner is currently available for extending.'
+      try {
+        const runner = await resolveRunner(['extend'])
+        if (!runner) {
+          const msg = 'No capable Livepeer runner is currently available for extending.'
+          logger.error(`Extend error: ${msg}`)
+          setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
+          return
+        }
+
+        // The remote worker cannot fetch a browser-local web:// source video — it requires the
+        // actual bytes as video_base64 in the body (otherwise worker 500s with KeyError).
+        const videoBase64 = await pathToBase64(params.videoPath)
+        if (!videoBase64) {
+          const msg = `The source video cannot be read as bytes (path=${params.videoPath}). It must be a browser asset before it can be extended.`
+          logger.error(`Extend error: ${msg}`)
+          setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
+          return
+        }
+
+        const res = await postRunnerTaskWithTicket(runner, 'extend', {
+          video_base64: videoBase64,
+          prompt: params.prompt,
+          // Worker extends by FRAMES, not seconds. 24fps (LTX band) preserves the chosen duration.
+          extendFrames: Math.round(params.duration * 24),
+          mode: params.mode,
+          seed: 42,
+          fps: 24,
+          resolution: params.resolution,
+        }, {
+          onProgress: (ev) => {
+            if (ev.stage === 'generating') {
+              setState(prev => ({ ...prev, extendStatus: ev.message || 'Extending...' }))
+            }
+          },
+        })
+        if (!res.mediaBlob) {
+          const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
+          logger.error(`Extend error: ${err}`)
+          setState({ isExtending: false, extendStatus: '', extendError: err, result: null })
+          return
+        }
+
+        // The runner streams the generated media back over the WebSocket — store it as a local
+        // object URL for the project asset store.
+        const videoPath = URL.createObjectURL(res.mediaBlob)
+        setState({
+          isExtending: false,
+          extendStatus: 'Extend complete!',
+          extendError: null,
+          result: { videoPath },
+        })
+      } catch (err) {
+        // Any throw (network fetch to runner, blob read, AbortError) surfaces as a visible
+        // error instead of leaving isExtending stuck true with no request sent.
+        const msg = err instanceof Error ? err.message : 'Extend failed'
         logger.error(`Extend error: ${msg}`)
         setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
-        return
       }
-
-      // The remote worker cannot fetch a browser-local web:// source video — it requires the
-      // actual bytes as video_base64 in the body (otherwise worker 500s with KeyError).
-      const videoBase64 = await pathToBase64(params.videoPath)
-      if (!videoBase64) {
-        const msg = 'The source video must be a browser asset before it can be extended.'
-        logger.error(`Extend error: ${msg}`)
-        setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
-        return
-      }
-
-      const res = await postRunnerTaskWithTicket(runner, 'extend', {
-        video_base64: videoBase64,
-        prompt: params.prompt,
-        // Worker extends by FRAMES, not seconds. 24fps (LTX band) preserves the chosen duration.
-        extendFrames: Math.round(params.duration * 24),
-        mode: params.mode,
-        seed: 42,
-        fps: 24,
-        resolution: params.resolution,
-      }, {
-        onProgress: (ev) => {
-          if (ev.stage === 'generating') {
-            setState(prev => ({ ...prev, extendStatus: ev.message || 'Extending...' }))
-          }
-        },
-      })
-      if (!res.mediaBlob) {
-        const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
-        logger.error(`Extend error: ${err}`)
-        setState({ isExtending: false, extendStatus: '', extendError: err, result: null })
-        return
-      }
-
-      // The runner streams the generated media back over the WebSocket — store it as a local
-      // object URL for the project asset store.
-      const videoPath = URL.createObjectURL(res.mediaBlob)
-      setState({
-        isExtending: false,
-        extendStatus: 'Extend complete!',
-        extendError: null,
-        result: { videoPath },
-      })
     })
   }, [])
 

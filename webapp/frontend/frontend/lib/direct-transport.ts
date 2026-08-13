@@ -15,7 +15,7 @@
  */
 
 import { ApiClient } from './api-client'
-import { getBlob } from './runtime/web-store'
+import { getBlob, getBlobUrl } from './runtime/web-store'
 
 // Task -> runner endpoint (must match the live-runner /video-creator/v1 route table that the
 // runner service exposes. See orchestrator.ts TASK_ENDPOINTS — we mirror the same shape here
@@ -69,8 +69,23 @@ function stripDataPrefix(url: string): string {
  * when the path is not a readable web:// blob (caller should treat as a missing/unsupported source).
  */
 export async function pathToBase64(path: string): Promise<string | null> {
-  if (!path || !path.startsWith('web://')) return null
-  const blob = getBlob(path)
+  if (!path) return null
+  let blob: Blob | null = null
+  if (path.startsWith('web://')) {
+    // Prefer the stored raw bytes; fall back to the live object URL (an asset may carry only a
+    // blobUrl after restore-from-disk, or the raw bytes may have been dropped).
+    blob = getBlob(path) ?? null
+    if (!blob) {
+      const url = getBlobUrl(path)
+      if (url) {
+        try { blob = await fetch(url).then((r) => r.blob()) } catch { blob = null }
+      }
+    }
+  } else if (path.startsWith('blob:') || path.startsWith('http:') || path.startsWith('https:')) {
+    try { blob = await fetch(path).then((r) => r.blob()) } catch { blob = null }
+  } else if (path.startsWith('data:')) {
+    return path.slice(path.indexOf(',') + 1)
+  }
   if (!blob) return null
   return await new Promise<string>((resolve, reject) => {
     const fr = new FileReader()
@@ -80,7 +95,7 @@ export async function pathToBase64(path: string): Promise<string | null> {
       else reject(new Error('Could not read media blob'))
     }
     fr.onerror = () => reject(fr.error ?? new Error('Could not read media blob'))
-    fr.readAsDataURL(blob)
+    fr.readAsDataURL(blob as Blob)
   })
 }
 
