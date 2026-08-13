@@ -223,6 +223,51 @@ export async function postRunnerTaskWithTicket(
   return { payload, mediaBlob: decodeMediaPayload(payload) }
 }
 
+/**
+ * Auto subject segmentation (SAM3) of the object-to-keep, via a Livepeer runner over
+ * the direct transport. The browser owns the bytes of a web:// source image, so it
+ * sends them as base64 in the JSON body (a remote runner cannot fetch a browser-local
+ * blob — that is why the Worker rail skips this step in the web app). Performs the full
+ * payment handshake and returns the subject mask. The runner returns { mask_b64, width,
+ * height } — a text/mask result, NOT media, so unlike media tasks we parse JSON directly.
+ */
+export interface Sam3Result {
+  maskB64: string
+  width?: number
+  height?: number
+}
+export async function segmentSubjectViaRunner(
+  runner: RunnerDto,
+  imageBase64: string,
+  opts?: { mode?: 'auto' | 'text'; prompt?: string; signal?: AbortSignal },
+): Promise<Sam3Result> {
+  const res = await postToRunnerWithTicket(
+    runner,
+    'restyle:segment-subject',
+    { image: imageBase64, mode: opts?.mode ?? 'auto', prompt: opts?.prompt },
+    opts,
+  )
+  if (!res.ok) {
+    let detail = `SAM3 segmentation failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (j && typeof j.error === 'string') detail = j.error
+    } catch { /* keep status message */ }
+    throw new Error(detail)
+  }
+  const data = (await res.json().catch(() => null)) as
+    | { mask_b64?: unknown; width?: unknown; height?: unknown } | null
+  const maskB64 = data?.mask_b64
+  if (typeof maskB64 !== 'string' || !maskB64) {
+    throw new Error('SAM3 completed without a mask')
+  }
+  return {
+    maskB64,
+    width: typeof data.width === 'number' ? data.width : undefined,
+    height: typeof data.height === 'number' ? data.height : undefined,
+  }
+}
+
 // ── FAL (fal.run) direct path ──────────────────────────────────────────────
 
 const FAL_BASE = 'https://fal.run'

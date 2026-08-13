@@ -2,8 +2,9 @@
 import { VideoPreviewPanel } from './VideoPreviewPanel'
 import { validateVideoSource } from '../lib/video-constraints'
 import { webAssetUrl } from '../lib/file-url'
-import { isWebPath } from '../lib/runtime/web-store'
+import { isWebPath, getBlob } from '../lib/runtime/web-store'
 import { ApiClient } from '../lib/api-client'
+import { resolveRunner, segmentSubjectViaRunner } from '../lib/direct-transport'
 import { Image, X, Loader2, Check, Film, Wand2, Upload } from 'lucide-react'
 import { logger } from '../lib/logger'
 import type { Asset } from '../types/project-model'
@@ -26,6 +27,24 @@ import type { Asset } from '../types/project-model'
 // live in the main prompt window.
 
 export const DEFAULT_RESTYLE_PROMPT = 'restyle this video'
+
+/** Read a browser Blob (e.g. a web:// image) as a base64 data payload for the runner. */
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => {
+      const url = fr.result
+      if (typeof url === 'string') {
+        const comma = url.indexOf(',')
+        resolve(comma >= 0 ? url.slice(comma + 1) : url)
+      } else {
+        reject(new Error('Could not read image blob'))
+      }
+    }
+    fr.onerror = () => reject(fr.error ?? new Error('Could not read image blob'))
+    fr.readAsDataURL(blob)
+  })
+}
 
 type RestyleTab = 'image' | 'video'
 
@@ -222,19 +241,38 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
       setExtractedFramePath(imagePath)
       // Auto-segment the subject to keep as soon as the first frame is pulled.
       setSegmentingSubject(true)
+      let mask: string | null = null
       try {
-        const segRes = await ApiClient.segmentSubject({ image_path: imagePath })
-        if (segRes.ok && segRes.data.mask_b64) {
-          setSubjectMaskB64(segRes.data.mask_b64)
-        } else {
-          setSubjectMaskB64(null)
+        // Browser path: the source image is a web:// blob only the browser can read — a
+        // remote runner can't fetch it, so the Worker rail would skip SAM3 ("auto subject
+        // segmentation unavailable in browser"). Instead hand the actual bytes to the
+        // runner over the direct-transport (paid Livepeer) rail when a sam3 runner is up.
+        if (isWebPath(imagePath)) {
+          const runner = await resolveRunner(['sam3'])
+          if (runner) {
+            const blob = getBlob(imagePath)
+            if (blob) {
+              const seg = await segmentSubjectViaRunner(runner, await blobToBase64(blob))
+              mask = seg.maskB64
+              logger.info(`SAM3 segmentation via direct runner ${runner.runner_id}`)
+            }
+          }
         }
       } catch (e2) {
-        logger.error(`Subject segmentation failed: ${e2}`)
-        setSubjectMaskB64(null)
-      } finally {
-        setSegmentingSubject(false)
+        logger.warn(`Direct SAM3 failed (${e2}); falling back to Worker rail`)
       }
+      if (!mask) {
+        // Desktop real path (or browser with no direct sam3 runner): Worker rail. For a
+        // web:// key with no runner this returns the graceful { ok, skipped } no-op.
+        try {
+          const segRes = await ApiClient.segmentSubject({ image_path: imagePath })
+          if (segRes.ok && segRes.data.mask_b64) mask = segRes.data.mask_b64
+        } catch (e3) {
+          logger.error(`Subject segmentation failed: ${e3}`)
+        }
+      }
+      setSubjectMaskB64(mask)
+      setSegmentingSubject(false)
     } catch (e) {
       logger.error(`First-frame extraction exception: ${e}`)
       setStylingError(e instanceof Error ? e.message : 'Could not extract the first frame')
