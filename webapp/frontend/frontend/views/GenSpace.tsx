@@ -154,15 +154,21 @@ function AssetCard({
       <div className="rounded-xl overflow-hidden">
         {asset.type === 'video' ? (
           <div className="relative w-full aspect-video bg-zinc-900">
-            {asset.bigThumbnailPath && (
-              <img
-                src={pathToFileUrl(asset.bigThumbnailPath)}
-                alt=""
-                className={`absolute inset-0 w-full h-full object-contain transition-opacity duration-150 ${
-                  isHovered ? 'opacity-0' : 'opacity-100'
-                }`}
-              />
-            )}
+            {/* Static first-frame poster. An <img> of a video blob renders as a broken image
+                icon (bigThumbnailPath points at a video key for older/stale assets, so we can't
+                rely on it). A non-playing, muted <video> makes the browser paint the first frame
+                as the poster — works for old + new assets, and the source is a local browser
+                blob so preloading is cheap. The hover <video> below crossfades over it. */}
+            <video
+              src={pathToFileUrl(asset.path)}
+              muted
+              playsInline
+              preload="auto"
+              disablePictureInPicture
+              className={`absolute inset-0 w-full h-full object-contain transition-opacity duration-150 ${
+                isHovered ? 'opacity-0' : 'opacity-100'
+              }`}
+            />
             {isHovered && (
               <video
                 ref={hoverVideoRef}
