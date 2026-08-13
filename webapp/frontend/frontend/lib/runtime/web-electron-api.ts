@@ -8,7 +8,7 @@
 // kill a process) resolves to a safe no-op that returns a clear result.
 import type { BackendHealthStatus, ElectronAPI } from '../../../shared/electron-api-schema'
 import { store } from './web-store'
-import { getProjectAssetsName, pickProjectAssetsFolder } from './fs-access'
+import { getProjectAssetsName, pickProjectAssetsFolder, saveAssetToProjectFolder } from './fs-access'
 
 // ---- config / credentials ------------------------------------------------
 
@@ -399,6 +399,17 @@ export function createWebElectronAPI(): ElectronAPI {
           key = store.registerBlob(blob, 'generated', blob.type)
         }
         const dims = await store.measureMedia(key, type)
+
+        // Persist the actual bytes into the user's selected project-assets folder (best-effort)
+        // so saved images exist as real files on disk and can be rescanned after a reload.
+        {
+          const asset = store.getAsset(key)
+          const data = store.getBlob(key)
+          if (asset && data) {
+            void saveAssetToProjectFolder(key, data, asset.name, asset.mimeType).catch(() => {})
+          }
+        }
+
         return {
           success: true,
           path: key,
