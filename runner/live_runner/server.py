@@ -423,6 +423,12 @@ async def handle_generic(req: web.Request) -> web.Response:
 
     The endpoint name is the last non-empty path segment. Body is forward as-is
     (base64 in -> base64 out); the swap policy makes the right model resident.
+
+    When the client requests ``?sse=1`` the response is served as text/event-stream
+    (accepted -> progress* -> a single complete event carrying the worker's JSON
+    payload with media base64, or error) so the browser can show live generation
+    progress over the same paid HTTP connection the go-livepeer orchestrator
+    reverse-proxies. Without the flag behavior is unchanged.
     """
     endpoint = req.match_info.get("endpoint", "")
     worker = ROUTES.get(endpoint)
@@ -433,16 +439,64 @@ async def handle_generic(req: web.Request) -> web.Response:
     body = await req.json()
 
     global _in_flight, _last_activity
+    want_sse = req.query.get("sse") in ("1", "true", "yes")
+    if not want_sse:
+        _in_flight += 1
+        _last_activity = time.monotonic()
+        try:
+            # Serialize inference: the shared GPU runs one generation at a time.
+            async with _generation_sem:
+                if endpoint == "restyle":
+                    return await _restyle_chain(wm, session, token, body)
+                return await proxy(wm, session, token, worker, endpoint, body)
+        finally:
+            _in_flight -= 1
+
+    # SSE path: stream accepted + progress while the worker runs, then a single
+    # complete event with the worker's JSON payload (media as base64).
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await resp.prepare(req)
+
+    async def _ev(event: str, data: dict) -> None:
+        try:
+            await resp.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+        except Exception:
+            pass
+
+    await _ev("accepted", {"endpoint": endpoint})
+    await _ev("progress", {"stage": "generating", "message": "Generating...", "progress": None})
+
     _in_flight += 1
     _last_activity = time.monotonic()
     try:
-        # Serialize inference: the shared GPU runs one generation at a time.
         async with _generation_sem:
             if endpoint == "restyle":
-                return await _restyle_chain(wm, session, token, body)
-            return await proxy(wm, session, token, worker, endpoint, body)
+                out = await _restyle_chain(wm, session, token, body)
+            else:
+                out = await proxy(wm, session, token, worker, endpoint, body)
+    except Exception as exc:
+        logger.exception("sse %s failed", endpoint)
+        await _ev("error", {"error": str(exc)})
+        await resp.write_eof()
+        return resp
     finally:
         _in_flight -= 1
+
+    if out.status >= 400:
+        await _ev("error", {"error": out.text or f"worker error {out.status}"})
+    else:
+        try:
+            data = json.loads(out.body.decode("utf-8"))
+        except Exception:
+            await _ev("error", {"error": "worker returned a non-JSON response"})
+        else:
+            await _ev("complete", data)
+    await resp.write_eof()
+    return resp
 
 
 async def handle_namespaced(req: web.Request) -> web.Response:

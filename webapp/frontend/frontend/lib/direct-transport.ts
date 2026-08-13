@@ -165,9 +165,12 @@ export async function postToRunnerWithTicket(
   runner: RunnerDto,
   task: string,
   body: unknown,
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; sse?: boolean },
 ): Promise<Response> {
-  const url = runner.url.replace(/\/+$/, '') + endpointForTask(task)
+  // sse=1 rides the query string so it survives the go-livepeer reverse proxy
+  // (it copies RawQuery) and tells the runner to answer as text/event-stream.
+  let url = runner.url.replace(/\/+$/, '') + endpointForTask(task)
+  if (opts?.sse) url += (url.includes('?') ? '&' : '?') + 'sse=1'
   // Livepeer ties the payment/auth ticket to a specific manifest. The ORCHESTRATOR
   // assigns the manifest in its 402 challenge (`manifest_id`); we must sign the ticket
   // for THAT manifest or go-livepeer rejects the retry with "mismatched manifest and
@@ -281,6 +284,127 @@ export async function postRunnerTaskWithTicket(
   const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null
   if (!payload) throw new Error('Runner returned no JSON payload')
   return { payload, mediaBlob: decodeMediaPayload(payload) }
+}
+
+// ── SSE generation transport ────────────────────────────────────────────────
+// Generation tasks (image/video) stream live progress to the browser over
+// Server-Sent Events instead of a WebSocket: the orchestrator reverse-proxies the
+// paid POST (Livepeer-Payment headers) to the runner, and the runner answers with
+// text/event-stream. The final `complete` event carries the whole result payload
+// (media as base64) in ONE event. Because SSE rides a normal fetch + ReadableStream,
+// it keeps the working HTTP payment rail (no browser WebSocket -> no header limits).
+
+/**
+ * Drive `reader` and deliver parsed SSE events to onEvent.
+ * Splits the byte stream on blank lines; a block's `event:` field names the event
+ * (default "message") and its `data:` lines are joined with newlines per the SSE spec.
+ */
+async function readSSEStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+  onEvent: (event: string, data: string) => void,
+): Promise<void> {
+  const decoder = new TextDecoder()
+  let buf = ''
+  const onAbort = () => { void reader.cancel().catch(() => {}) }
+  if (signal) {
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  }
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx: number
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const blockText = buf.slice(0, idx)
+        buf = buf.slice(idx + 2)
+        let event = 'message'
+        const datas: string[] = []
+        for (const line of blockText.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim()
+          else if (line.startsWith('data:')) datas.push(line.slice(5).replace(/^\s/, ''))
+        }
+        if (datas.length) onEvent(event, datas.join('\n'))
+      }
+    }
+  } finally {
+    if (signal) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * Generation task over SSE with the full Livepeer payment handshake.
+ * Same rail as postRunnerTaskWithTicket but the orchestrator-proxied runner answers
+ * with text/event-stream: `accepted` -> `progress`* -> single `complete` (media base64
+ * in one event) or `error`. onProgress fires for each progress event (0..1 only for
+ * genuine backbone steps). Falls back to plain-JSON decoding if the runner did not
+ * actually stream SSE yet.
+ */
+export async function postRunnerTaskWithTicketSSE(
+  runner: RunnerDto,
+  task: string,
+  body: unknown,
+  opts?: { signal?: AbortSignal; onProgress?: (ev: RunnerProgressEvent) => void },
+): Promise<{ payload: Record<string, unknown>; mediaBlob?: Blob }> {
+  const res = await postToRunnerWithTicket(runner, task, body, { ...opts, sse: true })
+  if (!res.ok) {
+    let message = `Runner ${task} failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (j && typeof j.error === 'string') message = j.error
+    } catch { /* keep status message */ }
+    throw new Error(message)
+  }
+  const ct = res.headers.get('content-type') ?? ''
+  if (!ct.includes('text/event-stream') || !res.body) {
+    // Runner hasn't been switched to SSE yet (or returns JSON) - behave like the old rail.
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null
+    if (!payload) throw new Error('Runner returned no JSON payload')
+    return { payload, mediaBlob: decodeMediaPayload(payload) }
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false
+    readSSEStream(res.body!.getReader(), opts?.signal, (event, data) => {
+      if (settled) return
+      if (event === 'progress') {
+        let p: Record<string, unknown>
+        try { p = JSON.parse(data) as Record<string, unknown> } catch { return }
+        opts?.onProgress?.({
+          stage: typeof p.stage === 'string' ? p.stage : null,
+          message: typeof p.message === 'string' ? p.message : null,
+          progress: typeof p.progress === 'number' ? p.progress : null,
+        })
+      } else if (event === 'complete') {
+        settled = true
+        let payload: Record<string, unknown>
+        try { payload = JSON.parse(data) as Record<string, unknown> } catch {
+          reject(new Error('Runner complete event was not valid JSON'))
+          return
+        }
+        resolve({ payload, mediaBlob: decodeMediaPayload(payload) })
+      } else if (event === 'error') {
+        settled = true
+        let msg = 'Runner SSE error'
+        try { msg = String((JSON.parse(data) as { error?: unknown }).error ?? msg) } catch { /* keep default */ }
+        reject(new Error(msg))
+      }
+    }).catch((e) => {
+      if (!settled) { settled = true; reject(e instanceof Error ? e : new Error(String(e))) }
+    })
+  })
+}
+
+/** Livepeer image generation over SSE. Returns the generated image Blob. */
+export async function postImageToRunnerSSE(
+  runner: RunnerDto,
+  body: unknown,
+  opts?: { signal?: AbortSignal; onProgress?: (ev: RunnerProgressEvent) => void },
+): Promise<Blob> {
+  const res = await postRunnerTaskWithTicketSSE(runner, 'generate-image', body, opts)
+  if (res.mediaBlob) return res.mediaBlob
+  throw new Error(res.payload?.error ? String(res.payload.error) : 'Runner returned no image')
 }
 
 /**

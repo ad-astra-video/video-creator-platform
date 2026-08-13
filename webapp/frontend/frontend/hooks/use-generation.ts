@@ -5,8 +5,8 @@ import {
   falGenerateI2I,
   falGenerateT2I,
   makeJobId,
-  postImageToRunner,
-  postRunnerTaskWithTicket,
+  postImageToRunnerSSE,
+  postRunnerTaskWithTicketSSE,
   resolveRunner,
   type RunnerDto,
 } from '../lib/direct-transport'
@@ -258,7 +258,7 @@ export function useGeneration(): UseGenerationReturn {
           if (!runner) {
             throw new Error('No available Livepeer runner for video generation')
           }
-          const res = await postRunnerTaskWithTicket(
+          const res = await postRunnerTaskWithTicketSSE(
             runner,
             'generate',
             { ...body, jobId: makeJobId() },
@@ -418,8 +418,14 @@ export function useGeneration(): UseGenerationReturn {
               keepSubject: false,
               ...(isEditing ? { imagePath: editSource } : {}),
             }
-            const mediaBlob = await postImageToRunner(livepeerRunner, imageBody, {
+            const mediaBlob = await postImageToRunnerSSE(livepeerRunner, imageBody, {
               signal: abortController.signal,
+              onProgress: (ev) => {
+                setState(prev => ({
+                  ...prev,
+                  statusMessage: ev.message || prev.statusMessage,
+                }))
+              },
             })
             const objectUrl = URL.createObjectURL(mediaBlob)
             setState({
