@@ -9,6 +9,20 @@ export type VideoGenerationDuration = components['schemas']['GenerateVideoReques
 export type VideoGenerationFps = components['schemas']['GenerateVideoRequest']['fps']
 export type VideoGenerationAspectRatio = components['schemas']['GenerateVideoRequest']['aspectRatio']
 
+// Resolution-aware extend ceiling advertised by the runner's model-spec metadata (see
+// runner/live_runner/specs.py -- build_extend_capability). The runner is the authority on how
+// many "seconds to add" it can actually run at each output resolution on its own GPU.
+export interface ExtendCapability {
+  context_window_seconds?: number
+  min_duration_seconds?: number
+  max_duration_seconds?: Record<string, number> // resolution key (e.g. "540p") -> max seconds
+}
+
+export function getExtendCapability(item: VideoGenerationModelSpecItem): ExtendCapability | null {
+  const ext = (item.spec as { extend?: ExtendCapability }).extend
+  return ext && ext.max_duration_seconds ? ext : null
+}
+
 export interface VideoGenerationSettingsShape {
   model: string
   duration: number

@@ -6,8 +6,9 @@ import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY } from './use-gener
 
 export type ExtendDirection = 'start' | 'end'
 
-// Seconds-to-add presets (matches LTX Studio). API allows 2–20s.
-export const EXTEND_SECONDS = [2, 4, 6, 8] as const
+// Seconds-to-add presets (full range; the UI filters down to the runner's advertised
+  // per-resolution extend capability — see GenSpace).
+export const EXTEND_SECONDS = [2, 4, 6, 8, 10, 12] as const
 export const MAX_EXTEND_SECONDS_RUNS = EXTEND_SECONDS[EXTEND_SECONDS.length - 1]
 export const DEFAULT_EXTEND_SECONDS = 4
 

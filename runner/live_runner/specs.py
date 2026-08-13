@@ -26,6 +26,38 @@ RESOLUTION_DIMS = {
     "1080p": (1920, 1088),
 }
 
+# --- Extend capability (run-time, GPU/Vram-bound) ---
+#
+# The runner's windowed extend holds the whole [context window + new frames] latent through
+# every denoising step, so its VRAM footprint scales with frame count x resolution. The web app
+# offers "seconds to add" choices, and those seconds are advertised HERE (the runner is the
+# authority on its own ceiling) rather than hardcoded in the Worker/webapp. The active paid
+# runner is a 32 GB card: a 4 s / 1080p extend (window 1 s + 4 s = 120 latent frames) succeeds
+# while 8 s (216 frames) OOMs, so we budget conservatively at ~132 total latent frames at 1080p
+# and scale by pixel area -- lower resolutions get proportionally more seconds.
+EXTEND_CONTEXT_SECONDS = 1.0
+EXTEND_FPS = 24
+EXTEND_MIN_SECONDS = 2.0
+EXTEND_MAX_SECONDS = 20.0
+_REFERENCE_AREA = RESOLUTION_DIMS["1080p"][0] * RESOLUTION_DIMS["1080p"][1]
+_REFERENCE_FRAMES_1080P = 132.0  # total latent frames (window + extend) safe at 1080p
+_WINDOW_FRAMES = int(round(EXTEND_CONTEXT_SECONDS * EXTEND_FPS))
+
+
+def build_extend_capability() -> dict:
+    """Resolution -> max extend seconds this GPU can actually run."""
+    table: dict[str, int] = {}
+    for res, (w, h) in RESOLUTION_DIMS.items():
+        area_scaled = _REFERENCE_FRAMES_1080P * (_REFERENCE_AREA / (w * h))
+        max_extend_frames = area_scaled - _WINDOW_FRAMES
+        secs = max(EXTEND_MIN_SECONDS, min(EXTEND_MAX_SECONDS, max_extend_frames / EXTEND_FPS))
+        table[res] = int(secs)
+    return {
+        "context_window_seconds": EXTEND_CONTEXT_SECONDS,
+        "min_duration_seconds": EXTEND_MIN_SECONDS,
+        "max_duration_seconds": table,
+    }
+
 # Durations (seconds) offered per fps band, mirroring the LTX-2.3 catalog the
 # desktop backend advertises for its own fast model.
 _FULL_DURATIONS = [6, 8, 10, 12, 14, 16, 18, 20]
@@ -73,6 +105,8 @@ def build_model_specs() -> list[dict]:
                 "display_name": "LTX-2.3 (Runner)",
                 "supported_resolutions_durations": supported,
                 "a2v_supported_resolutions_durations": None,
+                # Resolution-aware extend ceiling, driven by this GPU's VRAM budget.
+                "extend": build_extend_capability(),
             },
         }
     ]

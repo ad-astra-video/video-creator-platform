@@ -16,7 +16,7 @@ import { useVideoGenerationModelSpecs } from '../hooks/use-video-generation-mode
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
 import { useRestyle } from '../hooks/use-restyle'
 import { useRetake } from '../hooks/use-retake'
-import { useExtend, type ExtendDirection, EXTEND_SECONDS, DEFAULT_EXTEND_SECONDS } from '../hooks/use-extend'
+import { useExtend, type ExtendDirection, EXTEND_SECONDS, MAX_EXTEND_SECONDS_RUNS, DEFAULT_EXTEND_SECONDS } from '../hooks/use-extend'
 import { resolutionOptions, type ResolutionOption } from '../lib/video-resolution'
 import { useIcLora, type IcLoraAudioMode } from '../hooks/use-ic-lora'
 import { useCustomIcLoraEnabled } from '../hooks/use-custom-ic-lora-enabled'
@@ -33,6 +33,7 @@ import { addVisualAssetToProject } from '../lib/asset-copy'
 import { pathToFileUrl } from '../lib/file-url'
 import {
   areVideoGenerationSettingsEquivalent,
+  getExtendCapability,
   getVideoGenerationModelSpecs,
   resolveVideoGenerationOptions,
   sanitizeVideoGenerationSettings,
@@ -506,6 +507,7 @@ function PromptBar({
   onExtendDirectionChange,
   extendSeconds,
   onExtendSecondsChange,
+  extendSecondsOptions,
   resolutionOptions: resolutionOpts,
   selectedResolution,
   onResolutionChange,
@@ -545,6 +547,7 @@ function PromptBar({
   onExtendDirectionChange?: (direction: ExtendDirection) => void
   extendSeconds?: number
   onExtendSecondsChange?: (seconds: number) => void
+  extendSecondsOptions?: number[]
   resolutionOptions?: ResolutionOption[]
   selectedResolution?: string
   onResolutionChange?: (key: string) => void
@@ -924,11 +927,13 @@ function PromptBar({
               title="SECONDS TO ADD"
               value={String(extendSeconds ?? DEFAULT_EXTEND_SECONDS)}
               onChange={(v) => onExtendSecondsChange?.(parseInt(v, 10))}
-              options={EXTEND_SECONDS.map((s) => ({ value: String(s), label: `${s}s` }))}
+              options={(extendSecondsOptions ?? EXTEND_SECONDS).map((s) => ({ value: String(s), label: `${s}s` }))}
               trigger={
                 <>
                   <Clock className="h-3.5 w-3.5" />
-                  <span>{extendSeconds ?? DEFAULT_EXTEND_SECONDS}s</span>
+                  <span>{(extendSecondsOptions ?? [...EXTEND_SECONDS]).includes(extendSeconds ?? 0)
+                    ? extendSeconds ?? DEFAULT_EXTEND_SECONDS
+                    : (((extendSecondsOptions ?? [...EXTEND_SECONDS])[(extendSecondsOptions ?? [...EXTEND_SECONDS]).length - 1]) ?? DEFAULT_EXTEND_SECONDS)}s</span>
                   <ChevronUp className="h-3 w-3 text-zinc-500" />
                 </>
               }
@@ -1560,6 +1565,47 @@ export function GenSpace() {
     () => resolutionOptions(extendInput.width, extendInput.height),
     [extendInput.width, extendInput.height],
   )
+
+  // Resolution-aware extend ceiling, advertised by the runner's model-spec metadata
+  // (runner/live_runner/specs.py). The runner is the authority on how many seconds it can
+  // actually add at each output resolution on its own GPU (VRAM-bound); filter the SECONDS
+  // choices down to what will run instead of offering options that OOM.
+  const extendCapability = videoModelSpecs.length > 0 ? getExtendCapability(videoModelSpecs[0]) : null
+  const effectiveExtendRes = useMemo(() => {
+    if (extendResolutionKey === 'original') {
+      const src = extendInput
+      const shortEdge = Math.min(src.width || 0, src.height || 0)
+      // Same short-edge tier matching as lib/video-resolution.ts (snap 1088 -> 1080p, etc).
+      const tier = [1080, 720, 540].find((t) => shortEdge && Math.abs(t - shortEdge) <= shortEdge * 0.03)
+      return tier ? `${tier}p` : '1080p'
+    }
+    return `${extendResolutionKey}p`
+  }, [extendResolutionKey, extendInput])
+  const maxExtendSeconds = useMemo(() => {
+    const table = extendCapability?.max_duration_seconds
+    if (!table) return MAX_EXTEND_SECONDS_RUNS
+    const direct = table[effectiveExtendRes]
+    if (typeof direct === 'number' && direct > 0) return direct
+    // Unmapped resolution (e.g. source larger than 1080p): use the most conservative advertised
+    // cap so we never offer seconds that would OOM a bigger latent.
+    const vals = Object.values(table).filter((v): v is number => typeof v === 'number' && v > 0)
+    return vals.length ? Math.min(...vals) : MAX_EXTEND_SECONDS_RUNS
+  }, [extendCapability, effectiveExtendRes])
+  const extendSecondsOptions = useMemo(
+    () => EXTEND_SECONDS.filter((s) => s <= maxExtendSeconds),
+    [maxExtendSeconds],
+  )
+  // If the chosen resolution drops the ceiling below the currently selected seconds, pull the
+  // selection back to the largest allowed option so the request never sends an over-cap duration.
+  useEffect(() => {
+    if (extendSeconds > maxExtendSeconds) {
+      const allowed = extendSecondsOptions.length
+        ? extendSecondsOptions[extendSecondsOptions.length - 1]
+        : DEFAULT_EXTEND_SECONDS
+      setExtendSeconds(allowed)
+    }
+  }, [extendSeconds, maxExtendSeconds, extendSecondsOptions])
+
   const [extendPanelKey, setExtendPanelKey] = useState(0)
   const [extendInitial, setExtendInitial] = useState<{
     videoPath: string | null
@@ -3302,6 +3348,7 @@ export function GenSpace() {
           onExtendDirectionChange={setExtendDirection}
           extendSeconds={extendSeconds}
           onExtendSecondsChange={setExtendSeconds}
+          extendSecondsOptions={extendSecondsOptions}
           resolutionOptions={mode === 'extend' ? extendResolutionOpts : mode === 'retake' ? retakeResolutionOpts : []}
           selectedResolution={mode === 'extend' ? extendResolutionKey : retakeResolutionKey}
           onResolutionChange={mode === 'extend' ? setExtendResolutionKey : setRetakeResolutionKey}

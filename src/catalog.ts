@@ -179,6 +179,12 @@ export interface VideoGenerationModelSpecItem {
     display_name: string;
     supported_resolutions_durations: Record<string, { fps_to_durations: Record<string, number[]> }>;
     a2v_supported_resolutions_durations?: Record<string, { fps_to_durations: Record<string, number[]> }> | null;
+    // Resolution-aware extend ceiling advertised by the runner (runner/live_runner/specs.py).
+    extend?: {
+      context_window_seconds?: number;
+      min_duration_seconds?: number;
+      max_duration_seconds?: Record<string, number>;
+    };
   };
 }
 
