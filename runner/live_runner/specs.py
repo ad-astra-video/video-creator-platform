@@ -58,16 +58,15 @@ def build_extend_capability() -> dict:
         "max_duration_seconds": table,
     }
 
-# Durations (seconds) offered per fps band, mirroring the LTX-2.3 catalog the
-# desktop backend advertises for its own fast model.
-_FULL_DURATIONS = [6, 8, 10, 12, 14, 16, 18, 20]
-_SHORT_DURATIONS = [6, 8, 10]
+# Durations (seconds) offered per fps band. KEPT LEAN: this rides the orchestrator heartbeat
+# metadata, which go-livepeer caps at 1024 bytes -- with a multi-worker box every worker adds
+# a "{name}_up" flag, so the model_specs budget is tight. 24/48 fps with a trimmed duration set
+# keeps the picker useful while leaving ~150-190 bytes of headroom against the cap.
+_FULL_DURATIONS = [6, 8, 10, 12, 16]
 
 _FPS_TO_DURATIONS = {
     "24": _FULL_DURATIONS,
-    "25": _FULL_DURATIONS,
-    "48": _SHORT_DURATIONS,
-    "50": _SHORT_DURATIONS,
+    "48": _FULL_DURATIONS,
 }
 
 
@@ -104,7 +103,9 @@ def build_model_specs() -> list[dict]:
             "spec": {
                 "display_name": "LTX-2.3 (Runner)",
                 "supported_resolutions_durations": supported,
-                "a2v_supported_resolutions_durations": None,
+                # A2V is advertised as unsupported via the ABSENCE of an a2v_* key (the frontend
+                # falls back to supported_resolutions_durations); an explicit null key is omitted
+                # to keep the heartbeat metadata under the 1024-byte cap.
                 # Resolution-aware extend ceiling, driven by this GPU's VRAM budget.
                 "extend": build_extend_capability(),
             },
