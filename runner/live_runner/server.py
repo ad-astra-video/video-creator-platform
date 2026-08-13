@@ -558,7 +558,9 @@ async def on_startup(_app: web.Application) -> None:
         }),
         heartbeat_interval_s=config.HEARTBEAT_INTERVAL_S,
     )
-    await _registration.start()
+    # NOTE: `main`'s register_runner already calls .start() (returns a started
+    # registration) — do NOT call .start() again or we'd duplicate the initial
+    # heartbeat and spawn a second heartbeat loop.
     logger.info("Registered live-runner %s (app=%s)", _registration.runner_id, config.APP_ID)
 
     # Refresh heartbeat metadata each beat from the swap policy + live worker /health.
