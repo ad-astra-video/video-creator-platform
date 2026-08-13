@@ -86,5 +86,12 @@ huggingface-cli download --token "$HF_TOKEN" \
 huggingface-cli download --token "$HF_TOKEN" \
     Qwen/Qwen3-4B-FP8 || true
 
+# Precompiled fine-grained-FP8 CUDA kernels (kernels-community/finegrained-fp8),
+# used by the `kernels==0.15.2` pip package to execute Qwen3's fp8_linear at
+# style-frame time. Cached under HF_HOME so first use doesn't need a runtime
+# download/write into the cache (mirrors the Qwen3 pre-fetch above).
+huggingface-cli download --token "$HF_TOKEN" \
+    kernels-community/finegrained-fp8 || true
+
 echo ">>> Model download complete"
 ls -lh "$MODEL_DIR"
