@@ -7,3 +7,6 @@ dist/
 
 # local planning notes (not version-controlled)
 plans/
+
+# Hermes agent local session/planning notes
+.hermes/

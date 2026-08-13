@@ -1,5 +1,5 @@
 import type { AccountRow, Env, PaymentRow, RecoveryCodeRow } from "./types";
-import { addMinutesIso, hashSecret, isExpired, nowIso, verifyHash } from "./utils";
+import { addMinutesIso, hashSecret, isExpired, nowIso, verifyHash, sha256Hex } from "./utils";
 
 /** Upsert an instance account keyed by external_user_id. Returns the row. */
 export async function upsertAccount(
@@ -81,6 +81,45 @@ export async function consumeRecoveryCode(
   await db.prepare("UPDATE recovery_codes SET used = 1 WHERE id = ?1").bind(row.id).run();
   const account = await getAccountByEmail(db, email);
   return { ok: true, account: account ?? undefined };
+}
+
+// ---------------------------------------------------------------------------
+// Backup recovery code (no-email recovery; optional alternative to email codes)
+// ---------------------------------------------------------------------------
+
+/** Store the (salted-hash) backup code for an account. */
+export async function setBackupCode(db: D1Database, externalUserId: string, codeHash: string): Promise<void> {
+  await db
+    .prepare("UPDATE accounts SET backup_code_hash = ?1 WHERE external_user_id = ?2")
+    .bind(codeHash, externalUserId)
+    .run();
+}
+
+/** Find an account whose stored backup-code hash equals the presented (hashed) code. */
+export async function getAccountByBackupHash(db: D1Database, codeHash: string): Promise<AccountRow | null> {
+  const res = await db
+    .prepare("SELECT * FROM accounts WHERE backup_code_hash = ?1")
+    .bind(codeHash)
+    .first<AccountRow>();
+  return res ?? null;
+}
+
+/**
+ * Recover by backup code (no email needed): verify the hash, rotate the API key, and
+ * clear the used backup code. Returns whether it matched a real account.
+ */
+export async function useBackupCode(
+  db: D1Database,
+  plainCode: string,
+  keyHash: string,
+): Promise<{ ok: boolean; account?: AccountRow }> {
+  const plainHash = await sha256Hex(plainCode.toUpperCase());
+  const account = await getAccountByBackupHash(db, plainHash);
+  if (!account) return { ok: false };
+  // Rotate to the freshly-minted key, then clear the used backup code (one-time use).
+  await rotateApiKey(db, account.external_user_id, keyHash);
+  await setBackupCode(db, account.external_user_id, "");
+  return { ok: true, account };
 }
 
 // ---------------------------------------------------------------------------

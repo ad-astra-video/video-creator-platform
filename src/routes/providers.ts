@@ -69,18 +69,25 @@ function demoRunners(caps: string[]): RunnerInfo[] {
   return out;
 }
 
-function buildPrice(r: RunnerInfo): { usdPerSec?: number; pricePerUnit?: number; pixelsPerUnit?: number } | null {
-  // Never invent a price. Surface USD/sec when advertised, else the canonical
-  // go-livepeer PriceInfo (pricePerUnit wei + pixelsPerUnit) verbatim. A value of 0
-  // is a real "free" price and is shown, never blanked.
+function buildPrice(r: RunnerInfo): Record<string, unknown> | null {
+  // Never invent a price. Prefer USD/sec when pre-normalized; else surface the raw
+  // discovery price_info { price, currency, unit } verbatim — our runner's price is
+  // advertised in `currency` (the orchestrator republishes USD as wei), and the
+  // client converts wei -> USD via its own ETH/USD feed. Keep the go-livepeer
+  // pricePerUnit/pixelsPerUnit (wei per px) too. A value of 0 is a real "free"
+  // price and is shown, never blanked.
   if (typeof r.priceUsdMicrosPerSec === "number" && Number.isFinite(r.priceUsdMicrosPerSec)) {
     return { usdPerSec: r.priceUsdMicrosPerSec / 1_000_000 };
   }
-  if (r.priceInfo && (r.priceInfo.pricePerUnit !== undefined || r.priceInfo.pixelsPerUnit !== undefined)) {
-    return { ...(r.priceInfo.pricePerUnit !== undefined ? { pricePerUnit: r.priceInfo.pricePerUnit } : {}),
-             ...(r.priceInfo.pixelsPerUnit !== undefined ? { pixelsPerUnit: r.priceInfo.pixelsPerUnit } : {}) };
-  }
-  return null;
+  const raw = r.priceInfo?.raw;
+  const out: Record<string, unknown> = {
+    ...(raw?.price !== undefined
+      ? { price: raw.price, currency: raw.currency ?? "", unit: raw.unit ?? "" }
+      : {}),
+    ...(r.priceInfo?.pricePerUnit !== undefined ? { pricePerUnit: r.priceInfo.pricePerUnit } : {}),
+    ...(r.priceInfo?.pixelsPerUnit !== undefined ? { pixelsPerUnit: r.priceInfo.pixelsPerUnit } : {}),
+  };
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 function toProviderDto(

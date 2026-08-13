@@ -1,5 +1,6 @@
 import { createDirectSignerProxyHandler, mintUserSignerToken } from "@pymthouse/builder-sdk/signer/server";
 import { getExternalUserByKeyHash } from "./ledger";
+import { PymtHouseClient } from "./pymthouse";
 import { err, json, ok, readJson, sha256Hex } from "./utils";
 import type { AuthzSessionRow, Env } from "./types";
 
@@ -42,7 +43,29 @@ export async function authUserFromKey(req: Request, env: Env): Promise<{ externa
 
 const _proxyCache = new WeakMap<Env, ReturnType<typeof createDirectSignerProxyHandler>>();
 
-export function getSignerProxy(env: Env) {
+// Resolve the direct signer DMZ base URL: explicit REMOTE_SIGNER_URL wins; otherwise
+// derive it from PymtHouse /signer/routing (remoteDmzUrl === signerApiUrl === the DMZ
+// that serves /generate-live-payment and /sign-orchestrator-info). Cached 5 min.
+const _dmzCache = new WeakMap<Env, { url: string; fetchedAt: number }>();
+async function resolveRemoteSignerUrl(env: Env): Promise<string> {
+  if (typeof env.REMOTE_SIGNER_URL === "string" && env.REMOTE_SIGNER_URL.trim()) {
+    return env.REMOTE_SIGNER_URL.trim();
+  }
+  const cached = _dmzCache.get(env);
+  if (cached && Date.now() - cached.fetchedAt < 5 * 60_000) return cached.url;
+  const routing = await new PymtHouseClient(env).getSignerRouting();
+  const url = (routing.dmzUrl || "").trim();
+  if (!url) {
+    throw new Error("No signer DMZ URL: set REMOTE_SIGNER_URL or resolve it from PymtHouse /signer/routing");
+  }
+  _dmzCache.set(env, { url, fetchedAt: Date.now() });
+  return url;
+}
+
+
+
+export async function getSignerProxy(env: Env) {
+  const remoteSignerUrl = await resolveRemoteSignerUrl(env);
   let proxy = _proxyCache.get(env);
   if (!proxy) {
     proxy = createDirectSignerProxyHandler({
@@ -50,7 +73,7 @@ export function getSignerProxy(env: Env) {
       pymthouseClientId: env.PYMTHOUSE_PUBLIC_CLIENT_ID,
       pymthouseM2MClientId: env.PYMTHOUSE_M2M_CLIENT_ID,
       pymthouseM2MClientSecret: env.PYMTHOUSE_M2M_CLIENT_SECRET,
-      remoteSignerUrl: env.REMOTE_SIGNER_URL,
+      remoteSignerUrl,
       // Browser POSTs to /sign-ticket; empty suffix → defaults to the DMZ's
       // /generate-live-payment. The body (paymentParams/type/manifestId/state)
       // is relayed verbatim to the DMZ.
@@ -88,7 +111,12 @@ export function getSignerProxy(env: Env) {
 // `Livepeer-Payer-Address` so the orchestrator issues the right challenge.
 // ---------------------------------------------------------------------------
 export async function getPayerAddress(env: Env, externalUserId: string): Promise<Response> {
-  if (!env.REMOTE_SIGNER_URL) return err("REMOTE_SIGNER_URL not configured", 500);
+  let signerBase: string;
+  try {
+    signerBase = (await resolveRemoteSignerUrl(env)).replace(/\/+$/, "");
+  } catch (e) {
+    return err(`signer address error: ${(e as Error).message}`, 502);
+  }
   try {
     const token = await mintUserSignerToken({
       issuerUrl: env.PYMTHOUSE_ISSUER_URL,
@@ -96,8 +124,7 @@ export async function getPayerAddress(env: Env, externalUserId: string): Promise
       m2mClientSecret: env.PYMTHOUSE_M2M_CLIENT_SECRET,
       externalUserId,
     });
-    const base = env.REMOTE_SIGNER_URL.replace(/\/+$/, "");
-    const res = await fetch(`${base}/sign-orchestrator-info`, {
+    const res = await fetch(`${signerBase}/sign-orchestrator-info`, {
       method: "POST",
       headers: { authorization: `Bearer ${token.jwt}`, "content-type": "application/json" },
       body: "{}",

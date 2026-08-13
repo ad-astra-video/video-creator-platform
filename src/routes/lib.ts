@@ -101,82 +101,32 @@ export interface DispatchResult {
 }
 
 /**
- * Full dispatch pipeline used by every worker-dispatch route.
+ * Repurposed under the direct-transport design (plans/20260811_direct_transport.md,
+ * PHASE_B_BROWSER_TICKET_FLOW.md): the D1 Worker is NOT in the media/inference path. The
+ * browser posts generations DIRECTLY to the runner (Livepeer) or to FAL; this Worker's only
+ * involvement is minting the PymtHouse payment ticket (`/sign-ticket`) + auth/balance.
  *
- *   1. credit-check the ledger (PymtHouse balance)
- *   2. decrement (consume) + record a `job_debit` audit row        [BEFORE dispatch]
- *   3. create a `jobs` D1 row (queued)
- *   4. discover + select a capable runner, submit the job
- *   5. mark running + return { jobId }
- * On any dispatch failure: refund the debit (`job_refund`), mark the job failed.
+ * These shared worker-dispatch entry points (`/api/generate`, `/api/generate-image`, ...) are
+ * therefore GONE as media carriers. They authenticate (so a stale/degraded client still gets a
+ * clean, distinguishable response) and then return 410 Gone directing the caller to the direct
+ * transport, instead of silently doing the old debit-and-proxy that would bypass the Phase B
+ * ticket rail. No D1 job row, no PymtHouse decrement, no runner proxy happens here.
  */
 export async function dispatchJob(
-  env: Env,
-  externalUserId: string,
+  _env: Env,
+  _externalUserId: string,
   type: string,
-  requestBody: unknown,
-  requiredCaps: string[] = [],
+  _requestBody: unknown,
+  _requiredCaps: string[] = [],
 ): Promise<DispatchResult> {
-  if (!env.DB) return { ok: false, response: err("Server error: DB unavailable", 500) };
-
-  // Resolve the orchestrator base from THIS user's configured Discovery URL
-  // (fall back to env, then the local default), then discover + select a
-  // capable runner FIRST — we need its advertised price to decide on the ledger.
-  const settings = (await getSettings(env.DB, externalUserId).catch(() => null)) as
-    { livepeerDiscoveryUrl?: unknown } | null;
-  const toTrim = settings?.livepeerDiscoveryUrl ?? "";
-  const discoveryBase = (typeof toTrim === "string" ? toTrim.trim() : "") || env.ORCHESTRATOR_BASE_URL || DEFAULT_ORCHESTRATOR_URL;
-  const orch = new OrchestratorClient({ baseUrl: discoveryBase });
-
-  let runner: RunnerInfo;
-  try {
-    const runners = await orch.discoverRunners(requiredCaps);
-    const picked = orch.selectRunner(runners, requiredCaps);
-    if (!picked) throw new Error("no ready runner available for the requested capabilities");
-    runner = picked;
-  } catch (e) {
-    return { ok: false, response: err(`dispatch failed: ${(e as Error).message}`, 502) };
-  }
-
-  // ONLY charge through PymtHouse if this runner advertises a non-zero price.
-  // A free runner dispatches with no ledger call at all.
-  const client = new PymtHouseClient(env);
-  const charges = runnerChargesPrice(runner);
-  const cost = charges ? jobCostMicros(env) : 0n;
-  if (charges) {
-    try {
-      const balance = await client.getBalance(externalUserId);
-      const remaining = BigInt(balance?.remainingUsdMicros ?? "0");
-      if (remaining < cost) return { ok: false, response: err("insufficient credits — please top up", 402) };
-      await client.consumeCredits(externalUserId, cost.toString());
-    } catch (e) {
-      return { ok: false, response: err(`debit failed: ${(e as Error).message}`, 502) };
-    }
-    await logPayment(env.DB, { kind: "job_debit", externalUserId, amountUsdMicros: cost.toString(), reason: type });
-  }
-
-  // Persist the job (our local id is canonical for progress in D1).
-  const jobId = cryptoRandomHex(12);
-  await createJob(env.DB, { id: jobId, user_id: externalUserId, type, request_json: requestBody });
-
-  // POST the job DIRECTLY to the runner (no orchestrator job intermediary).
-  try {
-    const endpoint = endpointForTask(type);
-    const res = await orch.postToRunner(runner, endpoint, { jobId, ...(requestBody as Record<string, unknown>) });
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`runner ${res.status}: ${res.data !== null ? JSON.stringify(res.data) : ""}`);
-    }
-    await updateJob(env.DB, jobId, { status: "running", runner: runner.id });
-    return { ok: true, jobId, response: ok({ jobId }) };
-  } catch (e) {
-    // Failure: refund (only if we charged) + mark failed.
-    if (charges) {
-      try { await client.refundCredits(externalUserId, cost.toString()); } catch { /* best-effort */ }
-      await logPayment(env.DB, { kind: "job_refund", externalUserId, amountUsdMicros: cost.toString(), reason: `${type} dispatch failure` });
-    }
-    await updateJob(env.DB, jobId, { status: "failed" });
-    return { ok: false, response: err(`dispatch failed: ${(e as Error).message}`, 502) };
-  }
+  return {
+    ok: false,
+    response: err(
+      `Generation endpoint /api/${type} is served by the DIRECT transport (browser -> runner / FAL). ` +
+        `This worker no longer carries the media path; use the frontend's direct transport (lib/direct-transport.ts).`,
+      410,
+    ),
+  };
 }
 
 /** Cancel helper: mark an owned, non-terminal job cancelled (best-effort). */

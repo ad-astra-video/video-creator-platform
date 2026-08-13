@@ -50,3 +50,21 @@ export async function postSettingsRoute(request: Request, env: Env): Promise<Res
   await setSettings(env.DB, u.userId, merged);
   return ok(merged);
 }
+
+/**
+ * GET /api/settings/fal-key — return the raw FAL API key to its authenticated owner.
+ *
+ * Under the direct-transport design (plans/20260811_direct_transport.md) the browser calls FAL
+ * (fal.run) DIRECTLY for image generation, so it needs the raw key. The webapp threat model
+ * already keeps the per-user platform key client-side (same trust as desktop), so returning the
+ * key to the authenticated owner is acceptable and keeps the Worker the single source of config.
+ * This endpoint never returns the key to anyone but the owner (per-user Bearer key auth).
+ */
+export async function getSettingsFalKey(request: Request, env: Env): Promise<Response> {
+  const u = await resolveUserFromRequest(request, env);
+  if (!u.ok) return u.response;
+  if (!env.DB) return err("Server error", 500);
+  const stored = await getSettings(env.DB, u.userId);
+  const key = (stored as Record<string, unknown>).falApiKey;
+  return ok({ falApiKey: typeof key === "string" ? key : "", hasFalApiKey: typeof key === "string" && key.length > 0 });
+}

@@ -26,7 +26,8 @@ email recovery, job dispatch (minting a signer session), and operator admin. See
 | `GET /balance` | **user key** | current PymtHouse allowance (USD micros) |
 | `GET /usage` | **user key** | balance-backed usage view |
 | `POST /link-email { email }` / `POST /link-email/verify { code }` | **user key** | attach & verify a recovery email |
-| `POST /recover/request { email }` / `POST /recover/confirm { email, code }` | public | lost/compromised key: email one-time code; confirm **rotates** to a fresh key |
+| `POST /recover/request { email }` / `POST /recover/confirm { email, code }` | public | lost/compromised key via **email**: one-time code; confirm **rotates** to a fresh key |
+| `POST /recover/backup { code }` | public | lost key via **one-time backup code** (no email): rotate to a fresh key + mint a NEW backup code |
 | `POST /webhook/stripe` | signature | grants `credits` only (never the fee) — idempotent |
 | `POST /sign-ticket { paymentParams, type, manifestId, state? }` | **user key** | PymtHouse signer DMZ proxy → returns `{ payment, segCreds, state }` (the `Livepeer-Payment` / `Livepeer-Segment` header values) |
 | `GET /signer/address` | **user key** | payer/broadcaster address for the `Livepeer-Payer-Address` header |
@@ -63,15 +64,19 @@ grants exactly the **credit** amount (never the fee).
 
 ### 1. Accounts — create these FIRST
 
-Create these accounts **before doing anything else** — you can't configure the worker until you
-have the credentials each one provides:
+There are **four** external accounts, each with a distinct job. **Cloudflare** hosts the
+Worker + D1 control plane, **Resend** delivers the recovery emails, **Stripe** collects the
+credit top-up, and **PymtHouse** is the credits ledger. (Emails cannot be sent directly from
+D1 — D1 is just the database; an email provider like Resend always does the delivery.) Create
+them **before doing anything else** — you can't configure the worker until you have the
+credentials each one provides:
 
-| # | Account | What it's for | Credentials you'll need from it |
-|---|---|---|---|
-| 1 | **Cloudflare** — dash.cloudflare.com | hosts the Worker + D1 database | your account login (for `wrangler login`) |
-| 2 | **Stripe** — dashboard.stripe.com (test mode to start) | collects the top-up + platform fee | **secret key** (`sk_test_…`) and **webhook signing secret** (`whsec_…`) |
-| 3 | **PymtHouse** — register a Builder app | allowance ledger + remote signer | **base URL** (`https://<app>.pymthouse.example`) + **M2M client pair** (`app_…`, `m2m_…`, `pmth_cs_…`) |
-| 4 | **Resend** *(optional)* — resend.com | sends recovery codes by email | API key (`re_…`) — or swap `src/recovery.ts` for Mailgun/SES |
+| # | Account | What it's for | What you'll need to create | Credentials you'll need from it |
+|---|---|---|---|---|
+| 1 | **Cloudflare** — dash.cloudflare.com | hosts the Worker + D1 database (control plane: accounts, keys, recovery codes, settings) | a Cloudflare account (free); the D1 DB + Worker are created here in the Stand-up steps | your account login (for `wrangler login`); the Worker's `database_id` |
+| 2 | **Stripe** — dashboard.stripe.com (test mode to start) | collects the top-up + platform fee (user buys credits) | a Stripe account (free); a Checkout webhook endpoint | **secret key** (`sk_test_…`) and **webhook signing secret** (`whsec_…`) |
+| 3 | **PymtHouse** — register a Builder app | allowance ledger + remote signer (where credits live & get spent) | a Builder app in your PymtHouse account | **base URL** (`https://<app>.pymthouse.example`) + **M2M client pair** (`app_…`, `m2m_…`, `pmth_cs_…`) |
+| 4 | **Resend** — resend.com | sends one-time recovery / email-link codes | a Resend account (free, 3,000 emails/mo — more than enough for recovery codes); verify a sending domain | API key (`re_…`) + the `EMAIL_FROM` address |
 
 ### 2. Technical requirements
 
@@ -108,8 +113,9 @@ platform/
 
 ## Stand-up (step by step)
 
-> Assumes the three **accounts** (Cloudflare, Stripe, PymtHouse) from "Prerequisites →
+> Assumes the **four accounts** (Cloudflare, Stripe, PymtHouse, Resend) from "Prerequisites →
 > Accounts" already exist, and Node/pnpm are installed. Each step names which account it uses.
+> **Resend is required** — recovery/link codes are sent by email and cannot be sent from D1 alone.
 
 ### 1. Install
 ```bash
@@ -156,8 +162,22 @@ Optional — none are required for the fee or tiers to work:
 - **Products/Prices** — we use one-off inline `price_data`, so you don't have to pre-create
   products; create them only if you want cleaner reporting names.
 
-### 5. Set secrets
-Now that you have real values from steps 3–4, store them:
+### 5. Configure Resend *(optional — no-email recovery is built in)*
+
+> **You don't actually need Resend.** Sign-up issues a **one-time backup recovery code**
+> (shown once, never emailed, stored hashed) that can be used on the Login screen to
+> recover an account with **no email at all**. Resend is only needed if you also want
+> **email**-based recovery. Configure it only if you do:
+
+- Create a **free** Resend account and an **API key** (`re_…`).
+- **Verify a sending domain** (add the MX/SPF/DKIM records it provides) — or for a quick test use
+  the shared sender `onboarding@resend.dev` with no DNS setup.
+- You'll set `RESEND_API_KEY` and `EMAIL_FROM` in the secrets step below.
+- With Resend configured, email recovery works: `/recover/request` emails a code, `/recover/confirm`
+  verifies + rotates. See `src/recovery.ts`. (No-email backup-code recovery needs no provider.)
+
+### 6. Set secrets
+Now that you have real values from steps 3–5, store them:
 ```bash
 pnpm wrangler secret put STRIPE_SECRET_KEY          # sk_test_...
 pnpm wrangler secret put STRIPE_WEBHOOK_SECRET      # whsec_...  (from step 4)
@@ -176,7 +196,7 @@ Default tiers (used if `STRIPE_TIERS` is unset):
 [{"creditsCents":1000,"feeCents":100},{"creditsCents":2500,"feeCents":150},{"creditsCents":5000,"feeCents":300},{"creditsCents":10000,"feeCents":500}]
 ```
 
-### 6. Apply migrations & run
+### 7. Apply migrations & run
 ```bash
 pnpm d1:migrate:local        # local dev DB
 pnpm dev                     # http://localhost:8787
@@ -277,7 +297,11 @@ What changes for the Video Creator desktop app (vs. a shared key):
 3. **Key loss or compromise:** `POST /recover/request { email }` emails a one-time code, then
    `POST /recover/confirm { email, code }` proves ownership and **rotates** to a fresh key
    (returned in the response). No new provisioning needed.
-4. **Operators** can see which keys exist (`GET /admin/api-keys`, hashes only — never plaintext)
+4. **No-email recovery:** at sign-up `/provision` returns a **one-time backup code** (shown
+   once, never emailed; only its SHA-256 is stored). Present it at `POST /recover/backup` to
+   rotate to a fresh key — it is consumed and a **new** backup code is minted. Use this on the
+   Login screen's "Backup code" tab if you don't want email recovery.
+5. **Operators** can see which keys exist (`GET /admin/api-keys`, hashes only — never plaintext)
    and revoke one (`POST /admin/revoke-key { externalUserId }`); a revoked user must re-prove
    themselves via `/recover/confirm`.
 

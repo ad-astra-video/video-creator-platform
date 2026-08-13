@@ -23,7 +23,12 @@ export interface RunnerInfo {
   capabilities: RunnerCapabilities;
   priceUsdMicrosPerSec?: number;
   /** go-livepeer PriceInfo (see github.com/livepeer/go-livepeer net/lp_rpc): pricePerUnit (wei) + pixelsPerUnit. */
-  priceInfo?: { pricePerUnit?: number; pixelsPerUnit?: number };
+  priceInfo?: {
+    pricePerUnit?: number;
+    pixelsPerUnit?: number;
+    /** Raw discovery price_info { price, currency, unit } surfaced verbatim (our runner quotes wei). */
+    raw?: { price?: number; currency?: string; unit?: string };
+  };
   location?: string;
   gpu?: { name?: string; vram_mb?: number };
 }
@@ -173,14 +178,33 @@ export class OrchestratorClient {
     }
     // Price is taken from the upstream payload only. And only when it is
     // actually present — we never invent one.
+    //
+    // priceUsdMicrosPerSec: trusted as pre-normalized USD micros/sec.
+    // raw discovery price_info {price,currency,unit}: our live-runner quotes a
+    //   price denominated in `currency` (wei or usd) for `unit`. We surface it
+    //   verbatim so the client can convert wei->USD with its own ETH/USD feed
+    //   (the orchestrator republishes a USD price as wei). We must NOT fold a
+    //   wei price into priceUsdMicrosPerSec as if it were USD — that produced
+    //   an absurd USD figure from the raw wei integer.
     let micros: number | undefined;
-    if (raw.priceUsdMicrosPerSec !== undefined) micros = Number(raw.priceUsdMicrosPerSec);
-    else if (raw.price_info && typeof raw.price_info === "object") {
+    if (raw.priceUsdMicrosPerSec !== undefined) {
+      micros = Number(raw.priceUsdMicrosPerSec);
+    }
+    let rawPrice: { price?: number; currency?: string; unit?: string } | undefined;
+    if (raw.price_info && typeof raw.price_info === "object") {
       const pi = raw.price_info as Record<string, unknown>;
       if (typeof pi.price === "number") {
-        micros = String(pi.unit).includes("sec")
-          ? Math.round(pi.price * 1_000_000)
-          : Math.round((pi.price / 60) * 1_000_000);
+        rawPrice = {
+          price: pi.price,
+          currency: String(pi.currency ?? ""),
+          unit: String(pi.unit ?? ""),
+        };
+        const cur = (rawPrice?.currency ?? "").toLowerCase();
+        if (cur === "usd" || cur === "") {
+          micros = (rawPrice?.unit ?? "").toLowerCase().includes("sec")
+            ? Math.round((rawPrice?.price ?? 0) * 1_000_000)
+            : Math.round(((rawPrice?.price ?? 0) / 60) * 1_000_000);
+        }
       }
     }
     // go-livepeer OrchestratorInfo priceInfo / price_info { pricePerUnit (wei), pixelsPerUnit }.
@@ -192,12 +216,16 @@ export class OrchestratorClient {
           : undefined;
     const glPpu = glSource ? glSource.pricePerUnit : raw.pricePerUnit;
     const glPix = glSource ? glSource.pixelsPerUnit : raw.pixelsPerUnit;
-    const glPrice =
+    const glPrice: { pricePerUnit?: number; pixelsPerUnit?: number } | undefined =
       glPpu !== undefined || glPix !== undefined
         ? {
             ...(glPpu !== undefined ? { pricePerUnit: Number(glPpu) } : {}),
             ...(glPix !== undefined ? { pixelsPerUnit: Number(glPix) } : {}),
           }
+        : undefined;
+    const priceInfo =
+      glPrice || rawPrice
+        ? { ...(glPrice ?? {}), ...(rawPrice ? { raw: rawPrice } : {}) }
         : undefined;
 
     const status = raw.status === "busy" ? "busy" : raw.status === "offline" ? "offline" : "ready";
@@ -208,7 +236,7 @@ export class OrchestratorClient {
       status,
       capabilities: { tasks: caps },
       ...(micros !== undefined && Number.isFinite(micros) ? { priceUsdMicrosPerSec: micros } : {}),
-    ...(glPrice ? { priceInfo: glPrice } : {}),
+    ...(priceInfo ? { priceInfo } : {}),
       ...(gpu.name !== undefined || gpu.vram_mb !== undefined ? { gpu } : {}),
     };
   }

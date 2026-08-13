@@ -19,6 +19,8 @@ import {
   setPendingEmail,
   getPendingEmail,
   clearPendingEmail,
+  setBackupCode,
+  useBackupCode,
 } from "./ledger";
 import { sendCodeEmail } from "./recovery";
 import { createCheckoutSession, verifyWebhook } from "./stripe";
@@ -27,6 +29,7 @@ import { getPayerAddress, getSignerProxy, handleAuthorize } from "./signer";
 import {
   err,
   generateRecoveryCode,
+  generateBackupCode,
   hashSecret,
   isValidEmail,
   json,
@@ -67,7 +70,7 @@ import {
   getLocalCatalog,
 } from "./routes/catalog";
 import { getProviders, postDiscoverProviders, postSelectProvider, postExcludeProvider } from "./routes/providers";
-import { getSettingsRoute, postSettingsRoute } from "./routes/settings";
+import { getSettingsRoute, postSettingsRoute, getSettingsFalKey } from "./routes/settings";
 import { getPlatformStatus } from "./routes/platform";
 import { postHfLogin, getHfCallback, getHfStatus, postHfLogout } from "./routes/hf-auth";
 
@@ -125,6 +128,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (method === "POST" && path === "/provision") return await postProvision(request, env);
     if (method === "POST" && path === "/recover/request") return await postRecoverRequest(request, env);
     if (method === "POST" && path === "/recover/confirm") return await postRecoverConfirm(request, env);
+    if (method === "POST" && path === "/recover/backup") return await postRecoverBackup(request, env);
+    // Platform-credits contract — public recovery (no current key required).
+    if (method === "POST" && path === "/api/platform/recover/request") return await postPlatformRecoverRequest(request, env);
+    if (method === "POST" && path === "/api/platform/recover/confirm") return await postPlatformRecoverConfirm(request, env);
     // HF OAuth callback is a redirect target (no per-user key header present).
     if (method === "GET" && path === "/api/auth/huggingface/callback") return await getHfCallback(request, env);
 
@@ -188,9 +195,14 @@ async function handle(request: Request, env: Env): Promise<Response> {
       // Settings:
       if (method === "GET" && path === "/api/settings") return await getSettingsRoute(request, env);
       if (method === "POST" && path === "/api/settings") return await postSettingsRoute(request, env);
+      // Raw FAL key for the DIRECT fal.run path (direct-transport design).
+      if (method === "GET" && path === "/api/settings/fal-key") return await getSettingsFalKey(request, env);
 
       // Platform:
       if (method === "GET" && path === "/api/platform/status") return await getPlatformStatus(request, env);
+      if (method === "GET" && path === "/api/platform/balance") return await getPlatformBalance(env, uid);
+      if (method === "POST" && path === "/api/platform/checkout") return await postPlatformCheckout(request, env, uid);
+      if (method === "POST" && path === "/api/platform/link-email") return await postPlatformLinkEmail(request, env, uid);
 
       // Hugging Face auth (authed endpoints; callback handled above):
       if (method === "POST" && path === "/api/auth/huggingface/login") return await postHfLogin(request, env);
@@ -201,7 +213,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       if (method === "POST" && path === "/checkout") return await postCheckout(request, env, uid);
       if (method === "GET" && path === "/balance") return await getBalance(env, uid);
       if (method === "GET" && path === "/usage") return await getUsage(env, uid);
-      if (method === "POST" && path === "/sign-ticket") return await getSignerProxy(env)(request);
+      if (method === "POST" && path === "/sign-ticket") return await (await getSignerProxy(env))(request);
       if (method === "GET" && path === "/signer/address") return await getPayerAddress(env, uid);
       if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env, uid);
       if (method === "POST" && path === "/link-email/verify") return await verifyLinkEmail(request, env, uid);
@@ -219,10 +231,19 @@ async function handle(request: Request, env: Env): Promise<Response> {
 function withCors(request: Request, env: Env, res: Response): Response {
   const origin = request.headers.get("origin");
   if (!origin) return res;
-  res.headers.set("access-control-allow-origin", origin);
-  res.headers.set("access-control-expose-headers", "content-type, content-length");
-  res.headers.set("vary", "Origin");
-  return res;
+  // Clone into a NEW Response: a proxied response pulled from an upstream
+  // fetch() (e.g. the PymtHouse DMZ in createDirectSignerProxyHandler) has
+  // IMMUTABLE headers, so mutating res.headers would throw "Can't modify
+  // immutable headers" and turn every such route into a bare 500 with no ACAO.
+  const headers = new Headers(res.headers);
+  headers.set("access-control-allow-origin", origin);
+  headers.set("access-control-expose-headers", "content-type, content-length");
+  headers.set("vary", "Origin");
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
 }
 
 export default {
@@ -257,14 +278,19 @@ async function postProvision(request: Request, env: Env): Promise<Response> {
   if (!env.DB) return err("Server error", 500);
 
   await upsertAccount(env.DB, body.externalUserId);
-  const secret = cryptoRandomHex(32); // 64 hex chars, 256 bits
-  const inserted = await createApiKey(env.DB, body.externalUserId, await sha256Hex(secret));
+  const provisionedKey = cryptoRandomHex(32); // 64 hex chars, 256 bits
+  const inserted = await createApiKey(env.DB, body.externalUserId, await sha256Hex(provisionedKey));
   if (!inserted) {
     // Already provisioned — refuse to hand out a new key for this user (prevents
     // an attacker from seizing a balance by re-provisioning a known UUID).
     return err("API key already provisioned for this externalUserId; rotate via /recover", 409);
   }
-  return ok({ apiKey: secret, externalUserId: body.externalUserId });
+  // Optional no-email recovery: mint a one-time backup code, store only its hash,
+  // and return the plaintext ONCE so the user can save it (never emailed/sent again).
+  const backupCode = generateBackupCode();
+  await setBackupCode(env.DB, body.externalUserId, await sha256Hex(backupCode));
+
+  return ok({ apiKey: provisionedKey, externalUserId: body.externalUserId, backupCode });
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +372,96 @@ async function postRecoverConfirm(request: Request, env: Env): Promise<Response>
   const secret = cryptoRandomHex(32);
   await rotateApiKey(env.DB, account.external_user_id, await sha256Hex(secret));
   return ok({ externalUserId: account.external_user_id, apiKey: secret });
+}
+
+type RecoverBackupBody = { code: string };
+/**
+ * No-email recovery: the user presents the one-time backup code they saved at sign-up.
+ * (It is never emailed.) On success: rotate to a fresh API key AND mint a NEW backup
+ * code (returned once) so the user can save the next one. The presented code is
+ * consumed, so it cannot be reused.
+ */
+async function postRecoverBackup(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<RecoverBackupBody>(request);
+  if (!body?.code || !env.DB) return err("code required", 400);
+
+  const secret = cryptoRandomHex(32);
+  const keyHash = await sha256Hex(secret);
+  const { ok: matched, account } = await useBackupCode(env.DB, body.code, keyHash);
+  if (!matched || !account) return err("Invalid recovery code", 400);
+
+  // Rotate succeeded and the used code was cleared. Mint the next one-time code.
+  const nextBackup = generateBackupCode();
+  await setBackupCode(env.DB, account.external_user_id, await sha256Hex(nextBackup));
+  return ok({ externalUserId: account.external_user_id, apiKey: secret, backupCode: nextBackup });
+}
+
+// ---------------------------------------------------------------------------
+// Platform credits contract (/api/platform/*) — thin shapes over the worker-native
+// money/auth logic so the web CreditsPanel works without a desktop backend. The
+// handlers stay graceful when PymtHouse / Stripe / email are not configured (local
+// dev): they report `configured: false` (or a valid empty result) instead of 502.
+// ---------------------------------------------------------------------------
+
+async function getPlatformBalance(env: Env, externalUserId: string): Promise<Response> {
+  try {
+    const balance = await new PymtHouseClient(env).getBalance(externalUserId);
+    return ok({ ...balance, configured: true });
+  } catch {
+    return ok({
+      hasAccess: false,
+      balanceUsdMicros: "0",
+      remainingUsdMicros: "0",
+      consumedUsdMicros: "0",
+      lifetimeGrantedUsdMicros: "0",
+      configured: false,
+    });
+  }
+}
+
+type PlatformCheckoutBody = { tier?: number };
+async function postPlatformCheckout(request: Request, env: Env, externalUserId: string): Promise<Response> {
+  const body = await readJson<PlatformCheckoutBody>(request);
+  const tier = findTier(env, body?.tier ?? NaN);
+  if (!tier) return err("Unknown top-up tier", 400);
+  await upsertAccount(env.DB, externalUserId);
+  const { url } = await createCheckoutSession(env, externalUserId, tier, {});
+  return ok({ url, configured: true });
+}
+
+async function postPlatformLinkEmail(request: Request, env: Env, externalUserId: string): Promise<Response> {
+  const body = await readJson<LinkEmailBody>(request);
+  if (!body?.email || !isValidEmail(body.email)) return err("valid email required", 400);
+  const email = body.email.trim().toLowerCase();
+  await setPendingEmail(env.DB, externalUserId, email);
+  const code = generateRecoveryCode();
+  await storeRecoveryCode(env.DB, email, await hashSecret(code), "link");
+  await sendCodeEmail(env, email, "link", code);
+  return ok({ ok: true, configured: true });
+}
+
+async function postPlatformRecoverRequest(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<RecoverRequestBody>(request);
+  if (!body?.email || !isValidEmail(body.email)) return err("valid email required", 400);
+  const email = body.email.trim().toLowerCase();
+  const account = await getAccountByEmail(env.DB, email);
+  if (account) {
+    const code = generateRecoveryCode();
+    await storeRecoveryCode(env.DB, email, await hashSecret(code), "recover");
+    await sendCodeEmail(env, email, "recover", code);
+  }
+  return ok({ status: "sent" }); // generic — no account enumeration
+}
+
+async function postPlatformRecoverConfirm(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<RecoverConfirmBody>(request);
+  if (!body?.email || !body.code) return err("email and code required", 400);
+  const email = body.email.trim().toLowerCase();
+  const { ok: valid, account } = await consumeRecoveryCode(env.DB, email, body.code, "recover");
+  if (!valid || !account) return err("Invalid or expired code", 400);
+  const secret = cryptoRandomHex(32);
+  await rotateApiKey(env.DB, account.external_user_id, await sha256Hex(secret));
+  return ok({ hasApiKey: true, configured: true, externalUserId: account.external_user_id, apiKey: secret });
 }
 
 // ---------------------------------------------------------------------------

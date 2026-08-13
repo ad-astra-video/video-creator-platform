@@ -9,6 +9,6 @@
 //   apiKey   - OPTIONAL per-user key. Leave '' to let the user supply one in-app (stored in
 //              localStorage as `vcp_key`).
 window.__VC_CONFIG__ = {
-  apiBase: '',
+  apiBase: 'http://127.0.0.1:8787',
   apiKey: '',
 }

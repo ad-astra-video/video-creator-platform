@@ -1,7 +1,7 @@
 name = "video-creator-platform"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 workers_dev = true
 
 # D1 database (create via: wrangler d1 create video-creator-platform, then paste the database_id)

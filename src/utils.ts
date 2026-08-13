@@ -86,6 +86,24 @@ export function generateRecoveryCode(): string {
   return code;
 }
 
+/**
+ * Human-writable backup recovery code for no-email recovery: 4 groups of 4 chars,
+ * e.g. "K7XQ-9M2N-4PQR-3ZW5" (no ambiguous chars). HIGH entropy (~52 bits) — shown
+ * ONCE at sign-up, never emailed, only its SHA-256 is stored.
+ */
+export function generateBackupCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const groups: string[] = [];
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  for (let g = 0; g < 4; g++) {
+    let part = "";
+    for (let i = 0; i < 4; i++) part += alphabet[buf[g * 4 + i] % alphabet.length];
+    groups.push(part);
+  }
+  return groups.join("-");
+}
+
 /** Datetime string in the same format D1 uses (UTC). */
 export function nowIso(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);

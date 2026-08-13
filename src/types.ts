@@ -66,6 +66,7 @@ export interface AccountRow {
   external_user_id: string;
   email: string | null;
   email_verified: number;
+  backup_code_hash: string | null;
   created_at: string;
   last_seen_at: string | null;
 }

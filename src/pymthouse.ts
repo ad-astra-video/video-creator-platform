@@ -1,5 +1,13 @@
 import type { Balance, Env } from "./types";
 
+/** Shape of the per-user allowances response body (PymtHouse). */
+interface AllowanceView {
+  balanceUsdMicros?: string;
+  consumedUsdMicros?: string;
+  lifetimeGrantedUsdMicros?: string;
+  hasAccess?: boolean;
+}
+
 /**
  * Minimal PymtHouse Builder API client (no external SDK needed).
  * All calls use M2M HTTP Basic auth against the app tenant scope.
@@ -36,10 +44,26 @@ export class PymtHouseClient {
     });
   }
 
-  /** Real-time entitlement check. */
+  /**
+   * Real-time entitlement check. Reads the canonical per-user allowances endpoint,
+   * which INCLUDES manual top-up grants (the /usage/balance read only reflects the
+   * subscription/Starter ledger and omits top-ups). allowances.balanceUsdMicros is
+   * the current remaining entitlement ("Balance" in the UI).
+   */
   async getBalance(externalUserId: string): Promise<Balance> {
-    const data = await this.request("GET", `${this.base()}/usage/balance?externalUserId=${encodeURIComponent(externalUserId)}`);
-    return data as Balance;
+    const raw = (await this.request(
+      "GET",
+      `${this.base()}/users/${encodeURIComponent(externalUserId)}/allowances`,
+    )) as { allowances?: AllowanceView } | AllowanceView;
+    const a = (raw && (raw as { allowances?: AllowanceView }).allowances) || (raw as AllowanceView);
+    const balUsd = String(a?.balanceUsdMicros ?? "0");
+    return {
+      hasAccess: Boolean(a?.hasAccess),
+      balanceUsdMicros: balUsd,
+      remainingUsdMicros: balUsd,
+      consumedUsdMicros: String(a?.consumedUsdMicros ?? "0"),
+      lifetimeGrantedUsdMicros: String(a?.lifetimeGrantedUsdMicros ?? balUsd),
+    };
   }
 
   /**
@@ -63,10 +87,18 @@ export class PymtHouseClient {
     });
   }
 
-  /** DMZ / identity-webhook URLs (Phase B). */
+  /** DMZ / identity-webhook URLs (Phase B). Resolves the direct signer DMZ from
+   *  PymtHouse so `REMOTE_SIGNER_URL` doesn't have to be configured separately —
+   *  the base URL covers it. */
   async getSignerRouting(): Promise<{ dmzUrl: string; webhookUrl: string; jwksUrl: string; meteringMode: string }> {
-    const data = await this.request("GET", `${this.base()}/signer/routing`);
-    return data as any;
+    const data = (await this.request("GET", `${this.base()}/signer/routing`)) as any;
+    const routing = (data && typeof data === "object" ? data.routing : data) || {};
+    return {
+      dmzUrl: String(routing.remoteDmzUrl || routing.signerApiUrl || ""),
+      webhookUrl: String(routing.webhookUrl || ""),
+      jwksUrl: String(routing.jwksUri || ""),
+      meteringMode: String(routing.meteringMode || ""),
+    };
   }
 
   private async request(method: string, url: string, body?: unknown): Promise<unknown> {

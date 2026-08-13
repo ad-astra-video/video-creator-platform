@@ -137,16 +137,23 @@ console.log('api/catalog          ->', r.s, 'keys:', Object.keys(r.b));
 r = await j(new Request('https://x/api/providers', bearer(keyA)));
 console.log('api/providers        ->', r.s);
 
-// ---- Phase 2: dispatch generate -> jobId, then progress ----
+// ---- Phase 2: dispatch generate -> (direct-transport: worker no longer carries media) ----
+// Under plans/20260811_direct_transport.md the D1 Worker is control-plane only. /api/generate is
+// now a thin auth-then-410 stub (the browser posts DIRECTLY to the runner or FAL). This asserts the
+// stub responds loudly (410 for authed, 401 without key) instead of silently misrouting.
 r = await j(new Request('https://x/api/generate', { method: 'POST', ...bearer(keyA), body: JSON.stringify({ prompt: 'a cat on a skateboard', numFrames: 81, width: 480, height: 720 }) }));
-console.log('generate dispatch    ->', r.s, 'jobId:', r.b.jobId, r.b.error || '');
-const jobId = r.b.jobId;
-if (r.s === 200 && jobId) {
-  r = await j(new Request('https://x/api/generation/progress?jobId=' + jobId, bearer(keyA)));
-  console.log('generation progress ->', r.s, 'status:', r.b.status, 'jobId match:', r.b.jobId === jobId);
+console.log('generate dispatch    ->', r.s, r.b.error || '');
+if (r.s === 410) {
+  console.log('  (410 Gone = direct transport; worker no longer carries the media path)');
 } else {
-  console.log('generate dispatch FAILED (see above); skipping progress');
+  console.log('  UNEXPECTED: expected 410; got', r.s, JSON.stringify(r.b));
 }
+
+// ---- Phase 2: settings/fal-key (raw key for the direct fal.run path) ----
+r = await j(new Request('https://x/api/settings/fal-key', { method: 'GET', ...bearer(keyA) }));
+console.log('settings/fal-key     ->', r.s, 'hasFalApiKey:', r.b.hasFalApiKey, 'keyLen:', (r.b.falApiKey || '').length);
+r = await j(new Request('https://x/api/settings/fal-key', { method: 'GET' }));
+console.log('fal-key no key       ->', r.s);
 
 // ---- Phase 2: no key on dispatch = 401 ----
 r = await j(new Request('https://x/api/generate', { method: 'POST', body: JSON.stringify({ prompt: 'x' }) }));
