@@ -88,11 +88,21 @@ class FluxKleinEditor:
         return self._model is not None
 
     def ensure_loaded(self) -> None:
-        """Load the FLUX.2 klein 4B flow + AE + Qwen3 text encoder (once)."""
-        if self._model is not None:
+        """Load the FLUX.2 klein 4B flow + AE + Qwen3 text encoder.
+
+        The Qwen3 4B text encoder may be evicted separately right after it
+        produces the prompt conditioning (see evict_text_encoder) to trim VRAM
+        on the shared card during sampling. It is lazily re-loaded here on the
+        next edit when the flow + AE are already resident.
+        """
+        if self._model is not None and self._text_encoder is not None:
             return
         with self._lock:
+            if self._model is not None and self._text_encoder is not None:
+                return
             if self._model is not None:
+                # Flow + AE resident but text encoder was evicted -> load just it.
+                self._load_text_encoder_locked()
                 return
             if self._evict_cb is not None:
                 self._evict_cb()
@@ -109,7 +119,6 @@ class FluxKleinEditor:
 
             import torch
             from flux2.sampling import denoise  # noqa: F401  (smoke: package wired)
-            from flux2.text_encoder import load_qwen3_embedder
             from flux2.util import load_ae, load_flow_model
 
             logger.info(
@@ -120,14 +129,41 @@ class FluxKleinEditor:
             )
             model = load_flow_model("flux.2-klein-4b", device=self._device)
             ae = load_ae("flux.2-klein-4b", device=self._device)
-            text_encoder = load_qwen3_embedder(variant="4B", device=self._device)
-            model.eval()
-            ae.eval()
-            text_encoder.eval()
             self._model = model
             self._ae = ae
-            self._text_encoder = text_encoder
+            self._load_text_encoder_locked()
             logger.info("FLUX.2 klein 4B editor loaded on %s", self._device)
+
+    def _load_text_encoder_locked(self) -> None:
+        """Load/reload the Qwen3 4B text encoder (assumes self._lock held)."""
+        if self._text_encoder is not None:
+            return
+        from flux2.text_encoder import load_qwen3_embedder
+        text_encoder = load_qwen3_embedder(variant="4B", device=self._device)
+        text_encoder.eval()
+        self._text_encoder = text_encoder
+        logger.info("FLUX.2 klein Qwen3 4B text encoder loaded on %s", self._device)
+
+    def evict_text_encoder(self) -> None:
+        """Drop only the Qwen3 4B text encoder's weights.
+
+        Call after the prompt conditioning (ctx/ctx_ids) has been produced —
+        denoise consumes those tensors, not the encoder, so its ~4 GB is freed
+        for the flow + AE sampling loop on the shared card. Re-loaded lazily on
+        the next edit via ensure_loaded.
+        """
+        with self._lock:
+            if self._text_encoder is None:
+                return
+            self._text_encoder = None
+            try:
+                import gc
+                gc.collect()
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            logger.info("Evicted FLUX.2 klein Qwen3 4B text encoder (freed GPU memory)")
 
     def unload(self) -> None:
         """Drop the editor + free its GPU memory (safe to call when unloaded)."""
@@ -188,6 +224,11 @@ class FluxKleinEditor:
         # negative / empty pair (guidance_distilled -> `denoise`, not denoise_cfg).
         ctx = self._text_encoder([prompt]).to(torch.bfloat16)
         ctx, ctx_ids = batched_prc_txt(ctx)
+        # The prompt conditioning is now fully captured in ctx/ctx_ids; the 4B
+        # encoder's weights are no longer needed for denoise. Evict it to keep
+        # the card footprint down to flow + AE while sampling (~4 GB freed).
+        # Lazily re-loaded on the next edit via ensure_loaded.
+        self.evict_text_encoder()
 
         # Reference conditioning: encode the source frame through the AE.
         ref_tokens, ref_ids = encode_image_refs(self._ae, [image])
