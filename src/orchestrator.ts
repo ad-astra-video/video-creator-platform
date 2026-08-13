@@ -31,6 +31,8 @@ export interface RunnerInfo {
   };
   location?: string;
   gpu?: { name?: string; vram_mb?: number };
+  /** Runner-advertised video model specs (resolution/fps/duration) from its metadata. */
+  modelSpecs?: unknown;
 }
 
 export interface JobPayload {
@@ -170,12 +172,13 @@ export class OrchestratorClient {
     if (typeof gpuRaw.vram_mb === "number") gpu.vram_mb = gpuRaw.vram_mb;
     const label = raw.label !== undefined ? String(raw.label) : "";
     const name = gpu.name || label || id;
+    const meta = parseMeta(raw.metadata);
     let caps: string[] = [];
     if (Array.isArray(raw.capabilities)) caps = (raw.capabilities as unknown[]).map(String);
     if (caps.length === 0) {
-      const meta = parseMeta(raw.metadata);
       if (Array.isArray(meta.capabilities)) caps = (meta.capabilities as unknown[]).map(String);
     }
+    const modelSpecs = Array.isArray(meta.model_specs) ? meta.model_specs : undefined;
     // Price is taken from the upstream payload only. And only when it is
     // actually present — we never invent one.
     //
@@ -238,6 +241,7 @@ export class OrchestratorClient {
       ...(micros !== undefined && Number.isFinite(micros) ? { priceUsdMicrosPerSec: micros } : {}),
     ...(priceInfo ? { priceInfo } : {}),
       ...(gpu.name !== undefined || gpu.vram_mb !== undefined ? { gpu } : {}),
+      ...(modelSpecs !== undefined ? { modelSpecs } : {}),
     };
   }
 

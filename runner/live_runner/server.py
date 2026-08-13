@@ -27,6 +27,7 @@ from livepeer_gateway.live_runner import (
 
 from . import config
 from .routing import CAPABILITIES, ROUTES, proxy
+from .specs import build_model_specs
 from .swap import HttpWorkerTransport, ResidentWorkerManager
 
 logger = logging.getLogger("video_creator.runner.live_runner.server")
@@ -42,6 +43,10 @@ _ready = False
 _generation_sem = None  # asyncio.Semaphore(1) — single GPU, one inference at a time
 _in_flight = 0        # active request counter (idle-backfill gate)
 _last_activity = 0.0  # monotonic ts of last request (idle-backfill grace)
+
+# Advertised model-spec metadata (resolution/fps/duration) for the Livepeer
+# video pipelines. Computed once at import from the runner's GPU VRAM config.
+_MODEL_SPECS = build_model_specs()
 
 
 def _need(request: web.Request):
@@ -64,7 +69,7 @@ async def handle_info(_req: web.Request) -> web.Response:
         "capabilities": CAPABILITIES,
         "ready": _ready,
         "gpu": {"name": config.GPU_NAME, "vram_mb": config.GPU_VRAM_MB},
-        "metadata": meta,
+        "metadata": {**meta, "capabilities": CAPABILITIES, "model_specs": _MODEL_SPECS},
     })
 
 
@@ -492,6 +497,7 @@ async def on_startup(_app: web.Application) -> None:
         label="restyle",
         metadata=json.dumps({
             "capabilities": CAPABILITIES,
+            "model_specs": _MODEL_SPECS,
             "ltx_worker_up": False,
             "idv2v_worker_up": False,
             "warm_model": None,
@@ -548,6 +554,7 @@ async def _refresh_metadata_loop() -> None:
             if _worker_manager is not None and _registration is not None:
                 meta = await _worker_manager.check_health()
                 meta["capabilities"] = CAPABILITIES
+                meta["model_specs"] = _MODEL_SPECS
                 # The registration is an in-process object owned by this runner;
                 # set its payload metadata so the next heartbeat advertises the
                 # current warm-model + worker up/down status. (No SDK change needed.)

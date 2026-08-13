@@ -151,7 +151,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       // Worker-reimplemented API surface (api-contract.md).
       // Catalog:
       if (method === "GET" && path === "/api/models") return await getModels();
-      if (method === "GET" && path === "/api/generate/models-specs") return await getModelSpecs();
+      if (method === "GET" && path === "/api/generate/models-specs") return await getModelSpecs(request, env);
       if (method === "GET" && path === "/api/models/ltx-versions") return await getLtxVersions();
       if (method === "GET" && path === "/api/models/ltx-recommendation") return await getLtxRecommendation();
       if (method === "GET" && path === "/api/models/ltx-ic-lora-recommendation") return await getIcLoraRecommendation();
