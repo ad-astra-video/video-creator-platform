@@ -1,0 +1,46 @@
+# Caddyfile — CORS front for the Livepeer orchestrator (video-creator compose)
+# ---------------------------------------------------------------------------
+# Sits in front of the go-livepeer orchestrator so the webapp (running on a
+# different origin, e.g. http://localhost:5173) can call the orchestrator's
+# live-runner proxy (https://orchestrator-5090-3.dpn.gg/apps/...) directly.
+#
+# Responsibilities:
+#   1. Answer the browser OPTIONS preflight itself (204 + CORS headers), so the
+#      origin's 403-for-OPTIONS never blocks the request.
+#   2. Add Access-Control-* headers to every proxied response.
+#
+# The http:// site prefix keeps Caddy off TLS management — TLS is terminated at
+# the Cloudflare edge (cloudflared tunnel). Caddy just listens on plain HTTP.
+
+http://orchestrator-5090-3.dpn.gg {
+	# Browser preflight — handled entirely by Caddy, never reaches the origin.
+	@preflight {
+		method OPTIONS
+	}
+	handle @preflight {
+		header {
+			Access-Control-Allow-Origin "*"
+			Access-Control-Allow-Methods "GET,POST,OPTIONS"
+			Access-Control-Allow-Headers "Content-Type,Authorization,Livepeer-Payer-Address,Livepeer-Payment,Livepeer-Segment,Livepeer-Session,Livepeer-State"
+			Access-Control-Max-Age "86400"
+		}
+		respond "" 204
+	}
+
+	# Proxy other requests to the orchestrator. It serves its own HTTPS on
+	# :8935 with a SELF-SIGNED cert, so use https:// upstream and skip
+	# verification of that cert.
+	handle {
+		header {
+			Access-Control-Allow-Origin "*"
+			Access-Control-Allow-Methods "GET,POST,OPTIONS"
+			Access-Control-Allow-Headers "Content-Type,Authorization,Livepeer-Payer-Address,Livepeer-Payment,Livepeer-Segment,Livepeer-Session,Livepeer-State"
+			Access-Control-Max-Age "86400"
+		}
+		reverse_proxy https://orchestrator:8935 {
+			transport http {
+				tls_insecure_skip_verify
+			}
+		}
+	}
+}

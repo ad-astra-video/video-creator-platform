@@ -1,0 +1,6 @@
+aiohttp>=3.9.0
+Pillow>=10.0.0
+numpy>=1.24.0
+av>=11.0.0
+requests>=2.31.0
+huggingface_hub>=0.24.0

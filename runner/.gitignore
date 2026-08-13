@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# Runtime / build artifacts
+*.mp4
+*.png
+*.safetensors
+tmp_vid/

@@ -1,0 +1,4 @@
+# gemma-worker runtime deps — llama.cpp bindings (GPU via the cu128 index; the
+# CPU wheel from PyPI also works when GEMMA_N_GPU_LAYERS=0).
+llama-cpp-python>=0.3.0
+aiohttp>=3.9

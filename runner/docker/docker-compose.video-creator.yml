@@ -1,0 +1,234 @@
+﻿# Video-Creator runner composition — live-runner + ltx-worker + idv2v-worker
+# ============================================================================
+# Three Docker services on ONE GPU (shared 32GB RTX 5090). The live-runner
+# registers + heartbeats to the Livepeer Orchestrator as app `video-creator`,
+# owns the swap policy, and routes / proxies to exactly one resident worker.
+# ltx-worker and idv2v-worker expose a GPU-swappable surface (/health /load
+# /evict /v1/*) and do NOT touch the Orchestrator.
+#
+# Health-gating: ltx+idv2v workers only start AFTER live-runner is healthy
+# (`depends_on: condition: service_healthy`), so they never outlive the edge.
+#
+# Worker auth: all three share WORKER_TOKEN (auto-generated if blank — each
+# process writes a stable random token to its own env). For a reproducible
+# deployment, export a fixed token once and pass it to all three:
+#   export WORKER_TOKEN="$(openssl rand -hex 16)"
+#
+# Images: pulled from Docker Hub `adastravideo/video-creator`, one per runner
+# (tag = live-runner / ltx-worker / idv2v-worker). No build-from-source here —
+# that happens in CI / on a build host, so the 5090 box just pulls.
+#
+# Usage (from the video-creator repo root, on the GPU box):
+#   docker compose -f docker/docker-compose.video-creator.yml pull
+#   MODELS_DIR=/home/brad/models WORKER_TOKEN=$(openssl rand -hex 16) \
+#     docker compose -f docker/docker-compose.video-creator.yml up
+#
+# Optional local orchestrator (go-livepeer offchain) for testing discovery /
+# heartbeats. Point ORCHESTRATOR_URL at your real orchestrator for production.
+
+name: video-creator-runner
+
+services:
+  orchestrator:
+    image: livepeer/go-livepeer:v0.9.0
+    container_name: video-creator-orchestrator
+    command:
+      - -orchestrator
+      - -useLiveRunners
+      - -serviceAddr=https://orchestrator:8935
+      - -httpAddr=0.0.0.0:8935
+      - -liveRunnerAddr=https://orchestrator:8935
+      - -orchSecret=${ORCHESTRATOR_SECRET:-abcdef}
+      - -network=offchain
+      - -monitor=false
+      - -v=6
+    ports:
+      - "8935:8935"
+    networks:
+      - vc
+    profiles:
+      - orchestrator
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'GET /healthz HTTP/1.0\r\n\r\n' | openssl s_client -connect 127.0.0.1:8935 -quiet 2>/dev/null | grep -q '200 OK'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: video-creator-caddy
+    # CORS front for the orchestrator: lets the webapp (different origin) call the
+    # orchestrator's live-runner proxy directly. Answers OPTIONS preflights (204)
+    # and adds Access-Control-* headers when proxying. Point the cloudflared tunnel
+    # at this service (host port 80). Requires the Caddyfile next to this compose.
+    profiles:
+      - orchestrator
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+        required: false
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      - vc
+
+  live-runner:
+    image: adastravideo/video-creator:live-runner
+    container_name: video-creator-live-runner
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+        required: false
+    environment:
+      - ORCHESTRATOR_URL=${ORCHESTRATOR_URL:-https://orchestrator:8935}
+      - ORCHESTRATOR_SECRET=${ORCHESTRATOR_SECRET:-abcdef}
+      - RUNNER_URL=http://live-runner:8991
+      - APP_ID=video-creator
+      - PRICE=${PRICE:-0.5}
+      - PRICE_UNIT=fixed
+      - GPU_NAME=${GPU_NAME:-RTX 5090}
+      - GPU_VRAM_MB=${GPU_VRAM_MB:-32768}
+      - WORKER_TOKEN=${WORKER_TOKEN:-}
+      - LTX_WORKER_URL=http://ltx-worker:8991
+      - IDV2V_WORKER_URL=http://idv2v-worker:8992
+      - GEMMA_WORKER_URL=http://gemma-worker:8993
+      - LLM_GPU_DEVICE=${LLM_GPU_DEVICE:-}
+      - GEMMA_IDLE_GRACE_S=${GEMMA_IDLE_GRACE_S:-20}
+      - HEARTBEAT_INTERVAL_S=${HEARTBEAT_INTERVAL_S:-5}
+      - PORT=8991
+    ports:
+      - "8991:8991"
+    networks:
+      - vc
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8991/video-creator/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  ltx-worker:
+    image: adastravideo/video-creator:ltx-worker
+    container_name: video-creator-ltx-worker
+    depends_on:
+      live-runner:
+        condition: service_healthy
+    runtime: nvidia
+    environment:
+      - MODEL_CHECKPOINT=${MODEL_CHECKPOINT:-/models/fp8/ltx-2.3-22b-distilled-fp8.safetensors}
+      - TEXT_ENCODER_ROOT=${TEXT_ENCODER_ROOT:-/models/gemma}
+      - UPSCALER_PATH=${UPSCALER_PATH:-/models/upsampler/ltx-2.3-spatial-upscaler-x2-1.1.safetensors}
+      - GPU_DEVICE=${GPU_DEVICE:-0}
+      - WORKER_TOKEN=${WORKER_TOKEN:-}
+      - PORT=8991
+      - LORA_CACHE_DIR=${LORA_CACHE_DIR:-/models/loras}
+      - LORA_CACHE_SIZE_GB=${LORA_CACHE_SIZE_GB:-2.0}
+      - LORA_CATALOG_SOURCE=${LORA_CATALOG_SOURCE:-}
+      - LORA_HF_TOKEN=${LORA_HF_TOKEN:-}
+    volumes:
+      - ${MODELS_DIR:-/models}:/models
+    networks:
+      - vc
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8991/video-creator/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  idv2v-worker:
+    image: adastravideo/video-creator:idv2v-worker
+    container_name: video-creator-idv2v-worker
+    depends_on:
+      live-runner:
+        condition: service_healthy
+    runtime: nvidia
+    environment:
+      - WORKER_TOKEN=${WORKER_TOKEN:-}
+      - GPU_DEVICE=${GPU_DEVICE:-0}
+      - MODEL_CHECKPOINT=${IDV2V_MODEL_CHECKPOINT:-/models/idv2v.pth}
+      - WAN_MODEL_DIR=${WAN_MODEL_DIR:-/models/Wan-AI/Wan2.1-I2V-14B-720P}
+      - SAM3_CKPT=${SAM3_CKPT:-/models/sam3}
+      - IDV2V_QUANT=${IDV2V_QUANT:-int8}
+      - IDV2V_OFFLOAD=${IDV2V_OFFLOAD:-true}
+      - IDV2V_SKIP_SAM3=${IDV2V_SKIP_SAM3:-0}
+      # FLUX.2 [klein] 4B first-frame editor (styled-frame image edit).
+      # Weights bind-mounted by the operator at /models/flux2 (flow + AE) and
+      # the Qwen3 text embedder pulled from HF (KLEIN4B_TEXT_ENC).
+      - KLEIN4B_ENABLED=${KLEIN4B_ENABLED:-auto}
+      - KLEIN4B_MODEL=${KLEIN4B_MODEL:-/models/flux2/flux-2-klein-4b.safetensors}
+      - KLEIN4B_AE=${KLEIN4B_AE:-/models/flux2/ae.safetensors}
+      - KLEIN4B_TEXT_ENC=${KLEIN4B_TEXT_ENC:-Qwen/Qwen3-4B-FP8}
+      - KLEIN4B_STEPS=${KLEIN4B_STEPS:-4}
+      - KLEIN4B_GUIDANCE=${KLEIN4B_GUIDANCE:-1.0}
+      - KLEIN4B_MAX_SIDE=${KLEIN4B_MAX_SIDE:-1024}
+      - PORT=8992
+    volumes:
+      - ${MODELS_DIR:-/models}:/models
+    networks:
+      - vc
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8992/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  gemma-worker:
+    image: adastravideo/video-creator:gemma-worker
+    container_name: video-creator-gemma-worker
+    depends_on:
+      live-runner:
+        condition: service_healthy
+    runtime: nvidia
+    environment:
+      - WORKER_TOKEN=${WORKER_TOKEN:-}
+      - GPU_DEVICE=${GPU_DEVICE:-0}
+      # Blank = shares the video GPU (idle-evictable slot). Set e.g. "1" /
+      # "cuda:1" for a dedicated LLM GPU that the live-runner never evicts.
+      - GEMMA_GPU_DEVICE=${LLM_GPU_DEVICE:-}
+      - GEMMA_MODEL=${GEMMA_MODEL:-/models/gemma/gemma-4-12b-it-qat-q4_0.gguf}
+      - GEMMA_MMPROJ=${GEMMA_MMPROJ:-}
+      # -1 = all layers offloaded (dedicated GPU). 0 = CPU-only. Set per box.
+      - GEMMA_N_GPU_LAYERS=${GEMMA_N_GPU_LAYERS:--1}
+      # Max parallel prompt executions (Gemma 4 Q4; GPU eval serialized).
+      - GEMMA_MAX_PARALLEL=${GEMMA_MAX_PARALLEL:-3}
+      - PORT=8993
+    volumes:
+      - ${MODELS_DIR:-/models}:/models
+    networks:
+      - vc
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8993/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  vc:
+    driver: bridge

@@ -1,0 +1,8 @@
+# Live-runner edge — intentionally thin: NO heavy ML deps (no torch, no ltx,
+# no diffsynth). It only registers with the Livepeer Orchestrator, drives the
+# worker swap policy over HTTP, and proxies requests.
+aiohttp>=3.11.0
+
+# Livepeer gateway SDK (register_runner / heartbeats / metadata).
+# Same live-runner branch; package name is livepeer-gateway.
+livepeer-gateway @ git+https://github.com/livepeer/livepeer-python-gateway.git@ja/live-runner
