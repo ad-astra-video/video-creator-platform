@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sentinel: audio latent encoder not yet built (None means build attempted+failed).
+_AUDIO_COND_MISSING = object()
+
 
 def _gemma_generate(
     text_encoder: Any,
@@ -98,6 +101,10 @@ class VideoCreatorInferenceEngine:
         # constrained cards; this lock serializes swaps so a load never
         # happens concurrently with an eviction/other load.
         self._model_lock = threading.RLock()
+        # Lazily-built audio latent encoder for faithful extend reproduction (LTX-Desktop
+        # regenerates audio during extension). Sentinel (_AUDIO_COND_MISSING) until first
+        # use; None once a build attempt failed (extend then degrades to video-only).
+        self._audio_cond: Any = _AUDIO_COND_MISSING
 
     # ------------------------------------------------------------------
     # Pipeline lifecycle
@@ -225,6 +232,36 @@ class VideoCreatorInferenceEngine:
                 self._evict_zimage()
                 self._load_pipeline()
                 self._loaded_loras = list(self._loras)
+
+    def _pad_latent_frames(self, latent: torch.Tensor, pad_frames: int, at: str) -> torch.Tensor:
+        """Zero-pad a latent on its temporal axis (dim 2): front for ``start``, back for
+        ``end``. Mirrors LTX-Desktop's LTXRetakePipeline._pad_latent_frames."""
+        if pad_frames <= 0:
+            return latent
+        pad_shape = list(latent.shape)
+        pad_shape[2] = pad_frames
+        pad = torch.zeros(pad_shape, device=latent.device, dtype=latent.dtype)
+        return torch.cat([pad, latent] if at == "start" else [latent, pad], dim=2)
+
+    def _extend_audio_conditioner(self) -> Any:
+        """Lazily build the audio latent encoder (AudioConditioner) needed to reproduce
+        LTX-Desktop's extend (encode source audio -> pad -> regenerate). Cached; None on
+        failure so extend degrades to video-only rather than crashing."""
+        if self._audio_cond is not _AUDIO_COND_MISSING:
+            return self._audio_cond
+        try:
+            from ltx_pipelines.utils.blocks import AudioConditioner
+            self._audio_cond = AudioConditioner(
+                self._checkpoint,
+                dtype=torch.bfloat16,
+                device=self._device,
+            )
+            logger.info("Built AudioConditioner for extend audio regeneration")
+        except Exception:
+            logger.warning("AudioConditioner unavailable; extend will regenerate video only",
+                           exc_info=True)
+            self._audio_cond = None
+        return self._audio_cond
 
     # ------------------------------------------------------------------
     # GPU-profile helpers
@@ -467,7 +504,7 @@ class VideoCreatorInferenceEngine:
         logger.info("Upscaled video saved to %s (%dx%d)",
                     output_path, target_width, target_height)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate_extend(
         self,
         prompt: str,
@@ -478,83 +515,150 @@ class VideoCreatorInferenceEngine:
         fps: float,
         output_path: str,
     ) -> None:
-        """Extend video by appending/prepending new frames.
+        """Extend a video by appending/prepending frames - faithful reproduction of
+        LTX-Desktop's LTXRetakePipeline.extend (services/retake_pipeline/ltx_retake_pipeline.py).
 
-        Strategy: decode source video, pass last/first frame as image conditioning
-        to generate new frames, then concatenate.
+        Strategy (mirrors the desktop): encode the WHOLE source video (and audio) to a
+        latent, zero-pad the latent on the time axis by ``extend_frames`` (front/back per
+        ``mode``), then regenerate ONLY the new region under a TemporalRegionMask - the
+        source stays frozen while the newly drawn frames are governed by the TEXT PROMPT
+        (the diffusion's actual conditioning), with a 0.5s seam feather into the source.
+        Audio is regenerated too. This is what makes the extension FOLLOW the prompt -
+        unlike the old single-edge-frame image-to-video continuation.
         """
-        from ltx_pipelines.utils.args import ImageConditioningInput as _LtxImageInput
-
         self._ensure_pipeline()
+        pipe = self._pipeline
+        dtype = torch.bfloat16
+        device = self._device
 
-        # Save source video from base64
+        from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.model.video_vae import (
+            SpatialTilingConfig,
+            TemporalTilingConfig,
+            TilingConfig,
+            get_video_chunks_number,
+        )
+        from ltx_core.types import AudioLatentShape, VideoLatentShape
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES as _distilled_sigmas
+        from ltx_pipelines.utils.denoisers import SimpleDenoiser
+        from ltx_pipelines.utils.helpers import audio_latent_from_file, video_latent_from_file
+        from ltx_pipelines.utils.media_io import encode_video, get_videostream_metadata
+        from ltx_pipelines.utils.types import ModalitySpec
+
+        # Save source video from base64.
         src_bytes = base64.b64decode(video_base64)
         src_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        src_file.write(src_bytes)
-        src_file.close()
-
-        # Extract conditioning frame
-        import av
-        container = av.open(src_file.name)
-        video_stream = container.streams.video[0]
-        frames = []
-        for frame in container.decode(video_stream):
-            frames.append(frame.to_ndarray(format="rgb24"))
-        container.close()
-
-        if not frames:
-            raise ValueError("Source video has no frames")
-
-        if mode == "end":
-            conditioning_frame = frames[-1]
-        else:
-            conditioning_frame = frames[0]
-
-        # Save conditioning frame as image
-        from PIL import Image
-        cond_img = Image.fromarray(conditioning_frame)
-        cond_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-        cond_img.save(cond_path)
-
-        # Get source dimensions
-        h, w, _ = conditioning_frame.shape
-        w = round(w / 64) * 64
-        h = round(h / 64) * 64
-
         try:
-            tiling_config = self.default_tiling_config()
-            chunks = self.video_chunks_number(extend_frames, tiling_config)
+            src_file.write(src_bytes)
+            src_file.close()
 
-            # Generate new frames conditioned on the edge frame
-            video, audio = self._pipeline(
-                prompt=prompt,
-                seed=seed,
-                height=h,
-                width=w,
-                num_frames=extend_frames,
-                frame_rate=float(fps),
-                images=[_LtxImageInput(cond_path, frame_idx=0, strength=1.0)],
-                tiling_config=tiling_config,
+            tiling = TilingConfig.default()
+            encoding_tiling = TilingConfig(
+                spatial_config=SpatialTilingConfig(tile_size_in_pixels=256, tile_overlap_in_pixels=64),
+                temporal_config=TemporalTilingConfig(tile_size_in_frames=24, tile_overlap_in_frames=16),
             )
 
-            # Encode generated frames
-            gen_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-            self.encode_video_output(
-                video=video,
-                fps=int(fps),
-                output_path=gen_path,
-                video_chunks_number_value=chunks,
+            # --- Encode the WHOLE source video + audio to latents (tiled) ---
+            output_shape = get_videostream_metadata(src_file.name)
+            initial_video_latent = pipe.image_conditioner(
+                lambda enc: video_latent_from_file(
+                    video_encoder=enc,
+                    file_path=src_file.name,
+                    output_shape=output_shape,
+                    dtype=dtype,
+                    device=device,
+                    tiling_config=encoding_tiling,
+                )
+            )
+            audio_cond = self._extend_audio_conditioner()
+            initial_audio_latent = (
+                audio_cond(
+                    lambda enc: audio_latent_from_file(
+                        audio_encoder=enc,
+                        file_path=src_file.name,
+                        output_shape=output_shape,
+                        dtype=dtype,
+                        device=device,
+                    )
+                )
+                if audio_cond is not None
+                else None
             )
 
-            # Concatenate source + generated
-            if mode == "end":
-                self._concat_videos([src_file.name, gen_path], output_path)
+            # --- Resolve target shape + the temporal region to regenerate ---
+            target_shape = output_shape._replace(frames=output_shape.frames + extend_frames)
+            pad_video_frames = (
+                VideoLatentShape.from_pixel_shape(target_shape).frames
+                - VideoLatentShape.from_pixel_shape(output_shape).frames
+            )
+            if initial_video_latent is not None:
+                initial_video_latent = self._pad_latent_frames(initial_video_latent, pad_video_frames, mode)
+            if initial_audio_latent is not None:
+                pad_audio_frames = (
+                    AudioLatentShape.from_video_pixel_shape(target_shape).frames
+                    - AudioLatentShape.from_video_pixel_shape(output_shape).frames
+                )
+                initial_audio_latent = self._pad_latent_frames(initial_audio_latent, pad_audio_frames, mode)
+            # Seam feather: regenerate MASK_DELTA_SECONDS of real source adjacent to the new
+            # region so the frozen -> generated boundary blends (matches the desktop's 0.5s).
+            mask_delta_frames = round(0.5 * output_shape.fps)
+            if mode == "start":
+                region_start = 0.0
+                region_end = min(target_shape.frames, extend_frames + mask_delta_frames) / output_shape.fps
             else:
-                self._concat_videos([gen_path, src_file.name], output_path)
+                region_start = max(0, output_shape.frames - mask_delta_frames) / output_shape.fps
+                region_end = target_shape.frames / output_shape.fps
+
+            # --- Text conditioning: the prompt drives the newly generated region ---
+            generator = torch.Generator(device=device).manual_seed(seed)
+            noiser = GaussianNoiser(generator=generator)
+            (ctx_p,) = pipe.prompt_encoder([prompt], enhance_first_prompt=False)
+            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+
+            video_modality_spec = ModalitySpec(
+                context=v_context_p,
+                conditionings=[TemporalRegionMask(start_time=region_start, end_time=region_end, fps=output_shape.fps)],
+                initial_latent=initial_video_latent,
+                frozen=False,
+            )
+            audio_modality_spec = None
+            if a_context_p is not None:
+                audio_modality_spec = ModalitySpec(
+                    context=a_context_p,
+                    conditionings=[TemporalRegionMask(start_time=region_start, end_time=region_end, fps=output_shape.fps)]
+                    if initial_audio_latent is not None else [],
+                    initial_latent=initial_audio_latent,
+                    frozen=initial_audio_latent is not None,
+                )
+
+            sigmas = torch.tensor(_distilled_sigmas).to(dtype=torch.float32, device=device)
+            denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+            video_state, audio_state = pipe.stage(
+                denoiser=denoiser,
+                sigmas=sigmas,
+                noiser=noiser,
+                width=target_shape.width,
+                height=target_shape.height,
+                frames=target_shape.frames,
+                fps=target_shape.fps,
+                video=video_modality_spec,
+                audio=audio_modality_spec,
+            )
+
+            decoded_audio = pipe.audio_decoder(audio_state.latent)
+            decoded_video = pipe.video_decoder(video_state.latent, tiling, generator)
+            video_chunks = get_video_chunks_number(target_shape.frames, tiling)
+            encode_video(
+                video=decoded_video,
+                fps=int(fps),
+                audio=decoded_audio,
+                output_path=output_path,
+                video_chunks_number=video_chunks,
+            )
         finally:
-            for p in [src_file.name, cond_path, gen_path]:
-                if os.path.exists(p):
-                    os.unlink(p)
+            if os.path.exists(src_file.name):
+                os.unlink(src_file.name)
 
     # ------------------------------------------------------------------
     # Retake: regenerate a segment of a video with new prompt
