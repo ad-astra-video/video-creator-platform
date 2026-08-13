@@ -17,6 +17,12 @@ import { useAppSettings } from '../contexts/AppSettingsContext'
 const POLLING_INTERVAL_MS = 2000
 
 export const GENERATION_RECOVERY_KEY = 'ltx-generation-recovery'
+// Parallel timestamp for the same marker: a lease so a crash-leaked marker can't permanently
+// wedge the global generation lock. Written by writeRecoveryContext when the marker goes live;
+// refreshed while a generation is genuinely in flight (see generation-progress-poll); any marker
+// older than the lease (or lacking a timestamp, i.e. from a pre-lease build) is stale and purged.
+export const GENERATION_RECOVERY_TS_KEY = 'ltx-generation-recovery-ts'
+export const GENERATION_RECOVERY_LEASE_MS = 10 * 60 * 1000
 
 export interface GenerationRecoveryContext {
   projectId: string

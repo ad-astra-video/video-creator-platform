@@ -388,7 +388,7 @@ export function createWebElectronAPI(): ElectronAPI {
     },
 
     // Project assets ------------------------------------------------------------------
-    addVisualAssetToProject: async ({ srcPath, type }) => {
+    addVisualAssetToProject: async ({ srcPath, projectId, type }) => {
       try {
         // srcPath is normally a registered web:// key (from the picker). Generated
         // images can arrive as a raw blob:/data: URL that is NOT yet in the store —
@@ -419,8 +419,8 @@ export function createWebElectronAPI(): ElectronAPI {
         {
           const asset = store.getAsset(key)
           const data = store.getBlob(key)
-          if (asset && data) {
-            void saveAssetToProjectFolder(key, data, asset.name, asset.mimeType).catch(() => {})
+          if (asset && data && projectId) {
+            void saveAssetToProjectFolder(projectId, key, data, asset.name, asset.mimeType).catch(() => {})
           }
         }
 
@@ -436,7 +436,16 @@ export function createWebElectronAPI(): ElectronAPI {
         return { success: false, error: e instanceof Error ? e.message : 'Could not read asset' }
       }
     },
-    addGenericAssetToProject: async ({ srcPath }) => ({ success: true, path: srcPath }),
+    addGenericAssetToProject: async ({ srcPath, projectId }) => {
+      if (store.isWebPath(srcPath)) {
+        const asset = store.getAsset(srcPath)
+        const data = store.getBlob(srcPath)
+        if (asset && data && projectId) {
+          void saveAssetToProjectFolder(projectId, srcPath, data, asset.name, asset.mimeType).catch(() => {})
+        }
+      }
+      return { success: true, path: srcPath }
+    },
     makeThumbnailsForProjectAsset: async ({ path }) => ({ success: true, bigThumbnailPath: path, smallThumbnailPath: path }),
     makeDimensionsForProjectAsset: async ({ path, type }) => {
       try {

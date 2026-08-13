@@ -3,11 +3,13 @@
 // directory handle in IndexedDB so its permission can be re-requested on later visits instead
 // of re-picking the folder every time.
 //
-// This is also where saved project assets become REAL files on disk: when an image is saved to
-// a project, `saveAssetToProjectFolder` writes it into the chosen folder as `<uuid>.<ext>`; on
-// reload `listProjectFolderAssets` rescans that folder and the caller re-registers each
-// uuid-named file back into the web store (key `web://<uuid>`) so projects load their assets
-// from disk.
+// This is also where saved project assets become REAL files on disk. Each project gets its own
+// subfolder under the chosen folder (`<folder>/<projectId>/<uuid>.<ext>`), so projects stay
+// isolated on disk and projects load their assets from disk on reload:
+//   - `saveAssetToProjectFolder` writes a saved image/video into that project's subfolder.
+//   - `deleteAssetFromProjectFolder` removes an asset's file when the item is deleted.
+//   - `listProjectFolderAssets` rescans every project subfolder and returns the files re-keyed
+//     to `web://<uuid>` so the caller can re-register them into the web store.
 
 const DB_NAME = 'vcp-fs'
 const STORE = 'dirs'
@@ -22,9 +24,16 @@ interface FsWritableLike {
 interface FsFileHandleLike {
   createWritable(): Promise<FsWritableLike>
 }
+interface FsDirEntryLike {
+  kind: string
+  name: string
+  getFile(): Promise<File>
+}
 interface FsDirLike {
   getFileHandle(name: string, opts?: { create?: boolean }): Promise<FsFileHandleLike>
-  values(): AsyncIterableIterator<{ kind: string; name: string; getFile(): Promise<File> }>
+  getDirectoryHandle(name: string, opts?: { create?: boolean }): Promise<FsDirLike>
+  values(): AsyncIterableIterator<FsDirEntryLike>
+  removeEntry(name: string, opts?: { recursive?: boolean }): Promise<void>
 }
 
 function openDB(): Promise<IDBDatabase> {
@@ -148,23 +157,30 @@ export interface ProjectFolderAsset {
 }
 
 /**
- * Write a saved project asset into the user's chosen folder as `<uuid>.<ext>`. The filename
- * preserves the `web://<uuid>` key so a later rescan can rebuild the same key. Best-effort:
- * returns false (no throw) when no folder is selected or the write fails.
+ * Write a saved project asset into `<folder>/<projectId>/<uuid>.<ext>`. The filename preserves
+ * the `web://<uuid>` key so a later rescan can rebuild the same key. Best-effort: returns false
+ * (no throw) when no folder is selected, the project id is missing, or the write fails.
  */
-export async function saveAssetToProjectFolder(key: string, data: Blob, name: string, mimeType: string): Promise<boolean> {
+export async function saveAssetToProjectFolder(
+  projectId: string,
+  key: string,
+  data: Blob,
+  name: string,
+  mimeType: string,
+): Promise<boolean> {
   const uuid = uuidFromAssetsKey(key)
-  if (!uuid) return false
-  const dir = await requireWriteableAssetsHandle()
-  if (!dir) return false
+  if (!uuid || !projectId) return false
+  const root = await requireWriteableAssetsHandle()
+  if (!root) return false
   try {
-    const d = dir as unknown as FsDirLike
+    const r = root as unknown as FsDirLike
+    const projDir = await r.getDirectoryHandle(projectId, { create: true })
     const filename = `${uuid}.${extForMime(mimeType || data.type, name)}`
     let fh: FsFileHandleLike
     try {
-      fh = await d.getFileHandle(filename)
+      fh = await projDir.getFileHandle(filename)
     } catch {
-      fh = await d.getFileHandle(filename, { create: true })
+      fh = await projDir.getFileHandle(filename, { create: true })
     }
     const writable = await fh.createWritable()
     await writable.write(data)
@@ -177,23 +193,69 @@ export async function saveAssetToProjectFolder(key: string, data: Blob, name: st
 }
 
 /**
- * Scan the user's chosen folder for saved assets (files named `<uuid>.<ext>`) and return them
- * re-keyed to `web://<uuid>` so the caller can re-register them into the store. Returns an
- * empty list when there's no folder or permission isn't granted. Never throws.
+ * Delete an asset's file (`<uuid>.<ext>`) from `<folder>/<projectId>/`. Best-effort; returns
+ * true only if a matching file was actually removed. Never throws.
  */
-export async function listProjectFolderAssets(): Promise<ProjectFolderAsset[]> {
-  const dir = await requireWriteableAssetsHandle()
-  if (!dir) return []
-  const out: ProjectFolderAsset[] = []
+export async function deleteAssetFromProjectFolder(projectId: string, key: string): Promise<boolean> {
+  const uuid = uuidFromAssetsKey(key)
+  if (!uuid || !projectId) return false
+  const root = await requireWriteableAssetsHandle()
+  if (!root) return false
   try {
-    const d = dir as unknown as FsDirLike
-    for await (const entry of d.values()) {
+    const r = root as unknown as FsDirLike
+    let projDir: FsDirLike
+    try {
+      projDir = await r.getDirectoryHandle(projectId)
+    } catch {
+      return false // no subfolder for this project — nothing to delete
+    }
+    for await (const entry of projDir.values()) {
       if (entry.kind !== 'file') continue
       const dot = entry.name.lastIndexOf('.')
       const stem = dot > 0 ? entry.name.slice(0, dot) : entry.name
-      if (!UUID_RE.test(stem)) continue // only files we wrote (uuid-named)
-      const file = await entry.getFile()
-      out.push({ key: `web://${stem}`, data: file as Blob, name: entry.name, mimeType: file.type })
+      if (stem === uuid) {
+        await projDir.removeEntry(entry.name)
+        return true
+      }
+    }
+  } catch (e) {
+    console.warn('[fs-access] failed to delete project asset from folder:', e)
+  }
+  return false
+}
+
+/**
+ * Scan every project subfolder under the chosen folder for saved assets (files named
+ * `<uuid>.<ext>`) and return them re-keyed to `web://<uuid>` so the caller can re-register
+ * them into the store. Returns an empty list when there's no folder or permission isn't
+ * granted. Never throws.
+ */
+export async function listProjectFolderAssets(): Promise<ProjectFolderAsset[]> {
+  const root = await requireWriteableAssetsHandle()
+  if (!root) return []
+  const out: ProjectFolderAsset[] = []
+  try {
+    const r = root as unknown as FsDirLike
+    for await (const projEntry of r.values()) {
+      if (projEntry.kind !== 'directory') continue
+      let projDir: FsDirLike
+      try {
+        projDir = await r.getDirectoryHandle(projEntry.name)
+      } catch {
+        continue
+      }
+      try {
+        for await (const entry of projDir.values()) {
+          if (entry.kind !== 'file') continue
+          const dot = entry.name.lastIndexOf('.')
+          const stem = dot > 0 ? entry.name.slice(0, dot) : entry.name
+          if (!UUID_RE.test(stem)) continue // only files we wrote (uuid-named)
+          const file = await entry.getFile()
+          out.push({ key: `web://${stem}`, data: file as Blob, name: entry.name, mimeType: file.type })
+        }
+      } catch {
+        /* skip a project dir we can't read */
+      }
     }
   } catch (e) {
     console.warn('[fs-access] failed to scan project-assets folder:', e)

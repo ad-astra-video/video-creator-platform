@@ -8,7 +8,7 @@ import {
 import { useProjects } from '../contexts/ProjectContext'
 import type { GenSpaceRetakeSource } from '../contexts/ProjectContext'
 import { useAppSettings } from '../contexts/AppSettingsContext'
-import { useGeneration, GENERATION_RECOVERY_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
+import { useGeneration, GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
 import { setActiveGenerationOwner, hasValidBaselineId } from '../lib/generation-recovery'
 import { resolveRunner, enhancePromptViaRunner } from '../lib/direct-transport'
 import { withGenerationActive } from '../lib/generation-active'
@@ -2335,6 +2335,7 @@ export function GenSpace() {
       GENERATION_RECOVERY_KEY,
       JSON.stringify({ projectId: currentProjectId, baselineId, ...ctx } satisfies GenerationRecoveryContext),
     )
+    localStorage.setItem(GENERATION_RECOVERY_TS_KEY, String(Date.now()))
   }
 
   // Catalog-aware prompt enhancer: rewrites `prompt` in place using either the local Gemma text

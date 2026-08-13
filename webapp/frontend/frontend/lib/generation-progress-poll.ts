@@ -1,8 +1,63 @@
 import { ApiClient } from './api-client'
-import { GENERATION_RECOVERY_KEY } from '../hooks/use-generation'
+import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY, GENERATION_RECOVERY_LEASE_MS, type GenerationRecoveryContext } from '../hooks/use-generation'
 
 type ProgressResult = Awaited<ReturnType<typeof ApiClient.getGenerationProgress>>
 type Listener = (result: ProgressResult) => void
+
+// In the serverless webapp the Cloudflare Worker has NO generation-job rows (browser WS/HTTP
+// generations never write one to D1), so GET /api/generation/progress is a pointless keep-alive
+// ping the Worker can't answer meaningfully. Resolve it from browser-local state instead: the
+// GENERATION_RECOVERY_KEY marker in localStorage IS the "generation in flight" signal. The
+// desktop/Electron build (which has a real backend jobs row) keeps the network call.
+function isWebPlatform(): boolean {
+  try {
+    return (window as unknown as { electronAPI?: { platform?: string } }).electronAPI?.platform === 'web'
+  } catch {
+    return false
+  }
+}
+
+// Returns the in-flight generation marker ONLY if its lease is still live. A marker written by
+// a pre-lease build has no timestamp (or one that's expired because the owning tab died without
+// settling) — both are stale by definition and are purged here, so a leaked marker can never
+// permanently wedge the global generation lock (previously every Generate button greyed until
+// someone manually removed the localStorage key).
+function activeRecoveryMarker(): GenerationRecoveryContext | null {
+  const raw = localStorage.getItem(GENERATION_RECOVERY_KEY)
+  if (!raw) return null
+  const ts = Number(localStorage.getItem(GENERATION_RECOVERY_TS_KEY) ?? NaN)
+  if (!Number.isFinite(ts) || Date.now() - ts > GENERATION_RECOVERY_LEASE_MS) {
+    localStorage.removeItem(GENERATION_RECOVERY_KEY)
+    localStorage.removeItem(GENERATION_RECOVERY_TS_KEY)
+    return null
+  }
+  try {
+    return JSON.parse(raw) as GenerationRecoveryContext
+  } catch {
+    localStorage.removeItem(GENERATION_RECOVERY_KEY)
+    localStorage.removeItem(GENERATION_RECOVERY_TS_KEY)
+    return null
+  }
+}
+
+// Refresh the lease while a generation is genuinely in flight, so a legitimately long job isn't
+// released early; on a crash the tab stops polling and the lease naturally expires.
+function touchLease(): void {
+  if (!localStorage.getItem(GENERATION_RECOVERY_KEY)) return
+  localStorage.setItem(GENERATION_RECOVERY_TS_KEY, String(Date.now()))
+}
+
+export function activeRecoveryMarkerExists(): boolean {
+  return activeRecoveryMarker() != null
+}
+
+function browserLocalProgress(): ProgressResult {
+  const hasMarker = activeRecoveryMarkerExists()
+  return {
+    ok: true,
+    data: { id: null, status: hasMarker ? 'running' : 'idle', progress: 0, phase: '', result: undefined },
+  } as unknown as ProgressResult
+}
 
 const POLL_INTERVAL_MS = 3000
 const MARKER_CHECK_INTERVAL_MS = 3000
@@ -20,7 +75,13 @@ async function poll(): Promise<void> {
   if (pollInFlight) return
   pollInFlight = true
   try {
-    const result = await ApiClient.getGenerationProgress()
+    let result: ProgressResult
+    if (isWebPlatform()) {
+      touchLease()
+      result = browserLocalProgress()
+    } else {
+      result = await ApiClient.getGenerationProgress()
+    }
     lastResult = result
     listeners.forEach(listener => listener(result))
   } finally {
@@ -65,7 +126,7 @@ export function subscribeWhileGenerationMayBeActive(listener: Listener): () => v
     listener(result)
   }
   const sync = () => {
-    const hasMarker = localStorage.getItem(GENERATION_RECOVERY_KEY) != null
+    const hasMarker = activeRecoveryMarkerExists()
     if (hasMarker) {
       if (!unsubscribe) unsubscribe = subscribeToGenerationProgress(trackingListener)
       return

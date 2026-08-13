@@ -8,6 +8,8 @@ import {
   writeProject,
   writeProjectIds,
 } from '../lib/project-storage'
+import { deleteAssetFromProjectFolder } from '../lib/runtime/fs-access'
+import { isWebPath } from '../lib/runtime/web-store'
 
 interface ProjectContextType {
   currentTab: ProjectTab
@@ -189,9 +191,21 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   }, [mutateProject])
 
   const deleteAsset = useCallback((projectId: string, assetId: string) => {
+    // Remove the asset's files from the user's selected folder on disk (best-effort) so the
+    // filesystem stays consistent with the project.
+    const current = readProject(projectId)
+    const asset = current?.assets.find(a => a.id === assetId)
+    if (asset) {
+      const keys = new Set<string>()
+      if (isWebPath(asset.path)) keys.add(asset.path)
+      if (isWebPath(asset.bigThumbnailPath)) keys.add(asset.bigThumbnailPath)
+      if (isWebPath(asset.smallThumbnailPath)) keys.add(asset.smallThumbnailPath)
+      asset.takes?.forEach(take => { if (take && isWebPath(take.path)) keys.add(take.path) })
+      keys.forEach(key => void deleteAssetFromProjectFolder(projectId, key).catch(() => {}))
+    }
     mutateProject(projectId, project => ({
       ...project,
-      assets: project.assets.filter(asset => asset.id !== assetId),
+      assets: project.assets.filter(assetItem => assetItem.id !== assetId),
       updatedAt: Date.now(),
     }))
   }, [mutateProject])

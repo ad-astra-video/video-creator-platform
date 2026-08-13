@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
-import { subscribeWhileGenerationMayBeActive } from '../lib/generation-progress-poll'
-import { GENERATION_RECOVERY_KEY } from './use-generation'
+import { subscribeWhileGenerationMayBeActive, activeRecoveryMarkerExists } from '../lib/generation-progress-poll'
 
 // Only one generation can run at a time across the whole app (single global backend slot), but
 // each project's GenSpace only tracks its OWN local isGenerating-style state — it has no idea a
@@ -18,7 +17,7 @@ import { GENERATION_RECOVERY_KEY } from './use-generation'
 // first poll takes a network round trip to resolve — that gap is otherwise the same unconfirmed
 // window all over again, just re-opened on every reload instead of only at first app launch.
 export function useGlobalGenerationLock(): boolean {
-  const [isRunning, setIsRunning] = useState(() => localStorage.getItem(GENERATION_RECOVERY_KEY) != null)
+  const [isRunning, setIsRunning] = useState(() => activeRecoveryMarkerExists())
 
   useEffect(() => subscribeWhileGenerationMayBeActive(result => {
     setIsRunning(result.ok ? result.data.status === 'running' : true)
