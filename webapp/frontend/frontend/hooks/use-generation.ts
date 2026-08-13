@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import type { GenerationSettings } from '../components/SettingsPanel'
-import { ApiClient, type ApiRequestBodyOf, type ApiSuccessOf } from '../lib/api-client'
+import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
 import {
   falGenerateI2I,
   falGenerateT2I,
@@ -52,7 +52,6 @@ interface GenerationState {
   error: GenerationError | null
 }
 
-type GenerateVideoRequest = ApiRequestBodyOf<'generateVideo'>
 
 interface UseGenerationReturn extends GenerationState {
   generate: (prompt: string, imagePath: string | null, settings: GenerationSettings, audioPath?: string | null) => Promise<void>
@@ -245,10 +244,15 @@ export function useGeneration(): UseGenerationReturn {
           body.loras = settings.loras.map(l => ({ ref: l.ref, scale: l.scale }))
         }
 
-        const useDirectTransport = (appSettings.livepeerDiscoveryUrl || '').trim().length > 0
+        // Direct transport is the ONLY video backend in the webapp (/api/generate is 410 —
+        // the Worker no longer carries the media path). Gate on the Livepeer video toggle, not
+        // on the browser's discovery-URL string: runner resolution happens on the Worker via
+        // /api/providers (using its own D1/env discovery config), so a configured/toggle-on
+        // runner must be attempted even when appSettings.livepeerDiscoveryUrl is empty here.
+        const useDirectTransport = appSettings.livepeerVideoEnabled !== false
 
-        // DIRECT transport: when a Livepeer discovery URL is configured, open a WebSocket to
-        // the runner, stream live progress, and read the resulting media from the final frame.
+        // DIRECT transport: resolve a capable runner (Worker discovery) and do the Livepeer
+        // payment handshake + read the resulting media from the runner response.
         if (useDirectTransport) {
           const runner = await resolveRunner(['t2v'])
           if (!runner) {
@@ -291,84 +295,17 @@ export function useGeneration(): UseGenerationReturn {
           return
         }
 
-        // Poll for real progress from backend with time-based interpolation
-        let lastPhase = ''
-        let inferenceStartTime = 0
-        // Estimated inference time in seconds based on model
-        const estimatedInferenceTime = settings.model === 'pro' ? 120 : 45
-
-        const pollProgress = async () => {
-          if (!shouldApplyPollingUpdates) return
-          const result = await ApiClient.getGenerationProgress()
-          if (!result.ok || !shouldApplyPollingUpdates) return
-
-          const data = result.data
-          let displayProgress = data.progress
-          let statusMessage = getPhaseMessage(data.phase)
-
-          // Time-based interpolation during inference phase
-          if (data.phase === 'inference') {
-            if (lastPhase !== 'inference') {
-              inferenceStartTime = Date.now()
-            }
-            const elapsed = (Date.now() - inferenceStartTime) / 1000
-            // Interpolate from 15% to 95% based on estimated time
-            const inferenceProgress = Math.min(elapsed / estimatedInferenceTime, 0.95)
-            displayProgress = 15 + Math.floor(inferenceProgress * 80)
-          }
-
-          // Keep API/local completion as a terminal response state, not polling state.
-          // Polling complete means backend state is finalized, but request can still be in-flight.
-          if (data.phase === 'complete' || data.status === 'complete') {
-            displayProgress = 95
-            statusMessage = 'Finalizing...'
-          }
-
-          lastPhase = data.phase
-
-          setState(prev => ({
-            ...prev,
-            progress: displayProgress,
-            statusMessage,
-          }))
-        }
-
-        progressInterval = setInterval(pollProgress, 500)
-
-        // Start generation (HTTP POST - synchronous, returns when done)
-        const result = await ApiClient.generateVideo(body as unknown as GenerateVideoRequest, {
-          signal: abortController.signal,
-        })
-        shouldApplyPollingUpdates = false
-        if (!result.ok) {
-          setState(prev => ({
-            ...prev,
-            isGenerating: false,
-            error: result,
-          }))
-          return
-        }
-
-        const payload = result.data
-        if (payload.status === 'complete') {
-          setState({
-            isGenerating: false,
-            progress: 100,
-            statusMessage: 'Complete!',
-            videoPath: payload.video_path,
-            imagePath: null,
-            imagePaths: [],
-            error: null,
-          })
-        } else if (payload.status === 'cancelled') {
-          setState(prev => ({
-            ...prev,
-            isGenerating: false,
-            statusMessage: 'Cancelled',
-          }))
-        } else {
-          throw new Error('Unexpected response from /api/generate')
-        }
+        // The /api/generate fallback is gone in the direct-transport design (Worker returns
+        // 410). If we reach here, no direct runner was available — fail with a clear message
+        // instead of a confusing 410 from the Worker.
+        setState(prev => ({
+          ...prev,
+          isGenerating: false,
+          error: createLocalGenerationError(
+            'Video generation requires a Livepeer runner (direct transport). Configure a Livepeer discovery URL in Settings and ensure a t2v-capable runner is ready.',
+          ),
+        }))
+        return
 
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
