@@ -42,6 +42,13 @@ CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", 
                        "extend", "retake", "prompt-enhance", "suggest-gap-prompt",
                        "chat", "extract-conditioning", "ic-lora-generate"})
 
+# Endpoints served at the idv2v-worker that do NOT need the 20 GB video model
+# resident: they are image-only (FLUX.2 klein editor / SAM3 subprocess) and their
+# own internal lifecycle evicts whatever is resident. Forcing /load here would
+# build the whole WanVideoPipeline (DiT+VACE) and co-resident it with klein on
+# the shared 32 GB card -> OOM. Real video jobs (restyle) still use ensure().
+_IMAGE_ONLY_ENDPOINTS = frozenset({"style-frame", "sam3"})
+
 
 async def proxy(
     worker_manager: "ResidentWorkerManager",
@@ -59,7 +66,13 @@ async def proxy(
     """
     from . import config as cfg
     base = cfg.WORKERS[worker]
-    await worker_manager.ensure(worker)
+    # Image-only endpoints must NOT force the 20 GB video model resident (see
+    # _IMAGE_ONLY_ENDPOINTS). ensure(worker) POSTs /load -> builds the full
+    # WanVideoPipeline; doing that for a style-frame would co-resident the video
+    # model with the klein editor and OOM the shared 32 GB card. Let the worker's
+    # own klein/sam3 eviction lifecycle handle residency for these.
+    if endpoint not in _IMAGE_ONLY_ENDPOINTS:
+        await worker_manager.ensure(worker)
     url = f"{base}/video-creator/v1/{endpoint}"
 
     # Live runner heartbeats are asyncio background tasks; a long restyle must
