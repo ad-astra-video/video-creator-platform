@@ -133,6 +133,19 @@ export function ticketTypeForUnit(unit?: string): string {
  * Resolve a ready, capable runner. Prefers the user's selected runner when it's still ready and
  * capable; otherwise the first capable one. Returns null when none is available.
  */
+// Only a runner the BROWSER can actually fetch is usable for direct (paid) generation. Demo
+// placeholders (providers.ts, DEMO_RUNNERS=1) carry a fake `livepeer://runner.demo/...` url
+// that fetch() rejects ("URL scheme livepeer is not supported") — such a runner must never be
+// selected, or the caller gets an opaque scheme error instead of a graceful "no real runner".
+function isFetchableRunnerUrl(url: string): boolean {
+  try {
+    const p = new URL(url)
+    return p.protocol === 'http:' || p.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
 export async function resolveRunner(requiredCaps: string[]): Promise<RunnerDto | null> {
   const res = await ApiClient.getProviders()
   if (!res.ok) throw new Error('Failed to load providers (runner discovery)')
@@ -140,6 +153,7 @@ export async function resolveRunner(requiredCaps: string[]): Promise<RunnerDto |
   const capable = providers.filter((p) => {
     if (p.status !== 'ready') return false
     if (p.excluded) return false
+    if (!isFetchableRunnerUrl(p.url)) return false
     if (requiredCaps.length === 0) return true
     const ids = new Set((p.capabilities ?? []).map((c) => c.id))
     return requiredCaps.every((c) => ids.has(c))
@@ -167,6 +181,12 @@ export async function postToRunnerWithTicket(
   body: unknown,
   opts?: { signal?: AbortSignal; sse?: boolean },
 ): Promise<Response> {
+  if (!isFetchableRunnerUrl(runner.url)) {
+    throw new Error(
+      `Runner ${runner.runner_id} has no fetchable URL (${runner.url}). This is typically a ` +
+        'demo placeholder (DEMO_RUNNERS) — a real Livepeer orchestrator runner is required for paid generation.',
+    )
+  }
   // sse=1 rides the query string so it survives the go-livepeer reverse proxy
   // (it copies RawQuery) and tells the runner to answer as text/event-stream.
   let url = runner.url.replace(/\/+$/, '') + endpointForTask(task)
