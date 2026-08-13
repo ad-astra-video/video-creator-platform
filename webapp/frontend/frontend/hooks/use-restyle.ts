@@ -2,7 +2,6 @@ import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
-import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type RestyleModel = 'fast' | 'regular'
 
@@ -68,7 +67,6 @@ function getPhaseMessage(phase: string): string {
 
 
 export function useRestyle() {
-  const { settings } = useAppSettings()
   const [state, setState] = useState<UseRestyleState>({
     isRestyling: false,
     restyleStatus: '',
@@ -90,13 +88,6 @@ export function useRestyle() {
     await withGenerationActive(async () => {
       // Direct transport requires a configured Livepeer runner; without it there is no
       // remote backend to dispatch the restyle to.
-      if (!(settings.hasLivepeerDiscoveryUrl && settings.livepeerDiscoveryUrl.trim())) {
-        const msg = 'Restyle requires Livepeer runners. Configure a Livepeer discovery URL in Settings.'
-        logger.error(`Restyle error: ${msg}`)
-        setState({ isRestyling: false, restyleStatus: '', restyleError: msg, result: null })
-        return
-      }
-
       const runner = await resolveRunner(['restyle'])
       if (!runner) {
         const msg = 'No capable Livepeer runner is currently available for restyling.'
@@ -148,7 +139,7 @@ export function useRestyle() {
         result: { videoPath, videoCaption, enhancedPrompt },
       })
     })
-  }, [settings])
+  }, [])
 
   const resetRestyle = useCallback(() => {
     setState({

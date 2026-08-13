@@ -2,7 +2,6 @@ import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
-import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type IcLoraConditioningType = 'canny' | 'depth' | 'custom'
 export type IcLoraAudioMode = 'source' | 'generated' | 'off'
@@ -63,7 +62,6 @@ interface UseIcLoraState {
 
 
 export function useIcLora() {
-  const { settings } = useAppSettings()
   const [state, setState] = useState<UseIcLoraState>({
     isGenerating: false,
     status: '',
@@ -87,13 +85,6 @@ export function useIcLora() {
     await withGenerationActive(async () => {
       // Direct transport requires a configured Livepeer runner; without it there is no
       // remote backend to dispatch the IC-LoRA generation to.
-      if (!(settings.hasLivepeerDiscoveryUrl && settings.livepeerDiscoveryUrl.trim())) {
-        const msg = 'IC-LoRA generation requires Livepeer runners. Configure a Livepeer discovery URL in Settings.'
-        logger.error(`IC-LoRA error: ${msg}`)
-        setState({ isGenerating: false, status: '', error: msg, result: null })
-        return
-      }
-
       const runner = await resolveRunner(['ic-lora-generate'])  // runner advertises ic-lora-generate, not ic-lora
       if (!runner) {
         const msg = 'No capable Livepeer runner is currently available for IC-LoRA generation.'
@@ -148,7 +139,7 @@ export function useIcLora() {
         result: { videoPath },
       })
     })
-  }, [settings])
+  }, [])
 
   const reset = useCallback(() => {
     setState({

@@ -2,7 +2,6 @@ import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
-import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type ExtendDirection = 'start' | 'end'
 
@@ -31,7 +30,6 @@ interface UseExtendState {
 
 
 export function useExtend() {
-  const { settings } = useAppSettings()
   const [state, setState] = useState<UseExtendState>({
     isExtending: false,
     extendStatus: '',
@@ -45,15 +43,6 @@ export function useExtend() {
     setState({ isExtending: true, extendStatus: 'Generating', extendError: null, result: null })
 
     await withGenerationActive(async () => {
-      // Direct transport requires a configured Livepeer runner; without it there is no
-      // remote backend to dispatch the extend to.
-      if (!(settings.hasLivepeerDiscoveryUrl && settings.livepeerDiscoveryUrl.trim())) {
-        const msg = 'Remote extension requires Livepeer runners. Configure a Livepeer discovery URL in Settings.'
-        logger.error(`Extend error: ${msg}`)
-        setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
-        return
-      }
-
       const runner = await resolveRunner(['extend'])
       if (!runner) {
         const msg = 'No capable Livepeer runner is currently available for extending.'
@@ -92,7 +81,7 @@ export function useExtend() {
         result: { videoPath },
       })
     })
-  }, [settings])
+  }, [])
 
   const resetExtend = useCallback(() => {
     setState({ isExtending: false, extendStatus: '', extendError: null, result: null })

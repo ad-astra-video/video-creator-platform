@@ -2,7 +2,6 @@ import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
-import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type RetakeMode = 'replace_audio_and_video' | 'replace_video' | 'replace_audio'
 
@@ -28,7 +27,6 @@ interface UseRetakeState {
 }
 
 export function useRetake() {
-  const { settings } = useAppSettings()
   const [state, setState] = useState<UseRetakeState>({
     isRetaking: false,
     retakeStatus: '',
@@ -47,13 +45,6 @@ export function useRetake() {
     })
 
     await withGenerationActive(async () => {
-      if (!(settings.hasLivepeerDiscoveryUrl && settings.livepeerDiscoveryUrl.trim())) {
-        const msg = 'Remote retake requires Livepeer runners. Configure a Livepeer discovery URL in Settings.'
-        logger.error(`Retake error: ${msg}`)
-        setState({ isRetaking: false, retakeStatus: '', retakeError: msg, result: null })
-        return
-      }
-
       const runner = await resolveRunner(['t2v'])
       if (!runner) {
         const msg = 'No capable Livepeer runner is currently available for retake.'
@@ -91,7 +82,7 @@ export function useRetake() {
         result: { videoPath: URL.createObjectURL(res.mediaBlob) },
       })
     })
-  }, [settings])
+  }, [])
 
   const resetRetake = useCallback(() => {
     setState({
