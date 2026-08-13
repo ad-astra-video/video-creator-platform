@@ -351,6 +351,9 @@ export interface PlatformRecoverResponse {
 export interface PlatformRecoverConfirmResponse {
   hasApiKey: boolean
   configured: boolean
+  /** Rotated key. Persist it so the (web) app keeps talking to the Worker. */
+  apiKey?: string
+  externalUserId?: string
 }
 
 export type PlatformRequestResult<T> =
@@ -567,6 +570,66 @@ export class ApiClient {
     return { ok: false, status: '5XX', error: result.status }
   }
 
+  // ── Phase B direct transport: payment ticket + payer address + raw FAL key ──
+
+  /** GET /signer/address — the broadcaster/payer address to send as Livepeer-Payer-Address. */
+  static async getSignerAddress(): Promise<{ ok: true; data: { address: string } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/signer/address', { method: 'GET' })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json?.address) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+  /** POST /sign-ticket — Worker proxies the PymtHouse DMZ; returns { payment, segCreds, state }. */
+  static async signTicket(body: {
+    /** The orchestrator's opaque payment_params from the 402 challenge. */
+    paymentParams: unknown
+    type: string
+    manifestId?: string
+    state?: string
+  }): Promise<
+    { ok: true; data: { payment: string; segCreds: string; state?: string } }
+    | { ok: false; status: number; error: any }
+  > {
+    // The Worker relays this body VERBATIM to the PymtHouse DMZ
+    // POST /generate-live-payment, whose contract (see livepeer-python-gateway
+    // remote_signer.LivePaymentSession) is:
+    //   { orchestrator: <the 402 payment_params string>, type,
+    //     ManifestID: <manifest_id>, state? }
+    // So the 402's payment_params must be placed under `orchestrator` and the
+    // manifest id under the capitalised `ManifestID`.
+    const dmz: Record<string, unknown> = {
+      orchestrator: body.paymentParams,
+      type: body.type,
+      ManifestID: body.manifestId ?? '',
+    }
+    if (body.state) dmz.state = body.state
+    try {
+      const res = await backendFetch('/sign-ticket', { method: 'POST', body: JSON.stringify(dmz) })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json?.payment) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+  /** GET /api/settings/fal-key — the raw FAL key for the browser→fal.run DIRECT path. */
+  static async getFalApiKey(): Promise<{ ok: true; data: { falApiKey: string; hasFalApiKey: boolean } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/api/settings/fal-key', { method: 'GET' })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
   // ── Platform credits: balance, top-up (Stripe checkout), key recovery ────
 
   static getPlatformStatus(): Promise<PlatformRequestResult<PlatformStatus>> {
@@ -591,6 +654,102 @@ export class ApiClient {
 
   static confirmPlatformRecovery(email: string, code: string): Promise<PlatformRequestResult<PlatformRecoverConfirmResponse>> {
     return platformRequest<PlatformRecoverConfirmResponse>('/api/platform/recover/confirm', 'post', { email, code })
+  }
+
+  // ── Worker-native auth: provisioning + email recovery ────────────────────
+  // These hit the Worker's actual routes (/provision, /recover/{request,confirm}),
+  // which unlike the /api/platform/* routes above ARE served by the Worker for the
+  // direct web build. /provision is identity-free and mints a one-time key; the
+  // recover routes bind by email and rotate the key on the same externalUserId.
+
+  static async provisionWorker(externalUserId: string): Promise<{ ok: true; data: { apiKey: string; externalUserId: string; backupCode?: string } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/provision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ externalUserId }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+  static async linkEmail(email: string): Promise<{ ok: true; data: { ok: boolean } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/link-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+  static async verifyLinkEmail(email: string, code: string): Promise<{ ok: true; data: { ok: boolean; email: string } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/link-email/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+  static async requestRecovery(email: string): Promise<{ ok: true; data: { ok: boolean } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/recover/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+  static async confirmRecovery(email: string, code: string): Promise<{ ok: true; data: { externalUserId: string; apiKey: string } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/recover/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+  static async recoverByBackupCode(code: string): Promise<{ ok: true; data: { externalUserId: string; apiKey: string; backupCode?: string } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/recover/backup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
   }
 }
 

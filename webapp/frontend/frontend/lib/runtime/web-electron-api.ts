@@ -22,6 +22,14 @@ function vcConfig(): VcConfig {
 }
 
 function apiBase(): string {
+  // A user-set platform URL (chosen in the onboarding wizard / Settings) overrides the
+  // shipped config so the app can talk to a different Worker without a rebuild.
+  try {
+    const user = localStorage.getItem('vcp_platform_url')
+    if (user) return user.replace(/\/$/, '')
+  } catch {
+    /* ignore */
+  }
   // Runtime config (dist/config.js) wins, then VITE_API_BASE (build-time), then same-origin.
   const c = vcConfig().apiBase
   if (typeof c === 'string' && c) return c.replace(/\/$/, '')
@@ -70,7 +78,10 @@ const directories = new Map<string, Map<string, string>>() // dirKey -> { name: 
 
 // ---- health ---------------------------------------------------------------
 
-let healthTimer: ReturnType<typeof setInterval> | null = null
+// One-shot liveness probe (used only to resolve the App.tsx `connected` boot gate).
+// Intentionally NOT a recurring poll: under the serverless/Livepeer model there is no local
+// backend process to watch, so every-5s /health against the Worker was pure network chatter.
+let healthProbed = false
 let healthListeners = new Set<(s: BackendHealthStatus) => void>()
 
 function broadcastHealth(status: BackendHealthStatus): void {
@@ -93,13 +104,9 @@ async function probeHealth(): Promise<BackendHealthStatus> {
 }
 
 function ensureHealthPoll(): void {
-  if (healthTimer) return
-  void probeHealth().then((s) => {
-    broadcastHealth(s)
-    healthTimer = setInterval(() => {
-      void probeHealth().then(broadcastHealth)
-    }, 5000)
-  })
+  if (healthProbed) return
+  healthProbed = true
+  void probeHealth().then(broadcastHealth)
 }
 
 // ---- file input helper -----------------------------------------------------
@@ -382,14 +389,21 @@ export function createWebElectronAPI(): ElectronAPI {
 
     // Project assets ------------------------------------------------------------------
     addVisualAssetToProject: async ({ srcPath, type }) => {
-      // srcPath is already a registered web:// key (from the picker); add dimensions.
       try {
-        const dims = await store.measureMedia(srcPath, type)
+        // srcPath is normally a registered web:// key (from the picker). Generated
+        // images can arrive as a raw blob:/data: URL that is NOT yet in the store —
+        // register it first so measureMedia can read it and persistence succeeds.
+        let key = srcPath
+        if (!store.isWebPath(srcPath)) {
+          const blob = await fetch(srcPath).then((r) => r.blob())
+          key = store.registerBlob(blob, 'generated', blob.type)
+        }
+        const dims = await store.measureMedia(key, type)
         return {
           success: true,
-          path: srcPath,
-          bigThumbnailPath: srcPath,
-          smallThumbnailPath: srcPath,
+          path: key,
+          bigThumbnailPath: key,
+          smallThumbnailPath: key,
           width: dims.width,
           height: dims.height,
         }

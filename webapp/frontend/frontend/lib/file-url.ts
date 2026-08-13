@@ -5,6 +5,12 @@
  *   C:\Users\me\video#1.mp4 → file:///C:/Users/me/video%231.mp4
  */
 export function pathToFileUrl(filePath: string): string {
+  // Web-app case: a `web://<uuid>` key is NOT a filesystem path — resolve it to the
+  // in-browser store's object URL so <img>/<video> render it (otherwise it becomes an
+  // unplayable `file:///web%3A//…` URL that the browser blocks).
+  if (filePath.startsWith('web://')) {
+    return getBlobUrl(filePath) ?? ''
+  }
   // Normalize Windows separators
   let normalized = filePath.replace(/\\/g, '/')
 

@@ -1,7 +1,8 @@
 import { useCallback, useState } from 'react'
-import { ApiClient } from '../lib/api-client'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
+import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type ExtendDirection = 'start' | 'end'
 
@@ -28,7 +29,9 @@ interface UseExtendState {
   result: ExtendResult | null
 }
 
+
 export function useExtend() {
+  const { settings } = useAppSettings()
   const [state, setState] = useState<UseExtendState>({
     isExtending: false,
     extendStatus: '',
@@ -42,49 +45,54 @@ export function useExtend() {
     setState({ isExtending: true, extendStatus: 'Generating', extendError: null, result: null })
 
     await withGenerationActive(async () => {
-      const result = await ApiClient.extend({
+      // Direct transport requires a configured Livepeer runner; without it there is no
+      // remote backend to dispatch the extend to.
+      if (!(settings.hasLivepeerDiscoveryUrl && settings.livepeerDiscoveryUrl.trim())) {
+        const msg = 'Remote extension requires Livepeer runners. Configure a Livepeer discovery URL in Settings.'
+        logger.error(`Extend error: ${msg}`)
+        setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
+        return
+      }
+
+      const runner = await resolveRunner(['extend'])
+      if (!runner) {
+        const msg = 'No capable Livepeer runner is currently available for extending.'
+        logger.error(`Extend error: ${msg}`)
+        setState({ isExtending: false, extendStatus: '', extendError: msg, result: null })
+        return
+      }
+
+      const res = await postRunnerTaskWithTicket(runner, 'extend', {
         video_path: params.videoPath,
         duration: params.duration,
         prompt: params.prompt,
         mode: params.mode,
         resolution: params.resolution,
+      }, {
+        onProgress: (ev) => {
+          if (ev.stage === 'generating') {
+            setState(prev => ({ ...prev, extendStatus: ev.message || 'Extending...' }))
+          }
+        },
       })
-
-      if (!result.ok) {
-        logger.error(`Extend error: ${result.error.message}`)
-        setState({ isExtending: false, extendStatus: '', extendError: result.error.message, result: null })
+      if (!res.mediaBlob) {
+        const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
+        logger.error(`Extend error: ${err}`)
+        setState({ isExtending: false, extendStatus: '', extendError: err, result: null })
         return
       }
 
-      const payload = result.data
-
-      if (payload.status === 'cancelled') {
-        setState({ isExtending: false, extendStatus: 'Cancelled', extendError: null, result: null })
-        return
-      }
-
-      if ('video_path' in payload) {
-        setState({
-          isExtending: false,
-          extendStatus: 'Extend complete!',
-          extendError: null,
-          result: { videoPath: payload.video_path },
-        })
-        return
-      }
-
-      // A 200 with a remote payload and no local file is a legitimate success (the backend
-      // completed the generation); there's just no local artifact to import. Don't surface
-      // it as an error.
-      logger.warn(`Extend completed with a remote payload and no local file: ${JSON.stringify(payload.result)}`)
+      // The runner streams the generated media back over the WebSocket — store it as a local
+      // object URL for the project asset store.
+      const videoPath = URL.createObjectURL(res.mediaBlob)
       setState({
         isExtending: false,
         extendStatus: 'Extend complete!',
         extendError: null,
-        result: null,
+        result: { videoPath },
       })
     })
-  }, [])
+  }, [settings])
 
   const resetExtend = useCallback(() => {
     setState({ isExtending: false, extendStatus: '', extendError: null, result: null })

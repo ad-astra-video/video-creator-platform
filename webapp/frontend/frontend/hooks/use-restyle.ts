@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { ApiClient } from '../lib/api-client'
+import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
+import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type RestyleModel = 'fast' | 'regular'
 
@@ -36,7 +37,6 @@ interface UseRestyleState {
   result: RestyleResult | null
 }
 
-const POLLING_INTERVAL_MS = 500
 
 // Map backend phase to a user-friendly message.
 function getPhaseMessage(phase: string): string {
@@ -66,7 +66,9 @@ function getPhaseMessage(phase: string): string {
   }
 }
 
+
 export function useRestyle() {
+  const { settings } = useAppSettings()
   const [state, setState] = useState<UseRestyleState>({
     isRestyling: false,
     restyleStatus: '',
@@ -74,17 +76,6 @@ export function useRestyle() {
     result: null,
   })
 
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current)
-      pollRef.current = null
-    }
-  }, [])
-
-  // Stop polling if the hook unmounts mid-generation.
-  useEffect(() => stopPolling, [stopPolling])
 
   const submitRestyle = useCallback(async (params: RestyleSubmitParams) => {
     if (!params.videoPath || !params.stylizedImagePath) return
@@ -97,35 +88,24 @@ export function useRestyle() {
     })
 
     await withGenerationActive(async () => {
-      // Poll the backend's generation progress while the restyle request is
-      // in flight (the backend streams real remote progress over a websocket
-      // to the live-runner, so this shows live stages/percent rather than a
-      // static "Restyling" that hides a minuter-scale generation).
-      let stopped = false
-      pollRef.current = setInterval(async () => {
-        if (stopped) return
-        const r = await ApiClient.getGenerationProgress()
-        if (!r.ok || stopped) return
-        const data = r.data
-        if (data.status === 'complete') {
-          setState(prev => ({ ...prev, restyleStatus: 'Finalizing...' }))
-          return
-        }
-        const msg = getPhaseMessage(data.phase)
-        // The % is only meaningful for backbone inference iterations; every
-        // other step (connecting/preprocessing/decoding/upscaling/finalizing)
-        // updates the text only. So render the % purely when phase is
-        // 'generating' and a numeric progress is present.
-        const isBackbone = data.phase === 'generating'
-        const pct = typeof data.progress === 'number' ? data.progress : null
-        const showPct = isBackbone && pct !== null
-        setState(prev => ({
-          ...prev,
-          restyleStatus: showPct ? `${msg} ${Math.min(pct, 99)}%` : msg,
-        }))
-      }, POLLING_INTERVAL_MS)
+      // Direct transport requires a configured Livepeer runner; without it there is no
+      // remote backend to dispatch the restyle to.
+      if (!(settings.hasLivepeerDiscoveryUrl && settings.livepeerDiscoveryUrl.trim())) {
+        const msg = 'Restyle requires Livepeer runners. Configure a Livepeer discovery URL in Settings.'
+        logger.error(`Restyle error: ${msg}`)
+        setState({ isRestyling: false, restyleStatus: '', restyleError: msg, result: null })
+        return
+      }
 
-      const result = await ApiClient.restyle({
+      const runner = await resolveRunner(['restyle'])
+      if (!runner) {
+        const msg = 'No capable Livepeer runner is currently available for restyling.'
+        logger.error(`Restyle error: ${msg}`)
+        setState({ isRestyling: false, restyleStatus: '', restyleError: msg, result: null })
+        return
+      }
+
+      const res = await postRunnerTaskWithTicket(runner, 'restyle', {
         video_path: params.videoPath,
         stylized_image_path: params.stylizedImagePath,
         prompt: params.prompt,
@@ -136,55 +116,48 @@ export function useRestyle() {
         cfg_scale: params.cfgScale ?? 5.0,
         seed: params.seed,
         enhance_prompt: params.enhancePrompt ?? false,
+      }, {
+        onProgress: (ev) => {
+          const msg = getPhaseMessage(ev.stage || '')
+          const isBackbone = ev.stage === 'generating'
+          const pct = typeof ev.progress === 'number' ? ev.progress : null
+          const showPct = isBackbone && pct !== null
+          setState(prev => ({
+            ...prev,
+            restyleStatus: showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg,
+          }))
+        },
       })
-      stopped = true
-      stopPolling()
 
-      if (!result.ok) {
-        logger.error(`Restyle error: ${result.error.message}`)
-        setState({
-          isRestyling: false,
-          restyleStatus: '',
-          restyleError: result.error.message,
-          result: null,
-        })
+      if (!res.mediaBlob) {
+        const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
+        logger.error(`Restyle error: ${err}`)
+        setState({ isRestyling: false, restyleStatus: '', restyleError: err, result: null })
         return
       }
 
-      const payload = result.data
-
-      if (payload.status === 'cancelled') {
-        setState({
-          isRestyling: false,
-          restyleStatus: 'Cancelled',
-          restyleError: null,
-          result: null,
-        })
-        return
-      }
-
+      // The runner streams the generated media back over the WebSocket — store it as a local
+      // object URL for the project asset store.
+      const videoPath = URL.createObjectURL(res.mediaBlob)
+      const videoCaption = res.payload?.video_caption ? String(res.payload.video_caption) : null
+      const enhancedPrompt = res.payload?.enhanced_prompt ? String(res.payload.enhanced_prompt) : null
       setState({
         isRestyling: false,
         restyleStatus: 'Restyle complete!',
         restyleError: null,
-        result: {
-          videoPath: payload.video_path,
-          videoCaption: payload.video_caption ?? null,
-          enhancedPrompt: payload.enhanced_prompt ?? null,
-        },
+        result: { videoPath, videoCaption, enhancedPrompt },
       })
     })
-  }, [stopPolling])
+  }, [settings])
 
   const resetRestyle = useCallback(() => {
-    stopPolling()
     setState({
       isRestyling: false,
       restyleStatus: '',
       restyleError: null,
       result: null,
     })
-  }, [stopPolling])
+  }, [])
 
   return {
     submitRestyle,

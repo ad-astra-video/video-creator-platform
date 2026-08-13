@@ -1,8 +1,9 @@
-﻿import { AlertCircle, Check, Download, Film, Folder, HardDrive, Info, KeyRound, Settings, Sparkles, X, Zap } from 'lucide-react'
+﻿import { AlertCircle, Check, Download, Film, Folder, HardDrive, Info, KeyRound, Settings, Sparkles, Wallet, X, Zap } from 'lucide-react'
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { RunnersSection } from './settings/RunnersSection'
 import { CreditsPanel } from './settings/CreditsPanel'
+import { AccountPanel } from './AccountPanel'
 import { useAppSettings, type AppSettings } from '../contexts/AppSettingsContext'
 import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
 import { logger } from '../lib/logger'
@@ -16,7 +17,7 @@ interface SettingsModalProps {
   initialTab?: TabId
 }
 
-type TabId = 'general' | 'models' | 'apiKeys' | 'promptEnhancer' | 'about'
+type TabId = 'general' | 'models' | 'apiKeys' | 'promptEnhancer' | 'account' | 'about'
 
 /** Focuses an API Keys tab input once the modal has switched to that tab.
  *  Shared by the LTX and FAL key inputs — each call gets its own ref/pending state. */
@@ -433,6 +434,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     ...(!forceApiGenerations ? [{ id: 'models' as TabId, label: 'Models', icon: HardDrive }] : []),
     { id: 'apiKeys' as TabId, label: 'API Keys', icon: KeyRound },
     { id: 'promptEnhancer' as TabId, label: 'Prompt Enhancer', icon: Sparkles },
+    { id: 'account' as TabId, label: 'Account', icon: Wallet },
     { id: 'about' as TabId, label: 'About', icon: Info },
   ]
 
@@ -1008,6 +1010,8 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                     )}
                   </div>
 
+                  {/* Platform Credits — a card nested inside the Livepeer card. */}
+                  <CreditsPanel />
                 </div>
               </div>
 
@@ -1248,8 +1252,6 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                   </div>
                 </div>
               </div>
-
-<CreditsPanel />
             </>
           )}
 
@@ -1378,6 +1380,18 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                     </div>
                   </>
                 ) : null}
+              </div>
+            </>
+          )}
+
+          {activeTab === 'account' && (
+            <>
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <Wallet className="h-4 w-4 text-amber-400" />
+                  <h3 className="text-sm font-semibold text-white">Account</h3>
+                </div>
+                <AccountPanel />
               </div>
             </>
           )}

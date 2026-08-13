@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
-import { AlertCircle, CreditCard, KeyRound, RefreshCw, Wallet } from 'lucide-react'
+import { AlertCircle, CreditCard, KeyRound, Loader2, RefreshCw, Wallet } from 'lucide-react'
 import { useAppSettings } from '../../contexts/AppSettingsContext'
 import { ApiClient, type PlatformBalance, type PlatformStatus } from '../../lib/api-client'
+import { resetBackendCredentials } from '../../lib/backend'
 
 const TIERS: Array<{ label: string; cents: number; charge: string }> = [
-  { label: '$10', cents: 1000, charge: 'pays $11' },
-  { label: '$25', cents: 2500, charge: 'pays $26.50' },
-  { label: '$50', cents: 5000, charge: 'pays $53' },
-  { label: '$100', cents: 10000, charge: 'pays $105' },
+  { label: '$10', cents: 1000, charge: 'cost $11' },
+  { label: '$25', cents: 2500, charge: 'cost $26.50' },
+  { label: '$50', cents: 5000, charge: 'cost $53' },
+  { label: '$100', cents: 10000, charge: 'cost $105' },
 ]
 
 function formatMicros(micros: number): string {
@@ -15,12 +16,12 @@ function formatMicros(micros: number): string {
 }
 
 export function CreditsPanel() {
-  const { settings, updateSettings, refreshSettings } = useAppSettings()
+  const { refreshSettings } = useAppSettings()
 
-  const [baseUrlInput, setBaseUrlInput] = useState('')
   const [status, setStatus] = useState<PlatformStatus | null>(null)
   const [balance, setBalance] = useState<PlatformBalance | null>(null)
   const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false) // initial fetch finished (vs a later manual refresh)
   const [busyTier, setBusyTier] = useState<number | null>(null)
   const [message, setMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
@@ -38,27 +39,12 @@ export function CreditsPanel() {
     if (s.ok) setStatus(s.data)
     if (b.ok) setBalance(b.data)
     setLoading(false)
+    setLoaded(true)
   }, [])
 
   useEffect(() => {
-    if (!settings.hasPlatformBaseUrl) return
     void load()
-  }, [settings.hasPlatformBaseUrl, load])
-
-  const saveBaseUrl = async () => {
-    const trimmed = baseUrlInput.trim()
-    if (!trimmed) return
-    updateSettings({ platformBaseUrl: trimmed })
-    try {
-      await refreshSettings()
-      setMessage({ kind: 'ok', text: 'Platform server saved.' })
-      await load()
-    } catch (err) {
-      setMessage({ kind: 'err', text: errorText(err) })
-    } finally {
-      setBaseUrlInput('')
-    }
-  }
+  }, [load])
 
   const topUp = async (cents: number) => {
     setBusyTier(cents)
@@ -103,15 +89,25 @@ export function CreditsPanel() {
       setMessage({ kind: 'err', text: result.error.message })
       return
     }
+    // Persist the freshly-rotated key so the (web) app keeps talking to the Worker,
+    // and drop the cached credentials so the next request uses it.
+    if (result.data.apiKey) {
+      try {
+        localStorage.setItem('vcp_key', result.data.apiKey)
+      } catch {
+        /* ignore */
+      }
+    }
+    resetBackendCredentials()
     setMessage({ kind: 'ok', text: 'Recovery complete — your key was rotated. You’re signed back in.' })
     setCodeInput('')
     await refreshSettings()
   }
 
-  const configured = Boolean(settings.hasPlatformBaseUrl) && Boolean(status?.configured)
+  const configured = Boolean(status?.configured)
 
   return (
-    <div className="space-y-4 pt-4 border-t border-zinc-800">
+    <div className="space-y-3 rounded-lg border border-zinc-700 bg-zinc-900/60 p-4">
       <div className="flex items-center gap-2">
         <Wallet className="h-4 w-4 text-amber-400" />
         <h3 className="text-sm font-semibold text-white">Platform Credits</h3>
@@ -119,47 +115,31 @@ export function CreditsPanel() {
       </div>
 
       <p className="text-xs text-zinc-500 leading-relaxed">
-        Remote generation is credit-gated through a platform backend. Set the platform server URL, and add credits
-        to keep remote jobs running. Inference is charged against your balance (pass-through); a small platform fee is
-        added at checkout.
+        Remote generation is credit-gated through the platform backend this app talks to. Add credits to keep remote
+        jobs running. Inference is charged against your balance (pass-through); a small platform fee is added at
+        checkout.
       </p>
 
-      {/* Platform server URL */}
-      <div className="bg-zinc-800/50 rounded-lg p-4 space-y-3">
-        <div className="space-y-2">
-          <label className="block text-xs text-zinc-300 font-medium">Platform server URL</label>
-          <div className="flex gap-2">
-            <input
-              type="url"
-              value={baseUrlInput}
-              onChange={(e) => setBaseUrlInput(e.target.value)}
-              placeholder="https://your-platform.workers.dev"
-              className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
-            />
-            <button
-              onClick={saveBaseUrl}
-              disabled={!baseUrlInput.trim() || loading}
-              className="px-3 py-2 bg-amber-600 text-white text-sm rounded-lg hover:bg-amber-500 disabled:bg-zinc-700 disabled:text-zinc-500 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
-            >
-              Save
-            </button>
-          </div>
-          {settings.hasPlatformBaseUrl && (
-            <p className="text-[11px] text-zinc-500">
-              Saved: <span className="text-zinc-300">{settings.platformBaseUrl}</span>
-              {status?.userId ? <span className="ml-2 text-zinc-500">ID: <span className="font-mono text-zinc-400">{status.userId.slice(0, 8)}…</span></span> : null}
-            </p>
-          )}
-        </div>
-
-        {!configured ? (
-          <div className="text-xs text-zinc-500 bg-zinc-900/60 rounded-lg px-3 py-2 inline-flex items-center gap-1.5">
-            <AlertCircle className="h-3 w-3" /> Platform not configured — remote generation isn’t credit-gated yet.
-          </div>
+      <div className="text-[11px] text-zinc-500 flex items-center gap-2 flex-wrap">
+        <span>
+          Server: <span className="text-zinc-400 font-mono">{status?.baseUrl ?? '…'}</span>
+        </span>
+        {status?.userId ? (
+          <span>
+            · ID: <span className="font-mono text-zinc-400">{status.userId.slice(0, 8)}…</span>
+          </span>
         ) : null}
       </div>
 
-      {configured && (
+      {!loaded ? (
+        <div className="text-xs text-zinc-500 bg-zinc-900/60 rounded-lg px-3 py-2 inline-flex items-center gap-1.5">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading credits…
+        </div>
+      ) : !configured ? (
+        <div className="text-xs text-zinc-500 bg-zinc-900/60 rounded-lg px-3 py-2 inline-flex items-center gap-1.5">
+          <AlertCircle className="h-3 w-3" /> Platform not configured — remote generation isn’t credit-gated yet.
+        </div>
+      ) : (
         <>
           {/* Balance */}
           <div className="bg-zinc-800/50 rounded-lg p-4 space-y-3">
@@ -274,9 +254,4 @@ export function CreditsPanel() {
       )}
     </div>
   )
-}
-
-function errorText(err: unknown): string {
-  if (err instanceof Error) return err.message
-  return String(err)
 }

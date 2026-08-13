@@ -1,7 +1,8 @@
 import { useCallback, useState } from 'react'
-import { ApiClient, type ApiRequestBodyOf } from '../lib/api-client'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
+import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type IcLoraConditioningType = 'canny' | 'depth' | 'custom'
 export type IcLoraAudioMode = 'source' | 'generated' | 'off'
@@ -60,9 +61,9 @@ interface UseIcLoraState {
   result: IcLoraResult | null
 }
 
-type GenerateIcLoraBody = ApiRequestBodyOf<'generateIcLora'>
 
 export function useIcLora() {
+  const { settings } = useAppSettings()
   const [state, setState] = useState<UseIcLoraState>({
     isGenerating: false,
     status: '',
@@ -84,7 +85,24 @@ export function useIcLora() {
     })
 
     await withGenerationActive(async () => {
-      const result = await ApiClient.generateIcLora({
+      // Direct transport requires a configured Livepeer runner; without it there is no
+      // remote backend to dispatch the IC-LoRA generation to.
+      if (!(settings.hasLivepeerDiscoveryUrl && settings.livepeerDiscoveryUrl.trim())) {
+        const msg = 'IC-LoRA generation requires Livepeer runners. Configure a Livepeer discovery URL in Settings.'
+        logger.error(`IC-LoRA error: ${msg}`)
+        setState({ isGenerating: false, status: '', error: msg, result: null })
+        return
+      }
+
+      const runner = await resolveRunner(['ic-lora'])
+      if (!runner) {
+        const msg = 'No capable Livepeer runner is currently available for IC-LoRA generation.'
+        logger.error(`IC-LoRA error: ${msg}`)
+        setState({ isGenerating: false, status: '', error: msg, result: null })
+        return
+      }
+
+      const res = await postRunnerTaskWithTicket(runner, 'ic-lora', {
         video_path: params.videoPath,
         conditioning_type: params.conditioningType,
         conditioning_strength: params.conditioningStrength,
@@ -106,42 +124,31 @@ export function useIcLora() {
         images: params.referenceImagePath
           ? [{ path: params.referenceImagePath, frame: 0, strength: 1.0 }]
           : [],
-      } as GenerateIcLoraBody)
-      if (!result.ok) {
-        logger.error(`IC-LoRA error: ${result.error.message}`)
-        setState({
-          isGenerating: false,
-          status: '',
-          error: result.error.message,
-          result: null,
-        })
+      }, {
+        onProgress: (ev) => {
+          if (ev.stage === 'generating') {
+            setState(prev => ({ ...prev, status: ev.message || 'Generating...' }))
+          }
+        },
+      })
+      if (!res.mediaBlob) {
+        const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
+        logger.error(`IC-LoRA error: ${err}`)
+        setState({ isGenerating: false, status: '', error: err, result: null })
         return
       }
 
-      const payload = result.data
-      if (payload.status === 'cancelled') {
-        setState({
-          isGenerating: false,
-          status: 'Cancelled',
-          error: null,
-          result: null,
-        })
-        return
-      }
-
-      if (payload.status === 'complete') {
-        setState({
-          isGenerating: false,
-          status: 'Generation complete!',
-          error: null,
-          result: {
-            videoPath: payload.video_path,
-          },
-        })
-        return
-      }
+      // The runner streams the generated media back over the WebSocket — store it as a local
+      // object URL for the project asset store.
+      const videoPath = URL.createObjectURL(res.mediaBlob)
+      setState({
+        isGenerating: false,
+        status: 'Generation complete!',
+        error: null,
+        result: { videoPath },
+      })
     })
-  }, [])
+  }, [settings])
 
   const reset = useCallback(() => {
     setState({

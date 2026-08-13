@@ -1,6 +1,15 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import type { GenerationSettings } from '../components/SettingsPanel'
 import { ApiClient, type ApiRequestBodyOf, type ApiSuccessOf } from '../lib/api-client'
+import {
+  falGenerateI2I,
+  falGenerateT2I,
+  makeJobId,
+  postImageToRunner,
+  postRunnerTaskWithTicket,
+  resolveRunner,
+  type RunnerDto,
+} from '../lib/direct-transport'
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
 import { withGenerationActive } from '../lib/generation-active'
 import { useAppSettings } from '../contexts/AppSettingsContext'
@@ -44,7 +53,6 @@ interface GenerationState {
 }
 
 type GenerateVideoRequest = ApiRequestBodyOf<'generateVideo'>
-type GenerateImageRequest = ApiRequestBodyOf<'generateImage'>
 
 interface UseGenerationReturn extends GenerationState {
   generate: (prompt: string, imagePath: string | null, settings: GenerationSettings, audioPath?: string | null) => Promise<void>
@@ -84,6 +92,16 @@ function getImageDimensions(settings: GenerationSettings): { width: number; heig
     return { width: Math.round(shortSide * ratio), height: shortSide }
   }
   return { width: shortSide, height: Math.round(shortSide / ratio) }
+}
+
+/** Convert an ArrayBuffer to a base64 data URI (used for FAL I2I edit uploads). */
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  return btoa(binary)
 }
 
 // Map phase to user-friendly message
@@ -227,6 +245,52 @@ export function useGeneration(): UseGenerationReturn {
           body.loras = settings.loras.map(l => ({ ref: l.ref, scale: l.scale }))
         }
 
+        const useDirectTransport = (appSettings.livepeerDiscoveryUrl || '').trim().length > 0
+
+        // DIRECT transport: when a Livepeer discovery URL is configured, open a WebSocket to
+        // the runner, stream live progress, and read the resulting media from the final frame.
+        if (useDirectTransport) {
+          const runner = await resolveRunner(['t2v'])
+          if (!runner) {
+            throw new Error('No available Livepeer runner for video generation')
+          }
+          const res = await postRunnerTaskWithTicket(
+            runner,
+            'generate',
+            { ...body, jobId: makeJobId() },
+            {
+              signal: abortController.signal,
+              onProgress: (ev) => {
+                if (!shouldApplyPollingUpdates) return
+                let displayProgress = 0
+                if (ev.stage === 'generating' && typeof ev.progress === 'number') {
+                  displayProgress = Math.min(Math.round(ev.progress * 95), 95)
+                }
+                setState(prev => ({
+                  ...prev,
+                  progress: displayProgress,
+                  statusMessage: ev.message || 'Generating...',
+                }))
+              },
+            },
+          )
+          shouldApplyPollingUpdates = false
+          if (!res.mediaBlob) {
+            throw new Error(res.payload?.error ? String(res.payload.error) : 'Runner returned no media')
+          }
+          const objectUrl = URL.createObjectURL(res.mediaBlob)
+          setState({
+            isGenerating: false,
+            progress: 100,
+            statusMessage: 'Complete!',
+            videoPath: objectUrl,
+            imagePath: null,
+            imagePaths: [],
+            error: null,
+          })
+          return
+        }
+
         // Poll for real progress from backend with time-based interpolation
         let lastPhase = ''
         let inferenceStartTime = 0
@@ -327,7 +391,7 @@ export function useGeneration(): UseGenerationReturn {
         }
       }
     })
-  }, [])
+  }, [appSettings])
 
   const cancel = useCallback(async () => {
     // Abort the fetch request
@@ -361,16 +425,6 @@ export function useGeneration(): UseGenerationReturn {
       }))
     }
 
-    if (shouldImageGenerateWithFalApi) {
-      const settingsResult = await ApiClient.getSettings()
-      const hasFalApiKey = settingsResult.ok ? settingsResult.data.hasFalApiKey : appSettings.hasFalApiKey
-      if (!hasFalApiKey) {
-        if (settingsResult.ok) void refreshSettings()
-        openFalConnectDialog()
-        return
-      }
-    }
-
     const numImages = settings.variations || 1
 
     setState({
@@ -398,88 +452,104 @@ export function useGeneration(): UseGenerationReturn {
         const dims = isEditing ? { width: 1024, height: 1024 } : getImageDimensions(settings)
         const numSteps = settings.imageSteps || (isEditing ? 8 : 4)
 
-        // Poll for progress
-        const pollProgress = async () => {
-          const result = await ApiClient.getGenerationProgress()
-          if (!result.ok) return
-
-          const data = result.data
-          const currentImage = data.currentStep || 0
-          const totalImages = data.totalSteps || numImages
-          setState(prev => ({
-            ...prev,
-            progress: data.progress,
-            statusMessage: data.phase === 'loading_model'
-              ? 'Loading Z-Image Turbo model...'
-              : data.phase === 'inference'
-                ? isEditing
-                  ? 'Editing image...'
-                  : numImages > 1
-                    ? `Generating image ${currentImage + 1}/${totalImages}...`
-                    : 'Generating image...'
-                : data.phase === 'complete'
-                  ? 'Complete!'
-                  : 'Generating...',
-          }))
-        }
-
-        progressInterval = setInterval(pollProgress, 500)
-
-        const imageRequest: GenerateImageRequest = {
-          prompt: finalPrompt,
-          width: dims.width,
-          height: dims.height,
-          numSteps,
-          numImages,
-          // Z-Image-Turbo is guidance-free: always send guidanceScale 0.0 so the
-          // remote runner doesn't fall back to a nonzero pipeline default.
-          guidanceScale: 0.0,
-          // strength is ignored server-side unless imagePath is set, but the request type
-          // requires it — send the default rather than the edit-only setting when not editing.
-          strength: isEditing ? (settings.imageEditStrength ?? 0.6) : 0.6,
-          // Generic edits don't use the restyle SAM3 keep-subject masked path.
-          keepSubject: false,
-          ...(isEditing ? { imagePath: editSource } : {}),
-        }
-        const result = await ApiClient.generateImage(imageRequest, {
-          signal: abortController.signal,
-        })
-
-        if (!result.ok) {
-          setState(prev => ({
-            ...prev,
-            isGenerating: false,
-            error: result,
-          }))
-          return
-        }
-
-        const payload = result.data
-        if (payload.status === 'complete') {
-          const rawPaths = payload.image_paths
-          if (rawPaths.length === 0) {
-            throw new Error('Image generation completed without output images')
+        // 1) Livepeer runner first (preferred). Non-fatal: fall through to other
+        // providers when no capable livepeer runner is resolvable.
+        //
+        // Pays through the HTTP ticket rail (Livepeer-Payer-Address -> 402+payment
+        // params -> POST /sign-ticket -> retry with Livepeer-Payment+Livepeer-Segment)
+        // because a browser WebSocket cannot set those payment headers — against a
+        // billing orchestrator the payment-less WS is rejected with 402
+        // "invalid live runner payment signer address" (the orchestrator signs and
+        // proxies; it needs a valid signed payment on the job).
+        if (appSettings.livepeerImageEnabled) {
+          let livepeerRunner: RunnerDto | null = null
+          try {
+            livepeerRunner = await resolveRunner(['image'])
+          } catch {
+            livepeerRunner = null
           }
+          if (livepeerRunner) {
+            const imageBody = {
+              prompt: finalPrompt,
+              width: dims.width,
+              height: dims.height,
+              numSteps,
+              numImages,
+              seed: 42,
+              guidanceScale: 0.0,
+              strength: isEditing ? (settings.imageEditStrength ?? 0.6) : 0.6,
+              keepSubject: false,
+              ...(isEditing ? { imagePath: editSource } : {}),
+            }
+            const mediaBlob = await postImageToRunner(livepeerRunner, imageBody, {
+              signal: abortController.signal,
+            })
+            const objectUrl = URL.createObjectURL(mediaBlob)
+            setState({
+              isGenerating: false,
+              progress: 100,
+              statusMessage: 'Complete!',
+              videoPath: null,
+              imagePath: objectUrl,
+              imagePaths: [objectUrl],
+              error: null,
+            })
+            return
+          }
+        }
 
+        // 2) Fall back to other API providers — FAL (Z-Image Turbo).
+        if (shouldImageGenerateWithFalApi) {
+          const settingsResult = await ApiClient.getSettings()
+          const hasFalApiKey = settingsResult.ok ? settingsResult.data.hasFalApiKey : appSettings.hasFalApiKey
+          if (!hasFalApiKey) {
+            if (settingsResult.ok) void refreshSettings()
+            openFalConnectDialog()
+            return
+          }
+          const keyRes = await ApiClient.getFalApiKey()
+          if (!keyRes.ok || !keyRes.data.falApiKey) {
+            throw new Error('FAL API key required')
+          }
+          const falKey = keyRes.data.falApiKey
+          const seed = 42
+          let blob: Blob
+          if (isEditing) {
+            if (!editSource) throw new Error('Edit source image required')
+            const srcRes = await fetch(editSource, { signal: abortController.signal })
+            if (!srcRes.ok) throw new Error('Failed to load edit source image')
+            const srcBuf = await srcRes.arrayBuffer()
+            blob = await falGenerateI2I(falKey, {
+              prompt: finalPrompt,
+              imageDataUri: `data:image/png;base64,${arrayBufferToBase64(srcBuf)}`,
+              strength: settings.imageEditStrength ?? 0.6,
+              seed,
+              numInferenceSteps: numSteps,
+            })
+          } else {
+            blob = await falGenerateT2I(falKey, {
+              prompt: finalPrompt,
+              width: dims.width,
+              height: dims.height,
+              seed,
+              numInferenceSteps: numSteps,
+            })
+          }
+          const objectUrl = URL.createObjectURL(blob)
           setState({
             isGenerating: false,
             progress: 100,
             statusMessage: 'Complete!',
             videoPath: null,
-            imagePath: rawPaths[0],
-            imagePaths: rawPaths,
+            imagePath: objectUrl,
+            imagePaths: [objectUrl],
             error: null,
           })
-        } else if (payload.status === 'cancelled') {
-          setState(prev => ({
-            ...prev,
-            isGenerating: false,
-            statusMessage: 'Cancelled',
-          }))
-        } else {
-          throw new Error('Unexpected response from /api/generate-image')
+          return
         }
 
+        // 3) No backend available.
+        throw new Error('No image backend available. Enable a Livepeer image runner or connect a FAL AI key.')
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
           setState(prev => ({
@@ -500,7 +570,7 @@ export function useGeneration(): UseGenerationReturn {
         }
       }
     })
-  }, [appSettings.hasFalApiKey, shouldImageGenerateWithFalApi, refreshSettings])
+  }, [appSettings, refreshSettings, shouldImageGenerateWithFalApi])
 
   const reset = useCallback(() => {
     clearRecoveryPolling()

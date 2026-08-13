@@ -18,10 +18,13 @@ import { LtxUpgradePrompt } from './components/LtxUpgradePrompt'
 import { dismissUpgrade, isUpgradeDismissed } from './lib/upgrade-prompt-dismissals'
 import { PythonSetup } from './components/PythonSetup'
 import { SettingsModal, type SettingsTabId } from './components/SettingsModal'
+import { CreditsModal } from './components/settings/CreditsModal'
+import { GlobalBalanceButton } from './components/GlobalBalanceButton'
 import { LogViewer } from './components/LogViewer'
 import { ApiGatewayModal, type ApiGatewaySection } from './components/ApiGatewayModal'
 import { Button } from './components/ui/button'
 import { ProjectAssetsFolderModal } from './components/ProjectAssetsFolderModal'
+import { WebFirstRun } from './components/WebFirstRun'
 
 type SetupState = 'loading' | { needsSetup: boolean; needsLicense: boolean }
 type RequiredModelsGateState = 'checking' | 'missing' | 'ready'
@@ -40,6 +43,8 @@ function AppContent() {
   const [backendStarted, setBackendStarted] = useState(false)
   const [setupState, setSetupState] = useState<SetupState>('loading')
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const [isCreditsOpen, setIsCreditsOpen] = useState(false)
+  const [creditsRefreshKey, setCreditsRefreshKey] = useState(0)
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabId | undefined>(undefined)
   const [isLogViewerOpen, setIsLogViewerOpen] = useState(false)
   const [isFinalizingFirstRun, setIsFinalizingFirstRun] = useState(false)
@@ -55,6 +60,10 @@ function AppContent() {
   // "open api gateway" action resets it.
   const gatewayDismissedRef = useRef(false)
   const [assetsFolderOpen, setAssetsFolderOpen] = useState(false)
+  // Web-only: a locally-stored key means the user has already signed up; skip the first-run gate.
+  const [webHasLocalKey, setWebHasLocalKey] = useState<boolean>(() => {
+    try { return Boolean(localStorage.getItem('vcp_key')) } catch { return false }
+  })
   const assetsFolderShownRef = useRef(false)
 
   type ApiGatewayRequest = {
@@ -202,7 +211,9 @@ function AppContent() {
   // Web app: prompt once (right after first-run) to choose where project assets are saved.
   useEffect(() => {
     if (!isWebApp) return
-    if (setupState === 'loading' || setupState.needsLicense || setupState.needsSetup) return
+    // Only prompt after the sign-up onboarding wizard has completed (a key is stored).
+    if (!webHasLocalKey) return
+    if (setupState === 'loading' || setupState.needsSetup) return
     if (assetsFolderShownRef.current) return
     assetsFolderShownRef.current = true
     const run = async () => {
@@ -214,7 +225,7 @@ function AppContent() {
       }
     }
     void run()
-  }, [setupState, isWebApp])
+  }, [setupState, isWebApp, webHasLocalKey])
 
   // A configured Livepeer Discovery URL satisfies the API-key requirement for the
   // LTX/FAL providers, so those keys are no longer required.
@@ -551,7 +562,9 @@ function AppContent() {
     )
   }
 
-  if (setupState.needsLicense) {
+  // Web app: never show the desktop LTX model-license popup (LaunchGate) at first load —
+  // the web onboarding wizard handles license/notices acknowledgement on its final page.
+  if (setupState.needsLicense && !isWebApp) {
     const licenseOnly = forceApiGenerations || !setupState.needsSetup
     return (
       <LaunchGate
@@ -604,6 +617,10 @@ function AppContent() {
           >
             <FileText className="h-4 w-4" />
           </button>
+          <GlobalBalanceButton
+            onClick={() => setIsCreditsOpen(true)}
+            refreshKey={creditsRefreshKey}
+          />
           <button
             onClick={() => setIsSettingsOpen(true)}
             className="h-8 w-8 flex items-center justify-center rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
@@ -622,6 +639,13 @@ function AppContent() {
           setSettingsInitialTab(undefined)
         }}
         initialTab={settingsInitialTab}
+      />
+      <CreditsModal
+        isOpen={isCreditsOpen}
+        onClose={() => {
+          setIsCreditsOpen(false)
+          setCreditsRefreshKey((k) => k + 1)
+        }}
       />
       <ApiGatewayModal
         isOpen={shouldShowGateway}
@@ -648,7 +672,19 @@ function AppContent() {
         />
       )}
 
-      {shouldBlockUntilSettingsLoaded && (
+      {/* Web first-run gate. Gated on web-first-run state (no local key), NOT on
+          shouldBlockUntilSettingsLoaded / isLoaded: settings finishing loading in the
+          background (after sign-up stores a key) must NOT unmount this screen — the
+          one-time backup code is shown only once and must persist until the user
+          explicitly dismisses it. onComplete flips webHasLocalKey to drop it. */}
+      {isWebApp && !webHasLocalKey && (
+        <WebFirstRun
+          onComplete={() => {
+            try { setWebHasLocalKey(Boolean(localStorage.getItem('vcp_key'))) } catch { /* ignore */ }
+          }}
+        />
+      )}
+      {shouldBlockUntilSettingsLoaded && !(isWebApp && !webHasLocalKey) && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm">
           <div className="flex items-center gap-2 text-sm text-zinc-200">
             <Loader2 className="h-4 w-4 animate-spin" />

@@ -10,6 +10,7 @@ import type { GenSpaceRetakeSource } from '../contexts/ProjectContext'
 import { useAppSettings } from '../contexts/AppSettingsContext'
 import { useGeneration, GENERATION_RECOVERY_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
 import { setActiveGenerationOwner, hasValidBaselineId } from '../lib/generation-recovery'
+import { resolveRunner, enhancePromptViaRunner } from '../lib/direct-transport'
 import { withGenerationActive } from '../lib/generation-active'
 import { useVideoGenerationModelSpecs } from '../hooks/use-video-generation-model-specs'
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
@@ -2386,15 +2387,40 @@ export function GenSpace() {
 
     // Local-provider Enhance runs the same GIL-holding Gemma text encoder as local video/image
     // generation (see electron/python-backend.ts) — needs the same liveness-kill suppression.
-    const result = await withGenerationActive(() => ApiClient.enhancePrompt({
-      prompt: sourcePrompt,
-      loraCatalogIds,
-      icLoraId: mode === 'ic-lora' ? selectedIcLoraId ?? undefined : undefined,
-      conditioningType,
-      imagePath: imagePathForEnhance,
-      provider: enhanceProvider,
-      mediaType: mode === 'image' ? 'image' : 'video',
-    }))
+    // DIRECT transport: when Livepeer is configured with a capable runner, route prompt
+    // enhancement through the runner (returns the rewritten text). Otherwise fall back to the
+    // Gemini/LTX API via the Worker.
+    const directEnhanceActive = (appSettings.livepeerDiscoveryUrl || '').trim().length > 0
+    const result = await withGenerationActive(async () => {
+      if (directEnhanceActive) {
+        const runner = await resolveRunner(['prompt'])
+        if (!runner) return { ok: false, status: '4XX', error: { code: 'NO_RUNNER', message: 'No capable Livepeer runner available for prompt enhancement' } as any }
+        try {
+          const enhancedPrompt = await enhancePromptViaRunner(runner, {
+            prompt: sourcePrompt,
+            lora_catalog_ids: loraCatalogIds,
+            ic_lora_id: mode === 'ic-lora' ? selectedIcLoraId ?? undefined : undefined,
+            conditioning_type: conditioningType,
+            image_path: imagePathForEnhance,
+            provider: enhanceProvider,
+            media_type: mode === 'image' ? 'image' : 'video',
+          })
+          return { ok: true, data: { enhancedPrompt } as any }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : 'Enhance failed'
+          return { ok: false, status: '5XX', error: { code: 'RUNNER_ERROR', message: msg } as any }
+        }
+      }
+      return ApiClient.enhancePrompt({
+        prompt: sourcePrompt,
+        loraCatalogIds,
+        icLoraId: mode === 'ic-lora' ? selectedIcLoraId ?? undefined : undefined,
+        conditioningType,
+        imagePath: imagePathForEnhance,
+        provider: enhanceProvider,
+        mediaType: mode === 'image' ? 'image' : 'video',
+      } as any)
+    })
 
     setIsEnhancingPrompt(false)
     if (!result.ok) {

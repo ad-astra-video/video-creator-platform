@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { DollarSign, Info, RefreshCw, Server } from 'lucide-react'
 import { ApiClient } from '../../lib/api-client'
+import { getEthUsd, weiToUsd } from '../../lib/ethPrice'
 import { Button } from '../ui/button'
 
 interface RunnerCap {
@@ -42,15 +43,40 @@ function saveExcluded(list: string[]) {
   }
 }
 
-function fmtPrice(usd: number): string {
+function fmtPrice(usd: number, unit?: string): string {
   if (usd <= 0) return 'Free'
-  if (usd < 0.0001) return `$${usd.toFixed(6)}/sec`
-  return `$${usd.toFixed(4)}/sec`
+  // "fixed" = once per request/session. Anything else is a live (metered) billing
+  // unit, shown by the unit it is advertised in (hour, seconds, 720p, ...).
+  const u = (unit || '').toLowerCase()
+  let suffix: string
+  if (u === 'fixed') {
+    suffix = ' per request'
+  } else if (u === 'hour') {
+    suffix = '/hr'
+  } else if (u === 'second' || u === 'seconds') {
+    suffix = '/sec'
+  } else if (u) {
+    suffix = `/${u}`
+  } else {
+    suffix = '/sec'
+  }
+  const s = usd < 0.0001 ? usd.toFixed(6) : usd < 1 ? usd.toFixed(4) : usd.toFixed(2)
+  return `$${s}${suffix}`
 }
 
-function formatPrice(pi: NonNullable<ProviderDto['price_info']>): string | null {
-  if (typeof pi.usdPerSec === 'number') return fmtPrice(pi.usdPerSec)
-  if (typeof pi.price === 'number') return fmtPrice(pi.price)
+function formatPrice(
+  pi: NonNullable<ProviderDto['price_info']>,
+  ethUsd: number | null,
+): string | null {
+  if (typeof pi.usdPerSec === 'number') return fmtPrice(pi.usdPerSec, pi.unit)
+  if (typeof pi.price === 'number') {
+    // Livepeer discovery quotes wei (1 ETH = 1e18 wei); convert to USD using the rate.
+    if (pi.currency === 'wei') {
+      if (ethUsd == null) return null // rate not available yet -> 'Pricing not advertised'
+      return fmtPrice(weiToUsd(pi.price, ethUsd), pi.unit)
+    }
+    return fmtPrice(pi.price, pi.unit)
+  }
   if (typeof pi.pricePerUnit === 'number') {
     return pi.pricePerUnit === 0 ? 'Free' : `${pi.pricePerUnit} wei / ${pi.pixelsPerUnit ?? 1} px`
   }
@@ -63,6 +89,18 @@ export function RunnersSection() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [discoveryUrl, setDiscoveryUrl] = useState('')
+  const [ethUsd, setEthUsd] = useState<number | null>(null)
+
+  // ETH/USD for converting wei discovery prices to USD (failover feeds, 30-min cache).
+  useEffect(() => {
+    let alive = true
+    void getEthUsd().then(v => {
+      if (alive) setEthUsd(v)
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
 
   const isExcluded = useCallback((p: ProviderDto) => p.excluded || excluded.includes(p.url), [excluded])
 
@@ -183,7 +221,7 @@ export function RunnersSection() {
 
                 <div className="flex items-center gap-2 text-xs text-zinc-300">
                   <DollarSign className="h-3.5 w-3.5 text-green-400 flex-shrink-0" />
-                  {p.price_info ? formatPrice(p.price_info) ?? 'Pricing not advertised' : 'Pricing not advertised'}
+                  {p.price_info ? formatPrice(p.price_info, ethUsd) ?? 'Pricing not advertised' : 'Pricing not advertised'}
                 </div>
 
                 {(p.capabilities?.length ?? 0) > 0 && (
