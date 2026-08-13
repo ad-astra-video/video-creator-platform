@@ -40,11 +40,15 @@ export function useExtend() {
   const submitExtend = useCallback(async (params: ExtendSubmitParams) => {
     if (!params.videoPath) return
 
+    logger.info(`Extend: submit started videoPath=${params.videoPath} duration=${params.duration} mode=${params.mode}`)
     setState({ isExtending: true, extendStatus: 'Generating', extendError: null, result: null })
 
     await withGenerationActive(async () => {
       try {
         const runner = await resolveRunner(['extend'])
+        if (runner) logger.info(`Extend: runner resolved ${runner.runner_id}`)
+        else logger.info('Extend: NO capable extend runner resolved')
+
         if (!runner) {
           const msg = 'No capable Livepeer runner is currently available for extending.'
           logger.error(`Extend error: ${msg}`)
@@ -55,6 +59,8 @@ export function useExtend() {
         // The remote worker cannot fetch a browser-local web:// source video — it requires the
         // actual bytes as video_base64 in the body (otherwise worker 500s with KeyError).
         const videoBase64 = await pathToBase64(params.videoPath)
+        if (videoBase64) logger.info(`Extend: source bytes base64 ${(videoBase64.length / 1024 / 1024).toFixed(2)} MB`)
+        else logger.info(`Extend: pathToBase64 returned null (path=${params.videoPath})`)
         if (!videoBase64) {
           const msg = `The source video cannot be read as bytes (path=${params.videoPath}). It must be a browser asset before it can be extended.`
           logger.error(`Extend error: ${msg}`)
