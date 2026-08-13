@@ -49,6 +49,12 @@ setuptools
 torchao>=0.8.0,<0.9
 bitsandbytes>=0.43.0
 
+# --- fine-grained FP8 (FLUX.2 klein 4B styler) ---
+# Qwen3 fp8_linear in transformers.integrations.finegrained_fp8 needs NVIDIA's
+# `kernels` package to actually run the fp8 matmul on-demand. 0.16 removed the
+# API the installed transformers expects; pin 0.15.2 (0.15.2 <= v < 0.16.0).
+kernels==0.15.2
+
 # --- ID-V2V video model (Wan2.1 I2V 14B DiT + VACE) build notes ---
 # diffsynth (the Wan pipeline fork) + SAM3 are NOT pip-index packages: they come
 # from the Eyeline-Labs/ID-V2V reference repo. The Dockerfile clones it and
