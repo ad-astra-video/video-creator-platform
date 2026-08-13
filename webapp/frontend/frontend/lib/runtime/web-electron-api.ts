@@ -400,6 +400,20 @@ export function createWebElectronAPI(): ElectronAPI {
         }
         const dims = await store.measureMedia(key, type)
 
+        // A video asset's thumbnail CANNOT be the video key itself: the assets grid renders
+        // it in an <img>, and an <img> can't decode a video blob (broken-image thumbnail —
+        // the "broken link" a generated video showed even after the web:// URL fix). Extract a
+        // real first frame and use THAT image key for the poster. Image assets keep their own
+        // key (it IS an image). Fall back to the video key if framing fails (graceful).
+        let thumbKey = key
+        if (type === 'video') {
+          try {
+            thumbKey = await store.extractFrame(key, 0.1, 480)
+          } catch {
+            thumbKey = key
+          }
+        }
+
         // Persist the actual bytes into the user's selected project-assets folder (best-effort)
         // so saved images exist as real files on disk and can be rescanned after a reload.
         {
@@ -413,8 +427,8 @@ export function createWebElectronAPI(): ElectronAPI {
         return {
           success: true,
           path: key,
-          bigThumbnailPath: key,
-          smallThumbnailPath: key,
+          bigThumbnailPath: thumbKey,
+          smallThumbnailPath: thumbKey,
           width: dims.width,
           height: dims.height,
         }
