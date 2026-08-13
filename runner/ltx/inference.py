@@ -543,6 +543,39 @@ class VideoCreatorInferenceEngine:
             if r.returncode != 0:
                 raise RuntimeError(f"ffmpeg failed: {cmd}\n{r.stderr[-2000:]}")
 
+        def _has_audio(path: str) -> bool:
+            r = _sp.run(
+                ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True,
+            )
+            for line in r.stdout.splitlines():
+                if line.strip() == "audio":
+                    return True
+            return False
+
+        def _concat(a: str, b: str, out: str) -> None:
+            """Concatenate two mp4s, handling sources that lack an audio track.
+
+            The latent-extend segment always carries (regenerated) audio, but the source
+            cut (prefix/rest) may have no audio at all -- a hardcoded ``[0:a:0]`` then fails.
+            Probe both inputs and use an audio concat only when BOTH have audio.
+            """
+            with_audio = _has_audio(a) and _has_audio(b)
+            if with_audio:
+                spec = "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[v][a]"
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                       "-i", a, "-i", b, "-filter_complex", spec,
+                       "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+            else:
+                spec = "[0:v:0][1:v:0]concat=n=2:v=1:a=0[v]"
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                       "-i", a, "-i", b, "-filter_complex", spec, "-map", "[v]"]
+            cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", out]
+            r = _sp.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"ffmpeg concat failed: {cmd}\n{r.stderr[-2000:]}")
+
         workdir = tempfile.mkdtemp(prefix="vcext_")
         src = os.path.join(workdir, "src.mp4")
         prefix = os.path.join(workdir, "prefix.mp4")
@@ -571,12 +604,7 @@ class VideoCreatorInferenceEngine:
                 # Faithful latent extend over the 1 s window -> [window + new frames].
                 self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment)
                 if remain >= 1:
-                    _ffmpeg("-i", prefix, "-i", segment,
-                            "-filter_complex",
-                            "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[v][a]",
-                            "-map", "[v]", "-map", "[a]",
-                            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                            "-c:a", "aac", "-b:a", "128k", output_path)
+                    _concat(prefix, segment, output_path)
                 else:
                     _sp.run(["cp", segment, output_path], check=True)
             else:  # "start": window = head; new frames prepended; concat(segment, remainder)
@@ -591,12 +619,7 @@ class VideoCreatorInferenceEngine:
                             "-c:a", "aac", "-b:a", "128k", rest)
                 self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment)
                 if remain >= 1:
-                    _ffmpeg("-i", segment, "-i", rest,
-                            "-filter_complex",
-                            "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[v][a]",
-                            "-map", "[v]", "-map", "[a]",
-                            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                            "-c:a", "aac", "-b:a", "128k", output_path)
+                    _concat(segment, rest, output_path)
                 else:
                     _sp.run(["cp", segment, output_path], check=True)
         finally:
