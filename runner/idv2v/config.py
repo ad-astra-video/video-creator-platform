@@ -191,7 +191,9 @@ def _random_token() -> str:
 #                     e.g. cuda:1 for a card that doesn't contend with the video).
 #   KLEIN4B_STEPS / KLEIN4B_GUIDANCE  distilled defaults (4 / 1.0) — overridable
 #                     only for experimentation; BFL intends them fixed.
-#   KLEIN4B_MAX_SIDE  cap on the styled frame's long edge (avoid huge 1080p edits).
+#   KLEIN4B_MAX_SIDE  cap on the styled frame's long edge. Default 1920 allows a full
+#                     1080p frame through (it anchors the 1080p video restyle, so
+#                     capping to 1024 would misalign the styled first frame).
 KLEIN4B_ENABLED = os.environ.get("KLEIN4B_ENABLED", "auto")
 KLEIN4B_MODEL = os.environ.get("KLEIN4B_MODEL", "/models/flux2/flux-2-klein-4b.safetensors")
 KLEIN4B_AE = os.environ.get("KLEIN4B_AE", "/models/flux2/ae.safetensors")
@@ -199,7 +201,7 @@ KLEIN4B_TEXT_ENC = os.environ.get("KLEIN4B_TEXT_ENC", "Qwen/Qwen3-4B-FP8")
 KLEIN4B_GPU_DEVICE = os.environ.get("KLEIN4B_GPU_DEVICE", "")
 KLEIN4B_STEPS = int(os.environ.get("KLEIN4B_STEPS", "4"))
 KLEIN4B_GUIDANCE = float(os.environ.get("KLEIN4B_GUIDANCE", "1.0"))
-KLEIN4B_MAX_SIDE = int(os.environ.get("KLEIN4B_MAX_SIDE", "1024"))
+KLEIN4B_MAX_SIDE = int(os.environ.get("KLEIN4B_MAX_SIDE", "1920"))
 
 
 def klein4b_device() -> str:
