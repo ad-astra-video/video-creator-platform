@@ -82,8 +82,11 @@ async def _poll_worker_gpu_info(session: aiohttp.ClientSession) -> tuple[dict, i
     """Poll every configured worker's /info (polled at startup + each heartbeat).
 
     Returns ``(gpu_meta, ltx_vram_mb)``:
-      * gpu_meta — compact per-worker GPU summary ``{name: {vram_mb, name, cc}}``
-        folded into the advertised heartbeat metadata the live-runner passes on.
+      * gpu_meta — SHORTHAND per-worker GPU summary ``{short_name: vram_mb}``
+        (e.g. ``{"ltx": 32153, "idv2v": 32153, "gemma": 32153}``), folded into the
+        advertised heartbeat metadata. Integer MiB only (no name/cc) so the JSON
+        stays far under go-livepeer's 1024-byte metadata cap. The Worker control
+        plane never reads ``meta.gpu`` — it's informational — so terse keys are safe.
       * ltx_vram_mb — the create (ltx) worker's total VRAM, which drives the
         video-create resolution/duration specs.
     """
@@ -93,13 +96,10 @@ async def _poll_worker_gpu_info(session: aiohttp.ClientSession) -> tuple[dict, i
         info = await _fetch_worker_info(session, url)
         g = (info or {}).get("gpu") or {}
         vram_gb = g.get("vram_gb")
-        gpu_meta[name] = {
-            "vram_mb": int(float(vram_gb) * 1024) if vram_gb else None,
-            "name": g.get("gpu_name"),
-            "cc": g.get("compute_cap"),
-        }
+        vram_mb = int(float(vram_gb) * 1024) if vram_gb else None
+        gpu_meta[name.split("-", 1)[0]] = vram_mb  # ltx-worker -> ltx
         if name == "ltx-worker" and vram_gb:
-            ltx_vram_mb = int(float(vram_gb) * 1024)
+            ltx_vram_mb = vram_mb
     return gpu_meta, ltx_vram_mb
 
 
