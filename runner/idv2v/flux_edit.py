@@ -82,8 +82,8 @@ def _tiled_decode(
     import einops
     from PIL import Image as _PIL
 
-    F = 16  # flow latent is (1,128,H//16,W//16); decode -> 16x pixels
-    out_h, out_w = H * F, W * F
+    SCALE = 16  # flow latent is (1,128,H//16,W//16); decode -> 16x pixels
+    out_h, out_w = H * SCALE, W * SCALE
     # preallocate output + weight in pixel space (float, on CPU to not blow VRAM)
     acc = torch.zeros((3, out_h, out_w), dtype=torch.float32, device="cpu")
     wacc = torch.zeros((1, out_h, out_w), dtype=torch.float32, device="cpu")
@@ -107,13 +107,13 @@ def _tiled_decode(
                 dec = ae.decode(zt).float()          # (1,3, hh, ww)
             dec = dec[0].cpu()                        # (3, hh, ww)
             # pixel-space tile origin
-            py0, px0 = y0 * F, x0 * F
+            py0, px0 = y0 * SCALE, x0 * SCALE
             hh, ww = dec.shape[1], dec.shape[2]
             # weights: 1 in middle, ramp 0->1 across overlap margins
             wy = torch.ones((hh, 1), dtype=torch.float32)
             wx = torch.ones((1, ww), dtype=torch.float32)
-            ovy = min(overlap * F, hh // 2)
-            ovx = min(overlap * F, ww // 2)
+            ovy = min(overlap * SCALE, hh // 2)
+            ovx = min(overlap * SCALE, ww // 2)
             if ovy > 0:
                 ramp = torch.arange(ovy, dtype=torch.float32) / ovy
                 wy[:ovy, 0] = ramp
