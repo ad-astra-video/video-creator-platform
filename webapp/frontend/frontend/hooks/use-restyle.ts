@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { resolveRunner, postRunnerTaskWithTicketSSE } from '../lib/direct-transport'
 import { getBlob, isWebPath } from '../lib/runtime/web-store'
 import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY } from './use-generation'
 
@@ -156,7 +156,7 @@ export function useRestyle() {
         body.stylized_image_path = params.stylizedImagePath
       }
       logger.info(`[restyle] direct rail media=${usingB64 ? 'base64' : 'path'}`)
-      const res = await postRunnerTaskWithTicket(runner, 'restyle', body, {
+      const res = await postRunnerTaskWithTicketSSE(runner, 'restyle', body, {
         onProgress: (ev) => {
           const msg = getPhaseMessage(ev.stage || '')
           const isBackbone = ev.stage === 'generating'
