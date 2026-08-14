@@ -3170,6 +3170,13 @@ export function GenSpace() {
               setPrompt(DEFAULT_RESTYLE_PROMPT)
               setLastPrompt(DEFAULT_RESTYLE_PROMPT)
             }}
+            // Tweak-and-rerun: pull a kept take's prompt back into the prompt bar so
+            // the user can adjust it and re-run (seed rotates on each new take).
+            onReusePrompt={(takePrompt) => {
+              if (!takePrompt) return
+              setPrompt(takePrompt)
+              setLastPrompt(takePrompt)
+            }}
           />
 
           {/* Iterative restyle controls: redo (rotates the seed) + keep one of the

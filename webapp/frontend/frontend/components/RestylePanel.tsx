@@ -2,7 +2,7 @@
 import { VideoPreviewPanel } from './VideoPreviewPanel'
 import { validateVideoSource } from '../lib/video-constraints'
 import { webAssetUrl } from '../lib/file-url'
-import { isWebPath, getBlob } from '../lib/runtime/web-store'
+import { isWebPath, getBlob, removeAsset } from '../lib/runtime/web-store'
 import { ApiClient } from '../lib/api-client'
 import { resolveRunner, segmentSubjectViaRunner, styleFrameViaRunner } from '../lib/direct-transport'
 import { Image, X, Loader2, Check, Film, Wand2, Upload } from 'lucide-react'
@@ -70,6 +70,14 @@ export interface RestyleFrameState {
   hasStylized: boolean
 }
 
+/** One kept first-frame restyle take: the image plus the prompt+seed that produced it,
+ *  so the history is reusable (tweak the prompt, re-run with a rotated seed). */
+export interface RestyleTake {
+  path: string
+  prompt: string
+  seed: number
+}
+
 interface RestylePanelProps {
   initialVideoPath?: string | null
   initialImagePath?: string | null
@@ -94,6 +102,8 @@ interface RestylePanelProps {
   // Called when the user accepts a generated/first-frame stylized image, with the
   // accepted image path. The parent uses it to prefill the default restyle prompt.
   onAccept?: (acceptedImagePath: string, videoPath: string | null) => void
+  /** Called when the user picks "use this take's prompt" to tweak and re-run. */
+  onReusePrompt?: (prompt: string) => void
 }
 
 export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(function RestylePanel(
@@ -110,6 +120,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     onStateChange,
     onChange,
     onAccept,
+    onReusePrompt,
   },
   ref,
 ) {
@@ -129,7 +140,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   // Every generated first-frame candidate is KEPT so the user can iterate (each
   // re-run rotates the seed) and pick which stylized frame to accept. The active
   // one is what's shown / what Accept uses.
-  const [candidates, setCandidates] = useState<string[]>([])
+  const [candidates, setCandidates] = useState<RestyleTake[]>([])
   const [activeCandidate, setActiveCandidate] = useState<string | null>(null)
   const [isStyling, setIsStyling] = useState(false)
   const [isExtracting, setIsExtracting] = useState(false)
@@ -301,13 +312,16 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
         const blob = getBlob(extractedFramePath)
         if (runner && blob) {
           try {
+            const seed = opts.seed ?? Math.floor(Math.random() * 2 ** 31)
             const styled = await styleFrameViaRunner(
               runner,
               await blobToBase64(blob),
               opts.prompt.trim(),
-              { seed: opts.seed ?? Math.floor(Math.random() * 2 ** 31), enhance: opts.enhance ?? false },
+              { seed, enhance: opts.enhance ?? false },
             )
-            setCandidates(prev => prev.includes(styled.styledImageUrl) ? prev : [...prev, styled.styledImageUrl])
+            setCandidates(prev => prev.some(t => t.path === styled.styledImageUrl)
+              ? prev
+              : [...prev, { path: styled.styledImageUrl, prompt: opts.prompt.trim(), seed }])
             setActiveCandidate(styled.styledImageUrl)
             setTab('image')
             return true
@@ -322,10 +336,11 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
       // prompt + seed (+ optional enhance). No strength / guidance / steps /
       // keep-subject mask (those were Z-Image img2img concepts and do not exist
       // for FLUX.2 klein).
+      const seed = opts.seed ?? Math.floor(Math.random() * 2 ** 31)
       const res = await ApiClient.styleFirstFrame({
         image_path: extractedFramePath,
         prompt: opts.prompt.trim(),
-        seed: opts.seed ?? Math.floor(Math.random() * 2 ** 31),
+        seed,
         enhance_prompt: opts.enhance ?? false,
       })
       if (!res.ok) {
@@ -338,7 +353,9 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
         setStylingError('Restyle produced no image')
         return false
       }
-      setCandidates(prev => prev.includes(path) ? prev : [...prev, path])
+      setCandidates(prev => prev.some(t => t.path === path)
+        ? prev
+        : [...prev, { path, prompt: opts.prompt.trim(), seed }])
       // Show the freshly styled candidate.
       setActiveCandidate(path)
       setTab('image')
@@ -351,6 +368,20 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
       setIsStyling(false)
     }
   }, [extractedFramePath, setTab])
+
+  // Prompt tweaking / seed rotation helper: reuse a kept take's prompt (optionally
+  // a specific seed) so the user can tweak and re-run or keep the seed for a repeat.
+  const reuseTake = useCallback((take: RestyleTake) => {
+    onReusePrompt?.(take.prompt)
+  }, [onReusePrompt])
+
+  // Delete an unwanted restyled take (frees its blob from the web-store too).
+  const deleteTake = useCallback((takePath: string) => {
+    setCandidates(prev => prev.filter(t => t.path !== takePath))
+    if (isWebPath(takePath)) removeAsset(takePath)
+    setActiveCandidate(cur => (cur === takePath ? null : cur))
+    setStylizedImagePath(cur => (cur === takePath ? null : cur))
+  }, [])
 
   const acceptCurrent = useCallback(() => {
     const accepted = activeCandidate || extractedFramePath
@@ -382,7 +413,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   useEffect(() => {
     if (resetKey === undefined) return
     setStylizedImagePath(initialImagePath || null)
-    setCandidates(initialImagePath ? [initialImagePath] : [])
+    setCandidates(initialImagePath ? [{ path: initialImagePath, prompt: '', seed: 0 }] : [])
     setActiveCandidate(null)
   }, [resetKey, initialImagePath])
 
@@ -566,7 +597,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
               )}
               {displayFramePath && !isExtracting && (activeCandidate || stylizedImagePath) && (
                 <button
-                  onClick={(e) => { e.stopPropagation(); if (activeCandidate) { setCandidates(prev => prev.filter(c => c !== activeCandidate)); setActiveCandidate(null); } else { setStylizedImagePath(null) } }}
+                  onClick={(e) => { e.stopPropagation(); if (activeCandidate) { setCandidates(prev => { const next = prev.filter(c => c.path !== activeCandidate); if (isWebPath(activeCandidate)) removeAsset(activeCandidate); return next }); setActiveCandidate(null); } else { setStylizedImagePath(null) } }}
                   className="absolute top-1.5 right-1.5 p-1 rounded-full bg-zinc-800/80 text-zinc-400 hover:text-white"
                   title="Clear"
                 >
@@ -575,7 +606,9 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
               )}
               {displayFramePath !== extractedFramePath && displayFramePath && (
                 <span className="absolute top-1.5 left-1.5 text-[10px] text-emerald-400 bg-zinc-900/70 rounded px-1.5 py-0.5">
-                  {activeCandidate && stylizedImagePath !== activeCandidate ? `candidate · take ${candidates.indexOf(activeCandidate) + 1}` : 'stylized'}
+                  {activeCandidate && stylizedImagePath !== activeCandidate
+              ? `candidate · take ${(candidates.findIndex(t => t.path === activeCandidate) + 1) || '?'}`
+              : 'stylized'}
                 </span>
               )}
               {isStyling && (
@@ -613,7 +646,9 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                   className="self-start flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
                   <Check className="h-3.5 w-3.5" />
-                  {activeCandidate && stylizedImagePath !== activeCandidate ? `Accept styled frame (take ${candidates.indexOf(activeCandidate) + 1})` : 'Accept frame'}
+                  {activeCandidate && stylizedImagePath !== activeCandidate
+            ? `Accept styled frame (take ${(candidates.findIndex(t => t.path === activeCandidate) + 1) || '?'})`
+            : 'Accept frame'}
                 </button>
               )}
 
@@ -627,17 +662,42 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
               {candidates.length > 0 && (
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
                   {candidates.map((c, i) => (
-                    <button
-                      key={c}
-                      onClick={() => setActiveCandidate(c)}
-                      title={`take ${i + 1}`}
-                      className={`relative w-16 flex-shrink-0 aspect-video rounded-md overflow-hidden border-2 transition-colors ${
-                        activeCandidate === c ? 'border-emerald-500' : 'border-zinc-700 hover:border-zinc-500'
+                    <div
+                      key={c.path}
+                      className={`relative w-20 flex-shrink-0 aspect-video rounded-md overflow-hidden border-2 transition-colors group ${
+                        activeCandidate === c.path ? 'border-emerald-500' : 'border-zinc-700 hover:border-zinc-500'
                       }`}
                     >
-                      <img src={webAssetUrl(c)} alt="" className="w-full h-full object-cover" />
-                      <span className="absolute bottom-0 inset-x-0 bg-black/60 text-[8px] text-zinc-300 text-center">#{i + 1}</span>
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveCandidate(c.path)}
+                        title={c.prompt || `take ${i + 1}`}
+                        className="block w-full h-full p-0 focus:outline-none"
+                      >
+                        <img src={webAssetUrl(c.path)} alt="" className="w-full h-full object-cover" />
+                        <span className="absolute bottom-0 inset-x-0 bg-black/60 text-[8px] text-zinc-300 text-center truncate px-1">
+                          {c.prompt ? c.prompt : `#${i + 1}`}
+                        </span>
+                      </button>
+                      <div className="absolute top-0 inset-x-0 flex justify-between bg-gradient-to-b from-black/60 to-transparent px-0.5 py-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button
+                          type="button"
+                          onClick={() => reuseTake(c)}
+                          title={`Use this prompt (${c.prompt || 'no prompt'}) to tweak / re-run`}
+                          className="p-0.5 rounded bg-black/50 hover:bg-zinc-700 text-emerald-300"
+                        >
+                          <Wand2 className="h-3 w-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => deleteTake(c.path)}
+                          title="Delete this restyled image"
+                          className="p-0.5 rounded bg-black/50 hover:bg-red-600 text-red-300 hover:text-white"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    </div>
                   ))}
                 </div>
               )}
