@@ -168,7 +168,7 @@ services:
       - KLEIN4B_ENABLED=${KLEIN4B_ENABLED:-auto}
       - KLEIN4B_MODEL=${KLEIN4B_MODEL:-/models/flux2/flux-2-klein-4b.safetensors}
       - KLEIN4B_AE=${KLEIN4B_AE:-/models/flux2/ae.safetensors}
-      - KLEIN4B_TEXT_ENC=${KLEIN4B_TEXT_ENC:-Qwen/Qwen3-4B-FP8}
+      - KLEIN4B_TEXT_ENC=${KLEIN4B_TEXT_ENC:-Qwen/Qwen3-4B}
       - KLEIN4B_STEPS=${KLEIN4B_STEPS:-4}
       - KLEIN4B_GUIDANCE=${KLEIN4B_GUIDANCE:-1.0}
       - KLEIN4B_MAX_SIDE=${KLEIN4B_MAX_SIDE:-1920}

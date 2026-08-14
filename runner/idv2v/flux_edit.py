@@ -18,7 +18,7 @@ Model facts (researched from the official repo black-forest-labs/flux2):
   * Three components must be resident to edit:
       - the 4B flow transformer  (KLEIN4B_MODEL,   ~8 GB bf16)
       - the FLUX.2 autoencoder   (KLEIN4B_AE)   — shared with FLUX.2 [dev]
-      - a Qwen3 4B text embedder (KLEIN4B_TEXT_ENC, hidden states [9,18,27])
+      - a Qwen3 4B text embedder (KLEIN4B_TEXT_ENC, hidden states [9,18,27], bf16)
         which is a SEPARATE LLM from Gemma and must share the card with the
         video model via the evict-churn lifecycle below.
 
@@ -138,8 +138,19 @@ class FluxKleinEditor:
         """Load/reload the Qwen3 4B text encoder (assumes self._lock held)."""
         if self._text_encoder is not None:
             return
-        from flux2.text_encoder import load_qwen3_embedder
-        text_encoder = load_qwen3_embedder(variant="4B", device=self._device)
+        # Load the Qwen3 text embedder directly with the configured repo id.
+        # NB: we deliberately do NOT use flux2's load_qwen3_embedder() — it
+        # hardcodes the Qwen/Qwen3-4B-FP8 suffix, which (with torch_dtype=None
+        # and an fp8 checkpoint that carries a quantization_config) materializes
+        # the encoder at full bf16 AND requires the `kernels` finegrained-fp8
+        # runtime at forward time. The default KLEIN4B_TEXT_ENC is the plain
+        # bf16 Qwen/Qwen3-4B (same weights BFL bundles in the klein repo), which
+        # loads ~8 GB, needs no kernels pkg, and matches the ~13 GB reference
+        # footprint.
+        from flux2.text_encoder import Qwen3Embedder
+        text_encoder = Qwen3Embedder(
+            model_spec=config.KLEIN4B_TEXT_ENC, device=self._device
+        )
         text_encoder.eval()
         self._text_encoder = text_encoder
         logger.info("FLUX.2 klein Qwen3 4B text encoder loaded on %s", self._device)

@@ -186,7 +186,7 @@ def _random_token() -> str:
 #   KLEIN4B_MODEL     path to flux-2-klein-4b.safetensors (env KLEIN_4B_MODEL_PATH
 #                     is what the BFL loader reads; we set it before load).
 #   KLEIN4B_AE        path to ae.safetensors (env AE_MODEL_PATH).
-#   KLEIN4B_TEXT_ENC  HF id of the Qwen3 text embedder (default Qwen/Qwen3-4B-FP8).
+#   KLEIN4B_TEXT_ENC  HF id of the Qwen3 text embedder (default Qwen/Qwen3-4B, bf16).
 #   KLEIN4B_GPU_DEVICE device for the editor (default "" = video GPU_DEVICE; set
 #                     e.g. cuda:1 for a card that doesn't contend with the video).
 #   KLEIN4B_STEPS / KLEIN4B_GUIDANCE  distilled defaults (4 / 1.0) — overridable
@@ -197,7 +197,7 @@ def _random_token() -> str:
 KLEIN4B_ENABLED = os.environ.get("KLEIN4B_ENABLED", "auto")
 KLEIN4B_MODEL = os.environ.get("KLEIN4B_MODEL", "/models/flux2/flux-2-klein-4b.safetensors")
 KLEIN4B_AE = os.environ.get("KLEIN4B_AE", "/models/flux2/ae.safetensors")
-KLEIN4B_TEXT_ENC = os.environ.get("KLEIN4B_TEXT_ENC", "Qwen/Qwen3-4B-FP8")
+KLEIN4B_TEXT_ENC = os.environ.get("KLEIN4B_TEXT_ENC", "Qwen/Qwen3-4B")
 KLEIN4B_GPU_DEVICE = os.environ.get("KLEIN4B_GPU_DEVICE", "")
 KLEIN4B_STEPS = int(os.environ.get("KLEIN4B_STEPS", "4"))
 KLEIN4B_GUIDANCE = float(os.environ.get("KLEIN4B_GUIDANCE", "1.0"))

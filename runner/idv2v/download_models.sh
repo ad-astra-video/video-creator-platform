@@ -70,10 +70,10 @@ huggingface-cli download --token "$HF_TOKEN" \
 # Three components must be resident to edit, matching KLEIN4B_* config defaults:
 #   <MODEL_DIR>/flux2/flux-2-klein-4b.safetensors   (flow transformer, 4B, ~8 GB bf16)
 #   <MODEL_DIR>/flux2/ae.safetensors                (FLUX.2 autoencoder, shared w/ FLUX.2-dev)
-#   Qwen/Qwen3-4B-FP8 text embedder -> HF cache     (from_pretrained at runtime)
+#   Qwen/Qwen3-4B text embedder -> HF cache          (bf16, from_pretrained at runtime)
 # KLEIN4B_ENABLED defaults to "auto", i.e. engages only when the flow weight is
 # present on disk — so provisioning these is what turns the editor on.
-echo ">>> Downloading FLUX.2 [klein] 4B (flow + AE + Qwen3 text embedder)"
+echo ">>> Downloading FLUX.2 [klein] 4B (flow + AE + Qwen3 bf16 text embedder)"
 mkdir -p "$MODEL_DIR/flux2"
 huggingface-cli download --token "$HF_TOKEN" \
     black-forest-labs/FLUX.2-klein-4B flux-2-klein-4b.safetensors \
@@ -81,17 +81,12 @@ huggingface-cli download --token "$HF_TOKEN" \
 huggingface-cli download --token "$HF_TOKEN" \
     black-forest-labs/FLUX.2-dev ae.safetensors \
     --local-dir "$MODEL_DIR/flux2" || true
-# Qwen3 4B FP8 text embedder (KLEIN4B_TEXT_ENC). Cached under HF_HOME so the
-# worker's load_qwen3_embedder(variant="4B") resolves without a network hit.
+# Qwen3 4B bf16 text embedder (KLEIN4B_TEXT_ENC). Plain bf16 (no fp8) — same
+# weights BFL bundles in the klein repo — so no `kernels` pkg / finegrained-fp8
+# runtime is needed. Cached under HF_HOME so the worker's Qwen3Embedder resolves
+# without a network hit.
 huggingface-cli download --token "$HF_TOKEN" \
-    Qwen/Qwen3-4B-FP8 || true
-
-# Precompiled fine-grained-FP8 CUDA kernels (kernels-community/finegrained-fp8),
-# used by the `kernels==0.15.2` pip package to execute Qwen3's fp8_linear at
-# style-frame time. Cached under HF_HOME so first use doesn't need a runtime
-# download/write into the cache (mirrors the Qwen3 pre-fetch above).
-huggingface-cli download --token "$HF_TOKEN" \
-    kernels-community/finegrained-fp8 || true
+    Qwen/Qwen3-4B || true
 
 echo ">>> Model download complete"
 ls -lh "$MODEL_DIR"

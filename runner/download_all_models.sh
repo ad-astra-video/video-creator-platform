@@ -19,7 +19,7 @@
 #   <MODELS_DIR>/wan/                            (Wan-AI/Wan2.1-I2V-14B-720P)
 #   <MODELS_DIR>/flux2/                          (FLUX.2 [klein] 4B first-frame styler:
 #                                                   flux-2-klein-4b.safetensors + ae.safetensors; the
-#                                                   Qwen3-4B-FP8 text embedder goes to the HF cache)
+#                                                   Qwen3-4B bf16 text embedder goes to the HF cache)
 #
 # Usage (run on the GPU box as the user that owns the models dir):
 #   export HUGGING_FACE_HUB_TOKEN=hf_...
