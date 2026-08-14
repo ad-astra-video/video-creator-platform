@@ -14,11 +14,10 @@
  */
 import { z } from "zod";
 import { err, ok } from "../utils";
-import { makeOrchestrator, parseBody, resolveUserFromRequest } from "./lib";
+import { parseBody, resolveUserFromRequest, DEFAULT_ORCHESTRATOR_URL } from "./lib";
 import { deleteProvider, getProvider, setProvider, getSettings } from "../jobs";
 import type { Env } from "../types";
 import { OrchestratorClient, type RunnerInfo } from "../orchestrator";
-import { DEFAULT_ORCHESTRATOR_URL } from "./lib";
 
 const capsSchema = z.object({ capabilities: z.array(z.string()).optional() });
 const selectSchema = z.object({ runnerId: z.string().min(1) });
@@ -139,9 +138,17 @@ export async function getProviders(request: Request, env: Env): Promise<Response
   let discoveryError: string | null = null;
   try {
     runners = await orch.discoverRunners(caps);
-  } catch (e) {
-    discoveryError = (e as Error).message;
-  }
+    } catch (e) {
+      discoveryError = `Could not reach Discovery URL "${orch.baseUrl}": ${(e as Error).message}`;
+    }
+    // A configured URL that answered but advertised no ready runners: say so clearly rather
+    // than silently showing an empty list.
+    if (runners.length === 0 && !discoveryError) {
+      discoveryError = `Discovery URL "${orch.baseUrl}" answered but no ready runners were advertised. Check the URL is a Livepeer orchestrator with video-creator runners online.`;
+    }
+  // Demo placeholders are ONLY the "no orchestrator wired up yet" dev state: seed them only
+  // when NO Discovery URL is configured. Once the user saves a URL, show the real discovery
+  // result (possibly empty) plus any error — never fake runners that mask a failed URL.
   let demo = false;
   if (runners.length === 0 && env.DEMO_RUNNERS === "1") {
     runners = demoRunners(caps);
@@ -171,7 +178,10 @@ export async function postDiscoverProviders(request: Request, env: Env): Promise
   try {
     runners = await orch.discoverRunners(caps);
   } catch (e) {
-    discoveryError = (e as Error).message;
+    discoveryError = `Could not reach orchestrator "${orch.baseUrl}": ${(e as Error).message}`;
+  }
+  if (runners.length === 0 && !discoveryError) {
+    discoveryError = `Orchestrator "${orch.baseUrl}" answered but no ready runners were advertised. Check the URL is a Livepeer orchestrator with video-creator runners online.`;
   }
   let demo = false;
   if (runners.length === 0 && env.DEMO_RUNNERS === "1") {

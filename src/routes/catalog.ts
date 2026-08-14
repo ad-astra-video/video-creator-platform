@@ -14,6 +14,9 @@ import type { Env } from "../types";
  * Build an orchestrator client from the user's configured discovery URL (drives
  * which orchestrator we discover), falling back to env then the local default.
  * Mirrors providers.ts so model specs and runner discovery agree on the source.
+ * The default orchestrator means model specs come from the AVAILABLE runners even
+ * when the user hasn't saved a discovery URL — RESTORED from the d8826cc fix (the
+ * no-fallback variant regressed this: empty local_models -> no video settings).
  */
 async function orchestratorFor(env: Env, userId: string): Promise<OrchestratorClient> {
   let base = env.ORCHESTRATOR_BASE_URL || DEFAULT_ORCHESTRATOR_URL;
