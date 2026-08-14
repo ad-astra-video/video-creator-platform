@@ -2,6 +2,37 @@ import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
+import { getBlob, isWebPath } from '../lib/runtime/web-store'
+
+/** Read a browser Blob (e.g. a web:// image/video) as a base64 payload for a runner. */
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => {
+      const url = fr.result
+      if (typeof url === 'string') {
+        const comma = url.indexOf(',')
+        resolve(comma >= 0 ? url.slice(comma + 1) : url)
+      } else {
+        reject(new Error('Could not read media blob'))
+      }
+    }
+    fr.onerror = () => reject(fr.error ?? new Error('Could not read media blob'))
+    fr.readAsDataURL(blob)
+  })
+}
+
+/** Resolve a browser asset path (web://key → Blob) to base64, or null if not resolvable. */
+async function assetToBase64(path: string | null | undefined): Promise<string | null> {
+  if (!path) return null
+  if (isWebPath(path)) {
+    const blob = getBlob(path)
+    return blob ? blobToBase64(blob) : null
+  }
+  // Only web:// blobs are resolvable in-browser; anything else (electron disk path,
+  // backend path) must be handled by the backend Worker rail instead.
+  return null
+}
 
 export type RestyleModel = 'fast' | 'regular'
 
@@ -96,9 +127,16 @@ export function useRestyle() {
         return
       }
 
-      const res = await postRunnerTaskWithTicket(runner, 'restyle', {
-        video_path: params.videoPath,
-        stylized_image_path: params.stylizedImagePath,
+      // The id-v2v worker cannot read browser asset paths (web:// blobs) — it needs the
+      // actual media bytes. Convert the source video + accepted styled first frame to
+      // base64 and send them under the worker's expected field names (source_video /
+      // stylized_first_frame). Only resolvable web:// assets can be base64'd in-browser;
+      // if a media path isn't resolvable here (e.g. a backend/electron path) we keep the
+      // path form for the backend Worker rail to resolve server-side.
+      const sourceB64 = await assetToBase64(params.videoPath)
+      const styledB64 = await assetToBase64(params.stylizedImagePath)
+      const usingB64 = !!(sourceB64 && styledB64)
+      const body: Record<string, unknown> = {
         prompt: params.prompt,
         model: params.model ?? 'fast',
         max_frames: params.maxFrames ?? 81,
@@ -107,7 +145,16 @@ export function useRestyle() {
         cfg_scale: params.cfgScale ?? 5.0,
         seed: params.seed,
         enhance_prompt: params.enhancePrompt ?? false,
-      }, {
+      }
+      if (usingB64) {
+        body.source_video = sourceB64
+        body.stylized_first_frame = styledB64
+      } else {
+        body.video_path = params.videoPath
+        body.stylized_image_path = params.stylizedImagePath
+      }
+      logger.info(`[restyle] direct rail media=${usingB64 ? 'base64' : 'path'}`)
+      const res = await postRunnerTaskWithTicket(runner, 'restyle', body, {
         onProgress: (ev) => {
           const msg = getPhaseMessage(ev.stage || '')
           const isBackbone = ev.stage === 'generating'
