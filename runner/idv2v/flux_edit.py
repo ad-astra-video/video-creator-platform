@@ -144,6 +144,7 @@ class FluxKleinEditor:
         self._evict_cb = evict_cb
         self._steps = config.klein4b_steps()
         self._guidance = config.klein4b_guidance()
+        self._strength = _clamp01(config.klein4b_strength())
         self._lock = threading.Lock()
         self._model = None
         self._ae = None
@@ -271,6 +272,7 @@ class FluxKleinEditor:
         width: int | None = None,
         height: int | None = None,
         max_side: int | None = None,
+        strength: float | None = None,
     ) -> "Image.Image":
         """Single-reference image edit: style ``image`` according to ``prompt``.
 
@@ -335,13 +337,30 @@ class FluxKleinEditor:
         ref_tokens = ref_tokens.to(self._device)
         ref_ids = ref_ids.to(self._device)
 
-        # Output latent + schedule.
+        # Output latent + schedule. FIDELITY KNOB: strength<1.0 anchors the
+        # denoise start on the AE-encoded source (img2img-style) so the edit
+        # stays truer to the original; strength=1.0 (default) is the stock
+        # pure-noise re-imagine. If image-init isn't available (BFL API /
+        # VRAM) we fall back to the stock path so it can never regress.
         shape = (1, 128, height // 16, width // 16)
         generator = torch.Generator(device=self._device).manual_seed(int(seed))
-        randn = torch.randn(shape, generator=generator,
-                            dtype=torch.bfloat16, device=self._device)
-        x, x_ids = batched_prc_img(randn)
-        timesteps = get_schedule(self._steps, x.shape[1])
+        eff = _clamp01(strength if strength is not None else self._strength)
+        init = None
+        if eff < 1.0:
+            try:
+                init = self._image_init(ref_img, height, width, eff, generator)
+            except Exception as exc:
+                logger.warning(
+                    "klein image-init at strength %.2f failed (%s); "
+                    "falling back to full re-imagine", eff, exc)
+                init = None
+        if init is None:
+            randn = torch.randn(shape, generator=generator,
+                                dtype=torch.bfloat16, device=self._device)
+            x, x_ids = batched_prc_img(randn)
+            timesteps = get_schedule(self._steps, x.shape[1])
+        else:
+            x, x_ids, timesteps = init
 
         with torch.no_grad():
             x = denoise(
@@ -361,10 +380,46 @@ class FluxKleinEditor:
         from PIL import Image
         return Image.fromarray(out, mode="RGB")
 
+    def _image_init(self, ref_img, out_h, out_w, strength, generator):
+        """Build a noised source-anchored init so klein stays true to the original.
+
+        EXPERIMENTAL / PENDING ON-BOX VALIDATION (the step-distilled klein model
+        and the exact BFL flux2 API surface can't be exercised off-GPU, and .151
+        is unreachable). Encodes the source frame at the OUTPUT latent resolution
+        and starts the (truncated) denoise from that latent instead of pure noise
+        -- lower strength keeps the result closer to the source. Runs
+        `round(steps*strength)` (>=1) steps. Raises on any failure so the caller
+        falls back to the stock full-re-imagine path (never a silent wrong output).
+
+        Note: the init encode runs at the output res (latent must match the
+        flow's), unlike the conditioning ref which stays capped at
+        KLEIN4B_REF_SIDE -- on a small-VRAM card this encode may OOM and the
+        strength=1.0 fallback engages.
+        """
+        import torch
+        from flux2.sampling import batched_prc_img, get_schedule
+        from flux2.util import encode_image
+
+        init_img = ref_img.resize((out_w, out_h))
+        z = encode_image(self._ae, [init_img]).to(torch.bfloat16).to(self._device)
+        z = z[:, :, : out_h // 16, : out_w // 16]
+        n_steps = max(1, round(self._steps * strength))
+        x, x_ids = batched_prc_img(z)
+        timesteps = get_schedule(n_steps, x.shape[1])
+        return x, x_ids, timesteps
+
 
 # ---------------------------------------------------------------------------
 # Helpers + module-level singleton
 # ---------------------------------------------------------------------------
+
+def _clamp01(v: float) -> float:
+    """Clamp ``v`` to [0, 1] (image-init strength range)."""
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except (TypeError, ValueError):
+        return 1.0
+
 
 def _normalize_device(device: str) -> str:
     """Normalize a CUDA device spec ('0' | 'cuda:0') to the form BFL/transformers
