@@ -193,22 +193,3 @@ def test_style_first_frame_skips_enhance_when_llm_off(flux_server, monkeypatch):
     assert enhancer.calls == []            # LLM never touched
     assert editor.calls[0] == "editor:ensure_loaded"
     assert editor.calls[-1] == "editor:unload"
-
-
-def test_clamp01():
-    from runner.idv2v import flux_edit
-    assert flux_edit._clamp01(0.5) == 0.5
-    assert flux_edit._clamp01(-1.0) == 0.0
-    assert flux_edit._clamp01(2.0) == 1.0
-    assert flux_edit._clamp01(1.0) == 1.0
-    # Non-numeric / missing defaults to 1.0 (full re-imagine, no change).
-    assert flux_edit._clamp01(None) == 1.0
-    assert flux_edit._clamp01("nope") == 1.0
-
-
-def test_klein_config_strength_default(monkeypatch):
-    import runner.idv2v.config as cfg
-    monkeypatch.delenv("KLEIN4B_STRENGTH", raising=False)
-    monkeypatch.setattr(cfg, "KLEIN4B_STRENGTH", 1.0)
-    # Default = 1.0 (stock full re-imagine) so the knob is inert unless set.
-    assert cfg.klein4b_strength() == 1.0

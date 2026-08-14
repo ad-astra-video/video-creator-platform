@@ -213,15 +213,6 @@ KLEIN4B_STEPS = int(os.environ.get("KLEIN4B_STEPS", "4"))
 KLEIN4B_GUIDANCE = float(os.environ.get("KLEIN4B_GUIDANCE", "1.0"))
 KLEIN4B_MAX_SIDE = int(os.environ.get("KLEIN4B_MAX_SIDE", "1920"))
 KLEIN4B_REF_SIDE = int(os.environ.get("KLEIN4B_REF_SIDE", "1024"))
-# KLEIN4B_STRENGTH — image-init fidelity knob for the klein editor (0..1).
-# How much the output may deviate from the source frame. 1.0 (default) = the
-# current full re-imagine (start denoise from pure noise, reference only
-# conditions). <1.0 = initialize the denoise latent from the AE-encoded source
-# (partially noise-added) so the result stays closer to the original. 0.0 = a
-# near-copy of the source. Threaded as the default when a request omits
-# `strength`. EXPERIMENTAL on the step-distilled klein model — validate a
-# strength ramp on the box before shipping to users.
-KLEIN4B_STRENGTH = float(os.environ.get("KLEIN4B_STRENGTH", "1.0"))
 
 
 def klein4b_device() -> str:
@@ -235,11 +226,6 @@ def klein4b_steps() -> int:
 
 def klein4b_guidance() -> float:
     return KLEIN4B_GUIDANCE
-
-
-def klein4b_strength() -> float:
-    """Default image-init strength for the klein editor (0..1, default 1.0)."""
-    return KLEIN4B_STRENGTH
 
 
 def klein4b_enabled() -> bool:

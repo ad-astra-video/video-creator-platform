@@ -469,8 +469,7 @@ def _enhance_image_edit(enhancer, image_pil, prompt, seed):
         return prompt
 
 
-def _style_first_frame(image_pil, prompt, seed, width, height, enhance_prompt,
-                       strength=None):
+def _style_first_frame(image_pil, prompt, seed, width, height, enhance_prompt):
     """Style ``image_pil`` with FLUX.2 klein 4B and return (styled_pil, enhanced_prompt).
 
     CRITICAL sequencing (shared GPU / no dedicated LLM GPU): the prompt
@@ -497,8 +496,7 @@ def _style_first_frame(image_pil, prompt, seed, width, height, enhance_prompt,
     editor = get_editor()
     try:
         editor.ensure_loaded()                # evicts resident video model if present
-        styled = editor.edit(image_pil, final, seed, width=width, height=height,
-                              strength=strength)
+        styled = editor.edit(image_pil, final, seed, width=width, height=height)
     finally:
         evict_editor()                        # free FLUX.2 before the video model loads
     return styled, enhanced_prompt
@@ -538,7 +536,6 @@ def _style_first_frame_from_job(body, prompt, enhance_prompt):
         try:
             styled, enhanced = _style_first_frame(
                 pil, prompt, int(body.get("seed", 123)), None, None, enhance_prompt,
-                strength=body.get("strength"),
             )
             out = styled
         except Exception as exc:
@@ -556,7 +553,7 @@ async def handle_style_frame(request: web.Request) -> web.Response:
     """Style a single image (the restyle first frame) with FLUX.2 klein 4B.
 
     Body JSON: {image: <base64>, prompt: str, seed?: int, width?: int,
-    height?: int, enhance_prompt?: bool, strength?: float (0..1)}. Prompt-enhanced through the loaded
+    height?: int, enhance_prompt?: bool}. Prompt-enhanced through the loaded
     Gemma LLM before it is evicted (shared-GPU aware), then edited by FLUX.2.
     Returns {styled_image: <base64 PNG>, width, height, enhanced_prompt?}.
     """
@@ -576,7 +573,6 @@ async def handle_style_frame(request: web.Request) -> web.Response:
     enhance_prompt = bool(body.get("enhance_prompt", False))
     width = body.get("width")
     height = body.get("height")
-    strength = body.get("strength")
 
     def _run():
         import base64 as _b64
@@ -584,7 +580,7 @@ async def handle_style_frame(request: web.Request) -> web.Response:
         from PIL import Image as _Image
         img = _Image.open(_io.BytesIO(_b64.b64decode(image_b64))).convert("RGB")
         styled, enhanced = _style_first_frame(
-            img, prompt, seed, width, height, enhance_prompt, strength,
+            img, prompt, seed, width, height, enhance_prompt,
         )
         buf = _io.BytesIO()
         styled.save(buf, format="PNG")
