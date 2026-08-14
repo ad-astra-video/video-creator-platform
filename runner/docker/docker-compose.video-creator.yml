@@ -90,7 +90,6 @@ services:
       - PRICE=${PRICE:-0.5}
       - PRICE_UNIT=fixed
       - GPU_NAME=${GPU_NAME:-RTX 5090}
-      - GPU_VRAM_MB=${GPU_VRAM_MB:-32768}
       - WORKER_TOKEN=${WORKER_TOKEN:-}
       - LTX_WORKER_URL=http://ltx-worker:8991
       - IDV2V_WORKER_URL=http://idv2v-worker:8992

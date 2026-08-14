@@ -17,8 +17,6 @@ Worker can forward it straight through to the frontend:
 """
 from __future__ import annotations
 
-from . import config
-
 # Resolutions the LTX worker can render, in ascending order (ltx/gpu_profile).
 RESOLUTION_DIMS = {
     "540p": (960, 544),
@@ -67,8 +65,8 @@ _DURATION_CANDIDATES = [4, 6, 8, 10, 12, 16]
 # --- Video-create ("Create") duration budget -- VRAM + resolution aware ---
 # The runner is the authority on how many "seconds to generate" it can actually run.
 # During t2v/i2v generation the GPU holds the resident model weights PLUS activations
-# that grow with frames x resolution, so the ceiling is derived from the advertised
-# VRAM and per-resolution latent area -- NOT a hardcoded list (user-mandated 2026-08).
+# that grow with frames x resolution, so the ceiling is derived from the GPU's VRAM and
+# the per-resolution latent area -- NOT a hardcoded list (user-mandated 2026-08).
 #
 # Calibration anchor (user-validated): a 32 GB RTX 5090 (fp8 LTX-2.3, ~11 GB resident)
 # generates up to 8 s at its top resolution (1080p) = 192 latent frames at 24 fps.
@@ -119,15 +117,19 @@ def _max_resolution_for_vram(vram_mb: int) -> str:
     return "1080p"
 
 
-def build_model_specs() -> list[dict]:
+def build_model_specs(vram_mb: int) -> list[dict]:
     """Build the LTX-2.3 spec list limited to what this runner's GPU can do.
 
-    Resolutions are capped at the GPU profile's max (540p/720p/1080p). ``fast``
-    is the only advertised pipeline — the runner runs a single LTX-2.3 engine;
-    ``pro`` would overstate a model we don't actually serve. A2V is advertised
-    as unsupported (``None``) to match the LTX worker's ``not_supported`` route.
+    ``vram_mb`` is the GPU's total VRAM in MiB, detected at runtime from the
+    GPU-visible worker (the thin live-runner has no direct GPU/torch access) --
+    NOT read from an env var. Resolutions are capped at the GPU profile's max
+    (540p/720p/1080p) and durations at the VRAM + resolution activation ceiling.
+    ``fast`` is the only advertised pipeline -- the runner runs a single LTX-2.3
+    engine; ``pro`` would overstate a model we don't actually serve. A2V is
+    advertised as unsupported (``None``) to match the LTX worker's
+    ``not_supported`` route.
     """
-    max_res = _max_resolution_for_vram(config.GPU_VRAM_MB)
+    max_res = _max_resolution_for_vram(vram_mb)
     # Order resolutions ascending; stop once we reach the GPU's max.
     ordered = list(RESOLUTION_DIMS)
     resolutions = ordered[: ordered.index(max_res) + 1]
@@ -135,7 +137,7 @@ def build_model_specs() -> list[dict]:
     supported = {
         res: {
             "fps_to_durations": {
-                fps: _durations_for(config.GPU_VRAM_MB, res)
+                fps: _durations_for(vram_mb, res)
                 for fps in ("24", "48")
             }
         }

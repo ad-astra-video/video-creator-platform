@@ -45,8 +45,51 @@ _in_flight = 0        # active request counter (idle-backfill gate)
 _last_activity = 0.0  # monotonic ts of last request (idle-backfill grace)
 
 # Advertised model-spec metadata (resolution/fps/duration) for the Livepeer
-# video pipelines. Computed once at import from the runner's GPU VRAM config.
-_MODEL_SPECS = build_model_specs()
+# video pipelines. Built from the GPU's ACTUAL VRAM detected at runtime from the
+# GPU-visible worker (_detect_worker_vram_mb) and rebuilt if that VRAM changes.
+# Detection can't run at import time, so we start from the conservative fallback
+# and the first startup/heartbeat pass corrects it. (user-mandated 2026-08: use
+# the real GPU VRAM, not the GPU_VRAM_MB env var.)
+_MODEL_SPECS = build_model_specs(config.DEFAULT_VRAM_MB)
+# Total VRAM (MiB) of the GPU the workers render on, as detected from the ltx
+# worker's /info. None until the first successful detection.
+_gpu_vram_mb: int | None = None
+
+
+async def _detect_worker_vram_mb(session: aiohttp.ClientSession) -> int | None:
+    """Fetch the actual GPU VRAM (MiB) from the GPU-visible ltx worker.
+
+    The thin live-runner edge has no GPU/torch and cannot read VRAM itself, so it
+    learns the real value from the ltx-worker's ``/video-creator/v1/info``
+    (``gpu.vram_gb``), which is authoritative (torch -> nvidia-smi on the box).
+    Returns None when the worker isn't reachable / data isn't present yet.
+    """
+    url = f"{config.LTX_WORKER_URL.rstrip('/')}/video-creator/v1/info"
+    try:
+        async with session.get(
+            url,
+            headers={"X-Worker-Token": config.worker_token()},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            vram_gb = (data.get("gpu") or {}).get("vram_gb")
+            if not vram_gb:
+                return None
+            return int(float(vram_gb) * 1024)
+    except Exception:
+        logger.debug("worker VRAM detect failed (%s)", url, exc_info=True)
+        return None
+
+
+def _apply_detected_vram(vram_mb: int) -> None:
+    """Record detected VRAM and rebuild advertised model specs if it changed."""
+    global _gpu_vram_mb, _MODEL_SPECS
+    if vram_mb and vram_mb != _gpu_vram_mb:
+        _gpu_vram_mb = vram_mb
+        _MODEL_SPECS = build_model_specs(vram_mb)
+        logger.info("Detected worker GPU VRAM %d MiB -> rebuilt model specs", vram_mb)
 
 
 def _need(request: web.Request):
@@ -68,7 +111,7 @@ async def handle_info(_req: web.Request) -> web.Response:
         "app": config.APP_ID,
         "capabilities": CAPABILITIES,
         "ready": _ready,
-        "gpu": {"name": config.GPU_NAME, "vram_mb": config.GPU_VRAM_MB},
+        "gpu": {"name": config.GPU_NAME, "vram_mb": _gpu_vram_mb or config.DEFAULT_VRAM_MB},
         "metadata": {**meta, "capabilities": CAPABILITIES, "model_specs": _MODEL_SPECS},
     })
 
@@ -537,7 +580,14 @@ async def on_startup(_app: web.Application) -> None:
     )
     _generation_sem = asyncio.Semaphore(1)
 
-    gpu = LiveRunnerGPU(name=config.GPU_NAME, vram_mb=config.GPU_VRAM_MB)
+    # Learn the real GPU VRAM from the worker before registering, so the very
+    # first heartbeat already advertises specs for the actual card (not the env
+    # default). Falls back to DEFAULT_VRAM_MB if the worker isn't up yet -- the
+    # heartbeat loop will correct it as soon as detection succeeds.
+    detected = await _detect_worker_vram_mb(_session)
+    if detected:
+        _apply_detected_vram(detected)
+    gpu = LiveRunnerGPU(name=config.GPU_NAME, vram_mb=_gpu_vram_mb or config.DEFAULT_VRAM_MB)
     _registration = await register_runner(
         config.ORCHESTRATOR_URL,
         secret=config.ORCHESTRATOR_SECRET,
@@ -608,6 +658,11 @@ async def _refresh_metadata_loop() -> None:
     while True:
         try:
             if _worker_manager is not None and _registration is not None:
+                # Keep advertised specs in sync with the actual GPU VRAM in case
+                # the worker came up after startup (or its VRAM changed).
+                detected = await _detect_worker_vram_mb(_session)
+                if detected:
+                    _apply_detected_vram(detected)
                 meta = await _worker_manager.check_health()
                 meta["capabilities"] = CAPABILITIES
                 meta["model_specs"] = _MODEL_SPECS
