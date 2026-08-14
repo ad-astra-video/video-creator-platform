@@ -46,7 +46,7 @@ _last_activity = 0.0  # monotonic ts of last request (idle-backfill grace)
 
 # Advertised model-spec metadata (resolution/fps/duration) for the Livepeer
 # video pipelines. Built from the GPU's ACTUAL VRAM detected at runtime from the
-# GPU-visible worker (_detect_worker_vram_mb) and rebuilt if that VRAM changes.
+# GPU-visible workers (_poll_worker_gpu_info) and rebuilt if that VRAM changes.
 # Detection can't run at import time, so we start from the conservative fallback
 # and the first startup/heartbeat pass corrects it. (user-mandated 2026-08: use
 # the real GPU VRAM, not the GPU_VRAM_MB env var.)
@@ -56,15 +56,14 @@ _MODEL_SPECS = build_model_specs(config.DEFAULT_VRAM_MB)
 _gpu_vram_mb: int | None = None
 
 
-async def _detect_worker_vram_mb(session: aiohttp.ClientSession) -> int | None:
-    """Fetch the actual GPU VRAM (MiB) from the GPU-visible ltx worker.
+async def _fetch_worker_info(session: aiohttp.ClientSession, worker_url: str) -> dict | None:
+    """GET {worker_url}/video-creator/v1/info — worker liveness + GPU/model detail.
 
     The thin live-runner edge has no GPU/torch and cannot read VRAM itself, so it
-    learns the real value from the ltx-worker's ``/video-creator/v1/info``
-    (``gpu.vram_gb``), which is authoritative (torch -> nvidia-smi on the box).
-    Returns None when the worker isn't reachable / data isn't present yet.
+    learns each worker's GPU from that worker's ``/info`` (authoritative on the
+    box: torch -> nvidia-smi). Returns None when the worker/report isn't ready.
     """
-    url = f"{config.LTX_WORKER_URL.rstrip('/')}/video-creator/v1/info"
+    url = f"{worker_url.rstrip('/')}/video-creator/v1/info"
     try:
         async with session.get(
             url,
@@ -73,14 +72,35 @@ async def _detect_worker_vram_mb(session: aiohttp.ClientSession) -> int | None:
         ) as resp:
             if resp.status != 200:
                 return None
-            data = await resp.json()
-            vram_gb = (data.get("gpu") or {}).get("vram_gb")
-            if not vram_gb:
-                return None
-            return int(float(vram_gb) * 1024)
+            return await resp.json()
     except Exception:
-        logger.debug("worker VRAM detect failed (%s)", url, exc_info=True)
+        logger.debug("worker info fetch failed (%s)", url, exc_info=True)
         return None
+
+
+async def _poll_worker_gpu_info(session: aiohttp.ClientSession) -> tuple[dict, int | None]:
+    """Poll every configured worker's /info (polled at startup + each heartbeat).
+
+    Returns ``(gpu_meta, ltx_vram_mb)``:
+      * gpu_meta — compact per-worker GPU summary ``{name: {vram_mb, name, cc}}``
+        folded into the advertised heartbeat metadata the live-runner passes on.
+      * ltx_vram_mb — the create (ltx) worker's total VRAM, which drives the
+        video-create resolution/duration specs.
+    """
+    gpu_meta: dict = {}
+    ltx_vram_mb: int | None = None
+    for name, url in config.WORKERS.items():
+        info = await _fetch_worker_info(session, url)
+        g = (info or {}).get("gpu") or {}
+        vram_gb = g.get("vram_gb")
+        gpu_meta[name] = {
+            "vram_mb": int(float(vram_gb) * 1024) if vram_gb else None,
+            "name": g.get("gpu_name"),
+            "cc": g.get("compute_cap"),
+        }
+        if name == "ltx-worker" and vram_gb:
+            ltx_vram_mb = int(float(vram_gb) * 1024)
+    return gpu_meta, ltx_vram_mb
 
 
 def _apply_detected_vram(vram_mb: int) -> None:
@@ -584,9 +604,9 @@ async def on_startup(_app: web.Application) -> None:
     # first heartbeat already advertises specs for the actual card (not the env
     # default). Falls back to DEFAULT_VRAM_MB if the worker isn't up yet -- the
     # heartbeat loop will correct it as soon as detection succeeds.
-    detected = await _detect_worker_vram_mb(_session)
-    if detected:
-        _apply_detected_vram(detected)
+    gpu_meta, ltx_vram = await _poll_worker_gpu_info(_session)
+    if ltx_vram:
+        _apply_detected_vram(ltx_vram)
     gpu = LiveRunnerGPU(name=config.GPU_NAME, vram_mb=_gpu_vram_mb or config.DEFAULT_VRAM_MB)
     _registration = await register_runner(
         config.ORCHESTRATOR_URL,
@@ -602,6 +622,7 @@ async def on_startup(_app: web.Application) -> None:
         metadata=json.dumps({
             "capabilities": CAPABILITIES,
             "model_specs": _MODEL_SPECS,
+            "gpu": gpu_meta,
             "ltx_worker_up": False,
             "idv2v_worker_up": False,
             "warm_model": None,
@@ -660,12 +681,13 @@ async def _refresh_metadata_loop() -> None:
             if _worker_manager is not None and _registration is not None:
                 # Keep advertised specs in sync with the actual GPU VRAM in case
                 # the worker came up after startup (or its VRAM changed).
-                detected = await _detect_worker_vram_mb(_session)
-                if detected:
-                    _apply_detected_vram(detected)
+                gpu_meta, ltx_vram = await _poll_worker_gpu_info(_session)
+                if ltx_vram:
+                    _apply_detected_vram(ltx_vram)
                 meta = await _worker_manager.check_health()
                 meta["capabilities"] = CAPABILITIES
                 meta["model_specs"] = _MODEL_SPECS
+                meta["gpu"] = gpu_meta
                 # The registration is an in-process object owned by this runner;
                 # set its payload metadata so the next heartbeat advertises the
                 # current warm-model + worker up/down status. (No SDK change needed.)

@@ -110,6 +110,59 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", **info})
 
 
+def _gpu_info() -> dict:
+    """Report the GPU this worker renders on (torch primary, nvidia-smi fallback).
+
+    Shape matches the ltx-worker's ``gpu`` block so the live-runner can merge all
+    workers' GPU details uniformly into its advertised heartbeat metadata.
+    """
+    try:
+        import torch
+        idx = 0
+        ds = str(config.GPU_DEVICE)
+        if ":" in ds:
+            try:
+                idx = int(ds.split(":", 1)[1])
+            except ValueError:
+                idx = 0
+        if torch.cuda.is_available() and idx < torch.cuda.device_count():
+            props = torch.cuda.get_device_properties(idx)
+            return {
+                "gpu_name": torch.cuda.get_device_name(idx),
+                "vram_gb": round(props.total_memory / (1024 ** 3), 1),
+                "compute_cap": f"{props.major}.{props.minor}",
+            }
+    except Exception:
+        logger.debug("torch GPU query failed; trying nvidia-smi", exc_info=True)
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap",
+             "--format=csv,noheader,nounits"], text=True, timeout=10)
+        name, mem_mb, cc = (x.strip() for x in out.strip().splitlines()[0].split(","))
+        return {"gpu_name": name, "vram_gb": round(int(mem_mb) / 1024.0, 1), "compute_cap": cc}
+    except Exception:
+        logger.debug("nvidia-smi GPU query failed", exc_info=True)
+    return {"gpu_name": None, "vram_gb": None, "compute_cap": None}
+
+
+async def handle_info(request: web.Request) -> web.Response:
+    """GET /info — liveness + the GPU this worker renders on (for the live-runner)."""
+    model = _model
+    base = health_check(model) if model is not None else {
+        "status": "unloaded", "model_loaded": False, "device": config.GPU_DEVICE,
+        "precision": config.IDV2V_QUANT, "offload": config.IDV2V_OFFLOAD,
+    }
+    return web.json_response({
+        "runner_id": "",
+        "app": "idv2v",
+        "capabilities": ["restyle", "sam3", "prompt-enhance", "style-frame"],
+        "ready": model is not None,
+        "gpu": _gpu_info(),
+        **base,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
@@ -342,6 +395,8 @@ async def handle_prompt_enhance(request: web.Request) -> web.Response:
 def create_app() -> web.Application:
     app = web.Application(client_max_size=config.MAX_BODY_BYTES)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/info", handle_info)
+    app.router.add_get("/video-creator/v1/info", handle_info)
     app.router.add_post("/load", handle_load)
     app.router.add_post("/evict", handle_evict)
     app.router.add_post("/v1/restyle", handle_restyle)

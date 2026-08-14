@@ -13,8 +13,8 @@ PRICE = float(os.environ.get("PRICE", "0"))
 PRICE_UNIT = os.environ.get("PRICE_UNIT", "fixed")
 PRICE_CURRENCY = (os.environ.get("PRICE_CURRENCY", "usd") or "usd").strip().lower()
 GPU_NAME = os.environ.get("GPU_NAME", "RTX 5090")
-# GPU VRAM is DETECTED at runtime from the GPU-visible worker (see server.py
-# _detect_worker_vram_mb), NOT read from an env var (user-mandated 2026-08).
+# GPU VRAM is DETECTED at runtime from the GPU-visible workers (see server.py
+# _poll_worker_gpu_info), NOT read from an env var (user-mandated 2026-08).
 # This is a conservative fallback used only until runtime detection succeeds.
 DEFAULT_VRAM_MB = 32768
 HEARTBEAT_INTERVAL_S = float(os.environ.get("HEARTBEAT_INTERVAL_S", "5"))
