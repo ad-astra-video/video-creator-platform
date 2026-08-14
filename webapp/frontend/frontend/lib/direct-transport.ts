@@ -15,7 +15,7 @@
  */
 
 import { ApiClient } from './api-client'
-import { getBlob, getBlobUrl } from './runtime/web-store'
+import { getBlob, getBlobUrl, registerBlob, setDimensions } from './runtime/web-store'
 import { logger } from './logger'
 
 /** Fetch with an AbortSignal.timeout guard so a hung hop surfaces as an error instead of a silent await. */
@@ -185,9 +185,15 @@ export async function styleFrameViaRunner(
   const bin = atob(styledB64)
   const bytes = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-  const url = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }))
+  // Register the bytes in the browser asset store so the returned value is a `web://<uuid>`
+  // key that webAssetUrl() can resolve (a raw blob: URL would fall through pathToFileUrl to a
+  // broken file:///blob:... link in every <img> that renders it).
+  const key = registerBlob(new Blob([bytes], { type: 'image/png' }), 'styled-frame.png', 'image/png')
+  if (data?.width != null && data?.height != null) {
+    try { setDimensions(key, Number(data.width), Number(data.height)) } catch { /* non-fatal */ }
+  }
   return {
-    styledImageUrl: url,
+    styledImageUrl: key,
     width: typeof data?.width === 'number' ? data.width : undefined,
     height: typeof data?.height === 'number' ? data.height : undefined,
     enhancedPrompt: typeof data?.enhanced_prompt === 'string' ? data.enhanced_prompt : undefined,
