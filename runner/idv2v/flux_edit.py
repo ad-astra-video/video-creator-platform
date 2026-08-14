@@ -57,6 +57,79 @@ def resolve_dims(width: int, height: int, max_side: int, base: int = 16) -> tupl
     return max(base, nw), max(base, nh)
 
 
+
+
+def _tiled_decode(
+    ae,
+    z,
+    tile: int = 256,  # latent-space tile (z is (1, C, H, W), latent /16)
+    overlap: int = 32,
+    device: str = "cuda:0",
+) -> "torch.Tensor":
+    """Decode a (possibly large) AE latent in overlapping spatial tiles.
+
+    The FLUX.2 AE decode on the full 1920x1080 latent in ONE call is the second
+    big VRAM spike after the encode. Tiling keeps peak activation memory flat
+    (~a tile, not the whole frame) so native output resolution is VRAM-bound
+    only by the flow denoise, not the AE.
+
+    Overlapping tiles are blended linearly by distance-from-overlap-edge so
+    there are no visible seams.
+    """
+    import torch
+    z = z.to(device)
+    _, C, H, W = z.shape
+    import einops
+    from PIL import Image as _PIL
+
+    F = 16  # flow latent is (1,128,H//16,W//16); decode -> 16x pixels
+    out_h, out_w = H * F, W * F
+    # preallocate output + weight in pixel space (float, on CPU to not blow VRAM)
+    acc = torch.zeros((3, out_h, out_w), dtype=torch.float32, device="cpu")
+    wacc = torch.zeros((1, out_h, out_w), dtype=torch.float32, device="cpu")
+
+    # tile indices in latent space; step = tile - overlap
+    step = max(1, tile - overlap)
+    ys = list(range(0, max(1, H - tile + 1), step)) or [0]
+    if ys[-1] != H - tile:
+        ys.append(H - tile)
+    xs = list(range(0, max(1, W - tile + 1), step)) or [0]
+    if xs[-1] != W - tile:
+        xs.append(W - tile)
+
+    import torch.nn.functional as F
+    for y0 in set(ys):
+        y0 = max(0, min(y0, H - tile))
+        for x0 in set(xs):
+            x0 = max(0, min(x0, W - tile))
+            zt = z[:, :, y0:y0 + tile, x0:x0 + tile]
+            with torch.no_grad():
+                dec = ae.decode(zt).float()          # (1,3, hh, ww)
+            dec = dec[0].cpu()                        # (3, hh, ww)
+            # pixel-space tile origin
+            py0, px0 = y0 * F, x0 * F
+            hh, ww = dec.shape[1], dec.shape[2]
+            # weights: 1 in middle, ramp 0->1 across overlap margins
+            wy = torch.ones((hh, 1), dtype=torch.float32)
+            wx = torch.ones((1, ww), dtype=torch.float32)
+            ovy = min(overlap * F, hh // 2)
+            ovx = min(overlap * F, ww // 2)
+            if ovy > 0:
+                ramp = torch.arange(ovy, dtype=torch.float32) / ovy
+                wy[:ovy, 0] = ramp
+                wy[-ovy:, 0] = ramp.flip(0)
+            if ovx > 0:
+                ramp = torch.arange(ovx, dtype=torch.float32) / ovx
+                wx[0, :ovx] = ramp
+                wx[0, -ovx:] = ramp.flip(0)
+            wgt = (wy * wx)
+            acc[:, py0:py0 + hh, px0:px0 + ww] += dec.clamp(-1, 1) * wgt
+            wacc[0, py0:py0 + hh, px0:px0 + ww] += wgt
+            del dec, zt, wgt
+
+    out = acc / wacc.clamp(min=1e-6)
+    return out.unsqueeze(0)  # (1,3,out_h,out_w) CPU float32
+
 class FluxKleinEditor:
     """A single, swappable FLUX.2 [klein] 4B editor (one per worker process).
 
@@ -225,22 +298,27 @@ class FluxKleinEditor:
             scatter_ids,
         )
 
-        src_w, src_h = image.size
+        # OUTPUT resolution: use the caller's explicit width/height, else the
+        # source (capped at KLEIN4B_MAX_SIDE so a stray huge input can't blow
+        # the card).  This is the resolution the flow denoises its latent at
+        # and what comes back from decode -> a 1920x1080 output stays 1920x1080.
         cap = max_side or self._max_side
         if width is None or height is None:
-            width, height = resolve_dims(src_w, src_h, cap)
+            out_w, out_h = resolve_dims(image.size[0], image.size[1], cap)
         else:
-            width, height = resolve_dims(width, height, cap)
+            out_w, out_h = resolve_dims(width, height, cap)
 
-        # Downscale the SOURCE frame to the resolved dims BEFORE the AE encode.
-        # resolve_dims() only sets the output-latent resolution; if we feed the
-        # original full-res `image` to encode_image_refs() the AE encodes the
-        # whole 1080p frame in one shot, which is what actually OOMs (way more
-        # than the flow forward). Capping the input keeps both the encode and the
-        # denoise within card VRAM.  Output is produced at `width/height`;
-        # upscaling back to the video canvas is the caller's job.
-        if image.size != (width, height):
-            image = image.resize((width, height), Image.Resampling.LANCZOS)
+        # REFERENCE-ENCODE resolution: independent of the output. The reference
+        # only CONDITIONS the edit (ref_tokens), it does not set output size, so
+        # we cap it to keep the AE encode fast and VRAM-light.  Native 1080p is
+        # carried by the OUTPUT latent / tiled decode, not by encoding the ref
+        # at 1080p (which is what previously OOM'd).
+        ref_side = config.KLEIN4B_REF_SIDE
+        ref_img = image
+        if ref_side and max(image.size) > ref_side:
+            ref_w, ref_h = resolve_dims(image.size[0], image.size[1], ref_side)
+            ref_img = image.resize((ref_w, ref_h), Image.Resampling.LANCZOS)
+        width, height = out_w, out_h
 
         # Context: the (distilled) klein model needs only the prompt — no
         # negative / empty pair (guidance_distilled -> `denoise`, not denoise_cfg).
@@ -252,8 +330,8 @@ class FluxKleinEditor:
         # Lazily re-loaded on the next edit via ensure_loaded.
         self.evict_text_encoder()
 
-        # Reference conditioning: encode the source frame through the AE.
-        ref_tokens, ref_ids = encode_image_refs(self._ae, [image])
+        # Reference conditioning: encode the (capped) source frame through the AE.
+        ref_tokens, ref_ids = encode_image_refs(self._ae, [ref_img])
         ref_tokens = ref_tokens.to(self._device)
         ref_ids = ref_ids.to(self._device)
 
@@ -274,11 +352,12 @@ class FluxKleinEditor:
                 img_cond_seq_ids=ref_ids,
             )
             x = torch.cat(scatter_ids(x, x_ids)).squeeze(2)
-            x = self._ae.decode(x).float()
+            # Tile the decode so a native-HD output latent doesn't spike VRAM.
+            x = _tiled_decode(self._ae, x, device=self._device)
 
         x = x.clamp(-1, 1)
         x = rearrange(x[0], "c h w -> h w c")
-        out = (127.5 * (x + 1.0)).cpu().byte().numpy()
+        out = (127.5 * (x + 1.0)).byte().numpy()
         from PIL import Image
         return Image.fromarray(out, mode="RGB")
 

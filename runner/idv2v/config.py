@@ -195,7 +195,15 @@ def _random_token() -> str:
 #                     empirically-tested ceiling on a 31.4 GB card (flow 8 + AE +
 #                     Qwen3 bf16 ~16 GB weights + encode/denoise activations): a
 #                     1080p 1920 frame OOMs at the AE encode, 1472 fits. It anchors
-#                     the 1080p video restyle, so keep it as high as the card allows.
+#                     With tiled AE (ref encode capped at KLEIN4B_REF_SIDE, decode
+#                     tiled), the OUTPUT can be native 1920x1080; MAX_SIDE only
+#                     guards against a stray unbounded input. Callers pass explicit
+#                     1920x1080 for full-HD output.
+#   KLEIN4B_REF_SIDE  cap on the long edge of the REFERENCE image fed to the AE
+#                     for conditioning (default 1024). The reference only yields
+#                     ref_tokens; it is re-encoded at this size so the AE encode
+#                     stays VRAM-light even for a native-1080p edit. This is what
+#                     makes full-HD output fit on a 31.4 GB card.
 KLEIN4B_ENABLED = os.environ.get("KLEIN4B_ENABLED", "auto")
 KLEIN4B_MODEL = os.environ.get("KLEIN4B_MODEL", "/models/flux2/flux-2-klein-4b.safetensors")
 KLEIN4B_AE = os.environ.get("KLEIN4B_AE", "/models/flux2/ae.safetensors")
@@ -203,7 +211,8 @@ KLEIN4B_TEXT_ENC = os.environ.get("KLEIN4B_TEXT_ENC", "Qwen/Qwen3-4B")
 KLEIN4B_GPU_DEVICE = os.environ.get("KLEIN4B_GPU_DEVICE", "")
 KLEIN4B_STEPS = int(os.environ.get("KLEIN4B_STEPS", "4"))
 KLEIN4B_GUIDANCE = float(os.environ.get("KLEIN4B_GUIDANCE", "1.0"))
-KLEIN4B_MAX_SIDE = int(os.environ.get("KLEIN4B_MAX_SIDE", "1472"))
+KLEIN4B_MAX_SIDE = int(os.environ.get("KLEIN4B_MAX_SIDE", "1920"))
+KLEIN4B_REF_SIDE = int(os.environ.get("KLEIN4B_REF_SIDE", "1024"))
 
 
 def klein4b_device() -> str:
