@@ -3,6 +3,7 @@ import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicket } from '../lib/direct-transport'
 import { getBlob, isWebPath } from '../lib/runtime/web-store'
+import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY } from './use-generation'
 
 /** Read a browser Blob (e.g. a web:// image/video) as a base64 payload for a runner. */
 function blobToBase64(blob: Blob): Promise<string> {
@@ -117,6 +118,7 @@ export function useRestyle() {
     })
 
     await withGenerationActive(async () => {
+      try {
       // Direct transport requires a configured Livepeer runner; without it there is no
       // remote backend to dispatch the restyle to.
       const runner = await resolveRunner(['restyle'])
@@ -185,6 +187,17 @@ export function useRestyle() {
         restyleError: null,
         result: { videoPath, videoCaption, enhancedPrompt },
       })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Restyle failed'
+        logger.error(`Restyle error: ${msg}`)
+        setState({ isRestyling: false, restyleStatus: '', restyleError: msg, result: null })
+      } finally {
+        // Always release the global generation lock on settle. A thrown fetch/SSE/worker
+        // error must not leak GENERATION_RECOVERY_KEY — otherwise every Generate button
+        // greys out until localStorage is manually cleared (mirrors use-extend).
+        window.localStorage.removeItem(GENERATION_RECOVERY_KEY)
+        window.localStorage.removeItem(GENERATION_RECOVERY_TS_KEY)
+      }
     })
   }, [])
 
