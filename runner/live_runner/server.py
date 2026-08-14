@@ -136,26 +136,94 @@ async def handle_info(_req: web.Request) -> web.Response:
     })
 
 
-async def _restyle_chain(wm, session, token, body) -> web.Response:
-    """Restyle = idv2v generation at a GPU-fitting resolution (capped ~480),
-    then LTX spatial upscaler restores the requested output resolution.
+def _client_stage(info: dict):
+    """Map an idv2v worker progress payload to a client-facing stage/message pair."""
+    st = info.get("stage", "generating")
+    msg = info.get("message", "") or ""
+    if st == "preprocessing":
+        return "preprocessing", "Preparing frames..."
+    if st == "decoding":
+        return "decoding", "Decoding video..."
+    if st == "complete":
+        return "finalizing", "Finalizing output..."
+    if st == "generating":
+        return "generating", msg or "Generating..."
+    return st, msg
+
+
+async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Response:
+    """Restyle = idv2v generation at a GPU-fitting resolution (capped ~480), then
+    LTX spatial upscaler restores the requested output resolution.
 
     The response keeps the downstream contract: ``output_video`` base64 +
     ``resolution``. A flag and the pre-upscale resolution are included so the
     desktop can tell a chained (upscaled) result from a native one.
+
+    When ``progress_cb`` is supplied (SSE transport), the idv2v leg runs as a
+    background task and its REAL per-step progress is polled from the worker's
+    ``/progress/{job_id}`` and forwarded through the callback, and the upscale
+    leg emits keep-alive text stages -- so the connection stays alive and the
+    client sees live generation progress (fixes the Cloudflare-tunnel timeout
+    that a silent multi-minute request was hitting). Without it the plain HTTP
+    path returns the single JSON response unchanged.
     """
-    # 1) ID-V2V restyle (generates at the box-fitting ~480 cap internally).
     headers = {"X-Worker-Token": token}
     idv2v_base = config.WORKERS["idv2v-worker"]
     await wm.ensure("idv2v-worker")
-    async with session.post(
-        f"{idv2v_base}/video-creator/v1/restyle", json=body, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=3600.0),
-    ) as resp:
-        if resp.status >= 400:
-            txt = (await resp.read())[:500].decode("utf-8", "replace")
-            return web.Response(status=502, text=txt, content_type="application/json", charset="utf-8")
-        data = await resp.json()
+
+    job_id = str(body.get("job_id") or uuid.uuid4().hex[:12])
+    rbody = {**body, "job_id": job_id}
+
+    async def _send(ev: dict) -> None:
+        if progress_cb is None:
+            return
+        try:
+            await progress_cb(ev)
+        except Exception:
+            pass
+
+    # 1) ID-V2V restyle (background task so we can poll /progress concurrently).
+    async def _restyle():
+        async with session.post(f"{idv2v_base}/video-creator/v1/restyle",
+                                json=rbody, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
+            if r.status >= 400:
+                return {"_error": (await r.read())[:500].decode("utf-8", "replace")}
+            return await r.json()
+
+    task = asyncio.create_task(_restyle())
+    try:
+        while not task.done():
+            try:
+                async with session.get(
+                    f"{idv2v_base}/video-creator/v1/progress/{job_id}",
+                    headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    if r.status == 200:
+                        info = await r.json()
+                        stage, message = _client_stage(info)
+                        prog = info.get("progress")
+                        p = None
+                        if stage == "generating":
+                            try:
+                                p = round(float(prog), 4)
+                            except (TypeError, ValueError):
+                                p = None
+                        await _send({"stage": stage, "message": message, "progress": p})
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
+            except asyncio.TimeoutError:
+                pass
+        data = task.result()
+        if data.get("_error"):
+            return web.Response(status=502, text=data["_error"],
+                                content_type="application/json", charset="utf-8")
+    except Exception as exc:
+        logger.exception("restyle chain failed")
+        return web.Response(status=500, text=str(exc),
+                            content_type="application/json", charset="utf-8")
 
     out_b64 = data.get("output_video")
     if not out_b64:
@@ -175,29 +243,43 @@ async def _restyle_chain(wm, session, token, body) -> web.Response:
             "used_prompt": data.get("used_prompt"),
         })
 
-    # 2) LTX spatial upscale to the requested target resolution.
+    # 2) LTX spatial upscale to the requested target resolution (keep-alive).
     target_w = max(16, int(body.get("width", 1280)))
     target_h = max(16, int(body.get("height", 720)))
-    up_body = {
-        "video_base64": out_b64,
-        "width": target_w,
-        "height": target_h,
-        "fps": body.get("fps", 24),
-    }
+    up_body = {"video_base64": out_b64, "width": target_w, "height": target_h,
+               "fps": body.get("fps", 24)}
     ltx_base = config.WORKERS["ltx-worker"]
     await wm.ensure("ltx-worker")
-    async with session.post(
-        f"{ltx_base}/video-creator/v1/upscale", json=up_body, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=3600.0),
-    ) as resp2:
-        if resp2.status >= 400:
-            txt = (await resp2.read())[:500].decode("utf-8", "replace")
-            return web.Response(status=502, text=txt, content_type="application/json", charset="utf-8")
-        up = await resp2.json()
+
+    async def _upscale():
+        async with session.post(f"{ltx_base}/video-creator/v1/upscale",
+                                json=up_body, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r2:
+            if r2.status >= 400:
+                return {"_error": (await r2.read())[:500].decode("utf-8", "replace")}
+            return await r2.json()
+
+    utask = asyncio.create_task(_upscale())
+    try:
+        while not utask.done():
+            await _send({"stage": "upscaling",
+                         "message": "Upscaling to full resolution...", "progress": None})
+            try:
+                await asyncio.wait_for(asyncio.shield(utask), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        up = utask.result()
+        if up.get("_error"):
+            return web.Response(status=502, text=up["_error"],
+                                content_type="application/json", charset="utf-8")
+    except Exception as exc:
+        logger.exception("restyle upscale failed")
+        return web.Response(status=500, text=str(exc),
+                            content_type="application/json", charset="utf-8")
 
     up_b64 = up.get("video_base64")
     if not up_b64:
-        return web.json_response(data, status=502)
+        return web.json_response(up, status=502)
     return web.json_response({
         "output_video": up_b64,
         "frames_generated": data.get("frames_generated"),
@@ -531,15 +613,16 @@ async def handle_generic(req: web.Request) -> web.Response:
             pass
 
     await _ev("accepted", {"endpoint": endpoint})
-    await _ev("progress", {"stage": "generating", "message": "Generating...", "progress": None})
 
     _in_flight += 1
     _last_activity = time.monotonic()
     try:
         async with _generation_sem:
             if endpoint == "restyle":
-                out = await _restyle_chain(wm, session, token, body)
+                async def _prog(ev): await _ev("progress", ev)
+                out = await _restyle_chain(wm, session, token, body, progress_cb=_prog)
             else:
+                await _ev("progress", {"stage": "generating", "message": "Generating...", "progress": None})
                 out = await proxy(wm, session, token, worker, endpoint, body)
     except Exception as exc:
         logger.exception("sse %s failed", endpoint)
