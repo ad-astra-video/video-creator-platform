@@ -62,7 +62,14 @@ def build_extend_capability() -> dict:
 # metadata, which go-livepeer caps at 1024 bytes -- with a multi-worker box every worker adds
 # a "{name}_up" flag, so the model_specs budget is tight. 24/48 fps with a trimmed duration set
 # keeps the picker useful while leaving ~150-190 bytes of headroom against the cap.
-_FULL_DURATIONS = [6, 8, 10, 12, 16]
+#
+# Max generation ("Create") duration cap (user-mandated 2026-08): the active runner is a
+# 32 GB RTX 5090, which reliably generates only up to 8 s -- beyond that it OOMs/degrades.
+# Advertise only durations at or below this ceiling so the webapp's DURATION picker never
+# offers a choice the box can't actually run. The runner is the authority; the Worker and
+# frontend forward/surface whatever is advertised here verbatim.
+_MAX_GENERATION_SECONDS = 8.0
+_FULL_DURATIONS = [d for d in [6, 8, 10, 12, 16] if d <= _MAX_GENERATION_SECONDS]
 
 _FPS_TO_DURATIONS = {
     "24": _FULL_DURATIONS,
