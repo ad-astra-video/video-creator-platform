@@ -214,6 +214,7 @@ class FluxKleinEditor:
         """
         self.ensure_loaded()
         import torch
+        from PIL import Image
         from einops import rearrange
         from flux2.sampling import (
             batched_prc_img,
@@ -230,6 +231,16 @@ class FluxKleinEditor:
             width, height = resolve_dims(src_w, src_h, cap)
         else:
             width, height = resolve_dims(width, height, cap)
+
+        # Downscale the SOURCE frame to the resolved dims BEFORE the AE encode.
+        # resolve_dims() only sets the output-latent resolution; if we feed the
+        # original full-res `image` to encode_image_refs() the AE encodes the
+        # whole 1080p frame in one shot, which is what actually OOMs (way more
+        # than the flow forward). Capping the input keeps both the encode and the
+        # denoise within card VRAM.  Output is produced at `width/height`;
+        # upscaling back to the video canvas is the caller's job.
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
 
         # Context: the (distilled) klein model needs only the prompt — no
         # negative / empty pair (guidance_distilled -> `denoise`, not denoise_cfg).
