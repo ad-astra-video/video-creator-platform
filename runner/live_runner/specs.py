@@ -58,23 +58,55 @@ def build_extend_capability() -> dict:
         "max_duration_seconds": table,
     }
 
-# Durations (seconds) offered per fps band. KEPT LEAN: this rides the orchestrator heartbeat
-# metadata, which go-livepeer caps at 1024 bytes -- with a multi-worker box every worker adds
-# a "{name}_up" flag, so the model_specs budget is tight. 24/48 fps with a trimmed duration set
-# keeps the picker useful while leaving ~150-190 bytes of headroom against the cap.
-#
-# Max generation ("Create") duration cap (user-mandated 2026-08): the active runner is a
-# 32 GB RTX 5090, which reliably generates only up to 8 s -- beyond that it OOMs/degrades.
-# Advertise only durations at or below this ceiling so the webapp's DURATION picker never
-# offers a choice the box can't actually run. The runner is the authority; the Worker and
-# frontend forward/surface whatever is advertised here verbatim.
-_MAX_GENERATION_SECONDS = 8.0
-_FULL_DURATIONS = [d for d in [6, 8, 10, 12, 16] if d <= _MAX_GENERATION_SECONDS]
+# Durations (seconds) offered per fps band. KEPT LEAN: this rides the orchestrator
+# heartbeat metadata, which go-livepeer caps at 1024 bytes -- with a multi-worker box
+# every worker adds a "{name}_up" flag, so the model_specs budget is tight. 24/48 fps
+# keeps the picker useful while leaving headroom against the cap.
+_DURATION_CANDIDATES = [4, 6, 8, 10, 12, 16]
 
-_FPS_TO_DURATIONS = {
-    "24": _FULL_DURATIONS,
-    "48": _FULL_DURATIONS,
-}
+# --- Video-create ("Create") duration budget -- VRAM + resolution aware ---
+# The runner is the authority on how many "seconds to generate" it can actually run.
+# During t2v/i2v generation the GPU holds the resident model weights PLUS activations
+# that grow with frames x resolution, so the ceiling is derived from the advertised
+# VRAM and per-resolution latent area -- NOT a hardcoded list (user-mandated 2026-08).
+#
+# Calibration anchor (user-validated): a 32 GB RTX 5090 (fp8 LTX-2.3, ~11 GB resident)
+# generates up to 8 s at its top resolution (1080p) = 192 latent frames at 24 fps.
+# Everything else scales from that reference by activation budget (VRAM minus the
+# constant weights/overhead) and pixel area. A nominal 24 fps sets the seconds budget;
+# both advertised fps bands share the same seconds list (48 fps is an output-rate
+# option, not a doubling of the generation latent's frame count).
+_MODEL_WEIGHTS_MB = 11 * 1024            # fp8 DiT resident during generation
+_BASE_OVERHEAD_MB = 2 * 1024             # CUDA context / allocator pool / conditioning
+_REFERENCE_VRAM_MB = 32 * 1024
+_REFERENCE_RES = "1080p"
+_REFERENCE_SECONDS = 8.0
+_REFERENCE_FPS = 24
+_MIN_GENERATION_SECONDS = 4.0
+_MAX_GENERATION_SECONDS = 16.0           # largest duration we ever advertise
+
+
+def _activation_budget_mb(vram_mb: int) -> float:
+    """VRAM available for activations after the resident weights + fixed overhead."""
+    return max(1.0, vram_mb - _MODEL_WEIGHTS_MB - _BASE_OVERHEAD_MB)
+
+
+def _max_generation_seconds(vram_mb: int, res: str) -> float:
+    """Longest video-create clip this GPU can run at *res* (VRAM/area estimate)."""
+    area = RESOLUTION_DIMS[res][0] * RESOLUTION_DIMS[res][1]
+    ref_w, ref_h = RESOLUTION_DIMS[_REFERENCE_RES]
+    ref_area = ref_w * ref_h
+    ref_frames = _REFERENCE_SECONDS * _REFERENCE_FPS
+    budget_ratio = _activation_budget_mb(vram_mb) / _activation_budget_mb(_REFERENCE_VRAM_MB)
+    max_frames = ref_frames * budget_ratio * (ref_area / area)
+    secs = max_frames / _REFERENCE_FPS
+    return min(_MAX_GENERATION_SECONDS, max(_MIN_GENERATION_SECONDS, secs))
+
+
+def _durations_for(vram_mb: int, res: str) -> list[int]:
+    """Advertised duration options at *res*, capped to the VRAM activation ceiling."""
+    cap = _max_generation_seconds(vram_mb, res)
+    return [d for d in _DURATION_CANDIDATES if d <= cap]
 
 
 def _max_resolution_for_vram(vram_mb: int) -> str:
@@ -101,7 +133,12 @@ def build_model_specs() -> list[dict]:
     resolutions = ordered[: ordered.index(max_res) + 1]
 
     supported = {
-        res: {"fps_to_durations": dict(_FPS_TO_DURATIONS)}
+        res: {
+            "fps_to_durations": {
+                fps: _durations_for(config.GPU_VRAM_MB, res)
+                for fps in ("24", "48")
+            }
+        }
         for res in resolutions
     }
     return [
