@@ -147,7 +147,12 @@ class ResidentWorkerManager:
     async def check_health(self) -> dict:
         """Live /health probe of every worker for heartbeat metadata.
 
-        Returns {<name>_up, warm_model, gemma_model_loaded, pinned_resident}.
+        Returns a SHORTHAND status map (kept tiny for go-livepeer's 1024-byte
+        heartbeat metadata cap): {<short>_up, warm, gmm, pin} where each worker
+        name is reduced to its base token (ltx-worker -> ltx). None of these
+        keys are read by the Worker control plane or the webapp -- they are
+        informational -- so terse keys are safe. ``capabilities``/``model_specs``
+        (the actual contract) are added in server.py, not here.
         """
         up = {name: False for name in self.workers}
         for name in up:
@@ -159,8 +164,8 @@ class ResidentWorkerManager:
         gemma = "gemma-worker"
         gemma_loaded = (gemma in self._pinned_loaded) or (self._current == gemma)
         return {
-            **{f"{name}_up": v for name, v in up.items()},
-            "warm_model": self._current,
-            "gemma_model_loaded": gemma_loaded,
-            "pinned_resident": self.pinned_resident,
+            **{f"{name.split('-', 1)[0]}_up": v for name, v in up.items()},
+            "warm": self._current,
+            "gmm": gemma_loaded,
+            "pin": self.pinned_resident,
         }

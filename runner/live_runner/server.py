@@ -623,9 +623,9 @@ async def on_startup(_app: web.Application) -> None:
             "capabilities": CAPABILITIES,
             "model_specs": _MODEL_SPECS,
             "gpu": gpu_meta,
-            "ltx_worker_up": False,
-            "idv2v_worker_up": False,
-            "warm_model": None,
+            "ltx_up": False,
+            "idv2v_up": False,
+            "warm": None,
         }),
         heartbeat_interval_s=config.HEARTBEAT_INTERVAL_S,
     )

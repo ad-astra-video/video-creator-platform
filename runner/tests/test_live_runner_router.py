@@ -218,8 +218,8 @@ def test_health_reports_gemma_model(fake_workers):
     async def _t():
         await wm.load_pinned()
         meta = await wm.check_health()
-        assert meta["gemma_model_loaded"] is True
-        assert meta["gemma-worker_up"] is True
-        assert "gemma-worker" in meta["pinned_resident"]
+        assert meta["gmm"] is True
+        assert meta["gemma_up"] is True
+        assert "gemma-worker" in meta["pin"]
 
     asyncio.run(_t())
