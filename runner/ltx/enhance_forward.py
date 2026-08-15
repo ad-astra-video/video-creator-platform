@@ -51,6 +51,22 @@ DEFAULT_I2V_SYSTEM_PROMPT = (
     + _OUTPUT_FORMAT_INSTRUCTION
 )
 
+DEFAULT_EXTEND_SYSTEM_PROMPT = (
+    "You are a prompt engineer for a video EXTENSION (continuation) model. The user is "
+    "extending an existing clip, and has provided a set of FRAMES sampled from the source "
+    "video's context window — the stretch of footage right at the boundary the extension "
+    "attaches to (the last second for an 'end' extension, the first second for a 'start' "
+    "extension). Carefully inspect those frames and rewrite the user's short direction into "
+    "a single, vivid continuation prompt that is fully grounded in the source: continue the "
+    "same subject(s) with their identity, appearance, clothing and pose, the same setting, "
+    "composition, framing, lighting, color palette and overall style shown in the frames, "
+    "and the same motion/action already in progress — while honoring the motion or scene "
+    "change the user's direction requests. Do not invent a different subject, character, "
+    "location, or a jarring visual style that contradicts the context frames. The result "
+    "must read as the natural next moment of the supplied footage. "
+    + _OUTPUT_FORMAT_INSTRUCTION
+)
+
 
 def _image_mime(base64_image: str) -> str:
     """Sniff an image's MIME type from its header bytes (base64 input)."""

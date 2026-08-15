@@ -28,7 +28,11 @@ from aiohttp import web
 
 from . import config
 from .model import GemmaLLM
-from runner.ltx.enhance_forward import DEFAULT_I2V_SYSTEM_PROMPT, DEFAULT_T2V_SYSTEM_PROMPT
+from runner.ltx.enhance_forward import (
+    DEFAULT_I2V_SYSTEM_PROMPT,
+    DEFAULT_T2V_SYSTEM_PROMPT,
+    DEFAULT_EXTEND_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger("video_creator.runner.gemma.server")
 
@@ -104,20 +108,50 @@ async def handle_health(_request: web.Request) -> web.Response:
 def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
     """Build the OpenAI-style chat messages for prompt enhancement.
 
-    Mirrors runner.ltx.enhance_forward: a system prompt + either a text user
-    message, or an image+text user message when image_base64 is supplied (the
-    mmproj vision path — only if GEMMA_MMPROJ is configured).
+    Three shapes, mirroring runner.ltx.enhance_forward:
+      - context_frames: a LIST of base64 frames sampled from the source video's context
+        window (the edge an extend continuation attaches to) -> EXTEND system prompt and a
+        multimodal user message with each frame as an image_url part.
+      - image_base64 (single): i2v / image-edit enhancement -> DEFAULT_I2V_SYSTEM_PROMPT
+        with one image_url part.
+      - neither: plain text -> DEFAULT_T2V_SYSTEM_PROMPT.
+
+    A caller-supplied `system_prompt` (body) always overrides the relevant default.
     """
     prompt = str(body.get("prompt") or "").strip()
+    system_prompt = body.get("system_prompt")
+
+    context_frames = body.get("context_frames")
+    if isinstance(context_frames, list) and context_frames:
+        import base64 as _b64
+        user_content: Any = []
+        for frame in context_frames:
+            if not isinstance(frame, str) or not frame:
+                continue
+            head = _b64.b64decode(frame[:64]) if len(frame) >= 64 else b""
+            mime = "image/jpeg" if head[:3] == b"\xff\xd8\xff" else "image/png"
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{frame}"},
+            })
+        direction = str(body.get("direction") or "").strip()
+        dir_note = f" Extend direction: {direction}." if direction else ""
+        user_content.append({
+            "type": "text",
+            "text": f"User Raw Input Prompt: {prompt}.{dir_note}",
+        })
+        system = system_prompt or DEFAULT_EXTEND_SYSTEM_PROMPT
+        return [{"role": "system", "content": system},
+                {"role": "user", "content": user_content}], True
+
     image_b64 = body.get("image_base64")
     has_image = bool(image_b64)
-    system_prompt = body.get("system_prompt")
     if has_image:
         import base64 as _b64
         head = _b64.b64decode(image_b64[:64])
         mime = "image/jpeg" if head[:3] == b"\xff\xd8\xff" else "image/png"
         system = system_prompt or DEFAULT_I2V_SYSTEM_PROMPT
-        user_content: Any = [
+        user_content = [
             {"type": "image_url",
              "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
             {"type": "text", "text": f"User Raw Input Prompt: {prompt}."},
