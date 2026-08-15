@@ -5,6 +5,7 @@ import {
   falGenerateI2I,
   falGenerateT2I,
   makeJobId,
+  pathToBase64,
   postImageToRunnerSSE,
   postRunnerTaskWithTicketSSE,
   resolveRunner,
@@ -246,8 +247,18 @@ export function useGeneration(): UseGenerationReturn {
         if (audioPath) {
           body.audioPath = audioPath
         }
-        if (settings.loras?.length) {
-          body.loras = settings.loras.map(l => ({ ref: l.ref, scale: l.scale }))
+        const lorasArr: Array<Record<string, unknown>> = settings.loras?.length
+          ? settings.loras.map(l => ({ ref: l.ref, scale: l.scale }))
+          : []
+        // Option-A custom LoRA (user-supplied HF URL). Added to the runner loras array as
+        // {custom_url, scale?, hf_token?} — the runner's _resolve_loras downloads it from an
+        // allowlisted https host with the optional token.
+        const customLora = (settings as { customLora?: { url?: string; token?: string; scale?: number } }).customLora
+        if (customLora?.url) {
+          lorasArr.push({ custom_url: customLora.url, scale: customLora.scale ?? 1.0, hf_token: customLora.token || undefined })
+        }
+        if (lorasArr.length) {
+          body.loras = lorasArr
         }
 
         // Direct transport is the ONLY video backend in the webapp (/api/generate is 410 —
@@ -260,13 +271,29 @@ export function useGeneration(): UseGenerationReturn {
         // DIRECT transport: resolve a capable runner (Worker discovery) and do the Livepeer
         // payment handshake + read the resulting media from the runner response.
         if (useDirectTransport) {
-          const runner = await resolveRunner(['t2v'])
+          // Route by conditioning: a start image attached => image-to-video (runner /i2v with the
+          // image bytes), no image => plain t2v. The image MUST be sent as base64 bytes — a remote
+          // worker can't resolve a browser web:// or blob: path, so never send the path for i2v.
+          const isI2V = !!imagePath
+          const runner = await resolveRunner(isI2V ? ['i2v'] : ['t2v'])
           if (!runner) {
-            throw new Error('No available Livepeer runner for video generation')
+            throw new Error(
+              isI2V
+                ? 'No available Livepeer runner for image-to-video generation'
+                : 'No available Livepeer runner for video generation',
+            )
+          }
+          if (isI2V) {
+            const image_b64 = await pathToBase64(imagePath)
+            if (!image_b64) {
+              throw new Error('Could not read the start image for image-to-video generation')
+            }
+            body.image_base64 = image_b64
+            delete body.imagePath
           }
           const res = await postRunnerTaskWithTicketSSE(
             runner,
-            'generate',
+            isI2V ? 'generate-i2v' : 'generate',
             { ...body, jobId: makeJobId() },
             {
               signal: abortController.signal,

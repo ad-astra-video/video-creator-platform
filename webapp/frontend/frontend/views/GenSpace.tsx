@@ -468,6 +468,82 @@ function LoRAPicker({
   )
 }
 
+// Option-A custom LoRA: attach a Hugging Face .safetensors URL (+ optional token + scale).
+// Runner-mode only; the runner downloads it from a hf.co allowlisted host.
+function CustomLoraField({ value, onChange }: {
+  value: { url: string; token: string; scale: number } | null | undefined
+  onChange: (v: { url: string; token: string; scale: number } | null) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [url, setUrl] = useState(value?.url ?? '')
+  const [token, setToken] = useState(value?.token ?? '')
+  const [scale, setScale] = useState(value?.scale ?? 1.0)
+  const [dirty, setDirty] = useState(false)
+
+  const shortUrl = value?.url ? value.url.split('/').slice(-2).join('/') : ''
+  const openEditor = () => {
+    setUrl(value?.url ?? '')
+    setToken(value?.token ?? '')
+    setScale(value?.scale ?? 1.0)
+    setDirty(false)
+    setOpen(o => !o)
+  }
+  const apply = () => {
+    const trimmed = url.trim()
+    if (!trimmed) {
+      onChange(null)
+    } else {
+      onChange({ url: trimmed, token: token.trim(), scale })
+    }
+    setOpen(false)
+    setDirty(false)
+  }
+  return (
+    <div className="relative">
+      <button
+        onClick={openEditor}
+        className="flex items-center gap-1.5 px-2 py-1.5 rounded-md bg-zinc-800/60 text-zinc-300 text-xs hover:bg-zinc-700/60 transition-colors"
+        title="Attach a custom LoRA from a Hugging Face .safetensors URL"
+      >
+        <Sparkles className="h-3.5 w-3.5 flex-shrink-0" />
+        <span className="truncate max-w-[140px]">{value ? `Custom: ${shortUrl}` : 'Custom LoRA'}</span>
+      </button>
+      {open && (
+        <div className="absolute bottom-full mb-1 left-0 z-50 w-80 rounded-md border border-zinc-700 bg-zinc-900 shadow-xl p-3 space-y-2">
+          <div className="text-[10px] uppercase tracking-wide text-zinc-500">Custom LoRA (Hugging Face)</div>
+          <input
+            value={url}
+            onChange={e => { setUrl(e.target.value); setDirty(true) }}
+            placeholder="https://huggingface.co/…/…/model.safetensors"
+            className="w-full px-2 py-1.5 rounded-md bg-zinc-800 border border-zinc-700 text-xs text-zinc-200 placeholder-zinc-500"
+          />
+          <input
+            value={token}
+            onChange={e => { setToken(e.target.value); setDirty(true) }}
+            type="password"
+            placeholder="HF_TOKEN (optional, for private/gated)"
+            className="w-full px-2 py-1.5 rounded-md bg-zinc-800 border border-zinc-700 text-xs text-zinc-200 placeholder-zinc-500"
+          />
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-zinc-400 w-10">Scale</span>
+            <input type="range" min={0} max={2} step={0.05} value={scale}
+              onChange={e => { setScale(parseFloat(e.target.value)); setDirty(true) }} className="flex-1 accent-white" />
+            <span className="text-[10px] text-zinc-400 w-8 text-right">{scale.toFixed(2)}</span>
+          </div>
+          <div className="flex items-center justify-between pt-1">
+            <button onClick={() => { onChange(null); setOpen(false); setDirty(false) }}
+              className="text-[11px] text-zinc-500 hover:text-white">Clear</button>
+            <button onClick={apply} disabled={!url.trim()}
+              className="px-2.5 py-1 rounded-md bg-zinc-700 hover:bg-zinc-600 text-white text-xs disabled:opacity-40">
+              {dirty ? 'Apply' : 'Done'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 type GenSpaceMode = 'image' | 'video' | 'retake' | 'extend' | 'ic-lora' | 'restyle'
 
 // Resolve a selected resolution option key to {width,height}, or undefined for "original"
@@ -519,6 +595,8 @@ function PromptBar({
   availableLoras,
   selectedLoras,
   onSelectedLorasChange,
+  customLora,
+  onCustomLoraChange,
   loraDisplayNames,
   loraCatalogIdsByPath,
   enhanceProviderAvailable,
@@ -578,6 +656,9 @@ function PromptBar({
   availableLoras?: ApiSuccessOf<'listModels'>['models']
   selectedLoras?: LoraSelection[]
   onSelectedLorasChange?: (loras: LoraSelection[]) => void
+  // Option-A custom LoRA (HF URL + optional token + scale), runner-mode.
+  customLora?: { url: string; token: string; scale: number } | null
+  onCustomLoraChange?: (lora: { url: string; token: string; scale: number } | null) => void
   loraDisplayNames?: Map<string, string>
   loraCatalogIdsByPath?: Map<string, string>
   // Whether at least one enhancer provider (local Gemma text encoder or Gemini API) is usable.
@@ -1125,6 +1206,7 @@ function PromptBar({
                     catalogIdsByPath={loraCatalogIdsByPath}
                   />
                 )}
+                <CustomLoraField value={customLora} onChange={onCustomLoraChange ?? (() => {})} />
               </>
             ) : (
               <div className="px-2 py-1.5 rounded-md bg-zinc-800/60 text-zinc-500 text-xs">
@@ -1407,6 +1489,8 @@ export function GenSpace() {
   const isCustomIcLoraEnabled = useCustomIcLoraEnabled()
   const [localLoras, setLocalLoras] = useState<ApiSuccessOf<'listModels'>['models']>([])
   const [selectedLoras, setSelectedLoras] = useState<LoraSelection[]>([])
+  // Option-A custom LoRA: user-supplied HF URL (+ optional token + scale) sent to the runner.
+  const [customLora, setCustomLora] = useState<{ url: string; token: string; scale: number } | null>(null)
   // Installed IC-LoRAs (detected by metadata) for the "Custom IC-LoRA" picker.
   const [installedIcLoras, setInstalledIcLoras] = useState<ApiSuccessOf<'listModels'>['models']>([])
   const [icLoraCustomRef, setIcLoraCustomRef] = useState<string | null>(null)
@@ -2869,6 +2953,8 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           imageSteps: 4,
           // Local LoRA refs are filesystem paths the cloud API can't resolve.
           loras: isLocalMode && selectedLoras.length > 0 ? selectedLoras : undefined,
+          // Option-A custom LoRA (HF URL + optional token) — runner-mode only.
+          customLora: customLora ?? undefined,
       }
       await writeRecoveryContext({
         prompt,
@@ -3454,6 +3540,8 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           availableLoras={localLoras}
           selectedLoras={selectedLoras}
           onSelectedLorasChange={setSelectedLoras}
+          customLora={customLora}
+          onCustomLoraChange={setCustomLora}
           loraDisplayNames={loraDisplayNames}
           loraCatalogIdsByPath={loraCatalogIdsByPath}
           enhanceProviderAvailable={isEnhancerProviderAvailable}
