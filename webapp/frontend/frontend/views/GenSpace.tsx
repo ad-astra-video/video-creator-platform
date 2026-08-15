@@ -2422,7 +2422,11 @@ export function GenSpace() {
 //     first second for 'start');
 //   - retake: the user's SELECTED range ([startTime, startTime+duration]).
 // Returns undefined when the source can't be sampled (falls back to text-only enhance).
-const CONTEXT_FRAMES = 3
+// Sample at CONTEXT_FPS frames per second of the window (3 fps), so a longer retake range
+// yields proportionally more frames. Capped at MAX_CONTEXT_FRAMES so a very long range can't
+// overflow the gemma-worker's multimodal context (n_ctx 8192).
+const CONTEXT_FPS = 3
+const MAX_CONTEXT_FRAMES = 15
 async function sampleContextFrames(
   videoPath: string | null | undefined,
   windowSec: { start: number; end: number },
@@ -2432,10 +2436,12 @@ async function sampleContextFrames(
   const start = Math.max(0, windowSec.start)
   const end = Math.min(videoDuration, windowSec.end)
   if (!(end > start)) return undefined
+  const span = end - start
+  const count = Math.max(1, Math.min(MAX_CONTEXT_FRAMES, Math.round(span * CONTEXT_FPS)))
   const frames: string[] = []
-  for (let i = 0; i < CONTEXT_FRAMES; i++) {
-    const frac = CONTEXT_FRAMES > 1 ? i / (CONTEXT_FRAMES - 1) : 0
-    const seek = start + frac * (end - start)
+  for (let i = 0; i < count; i++) {
+    const frac = count > 1 ? i / (count - 1) : 0
+    const seek = start + frac * span
     try {
       const key = await extractFrame(videoPath, seek, 448, 0.85)
       const b64 = key ? await pathToBase64(key) : null
