@@ -67,6 +67,20 @@ DEFAULT_EXTEND_SYSTEM_PROMPT = (
     + _OUTPUT_FORMAT_INSTRUCTION
 )
 
+DEFAULT_RETAKE_SYSTEM_PROMPT = (
+    "You are a prompt engineer for a video RETAKE (re-render) model. The user is "
+    "re-rendering a selected segment of an existing clip and has provided FRAMES sampled "
+    "from that selected segment. Carefully inspect those frames and rewrite the user's short "
+    "instruction into a single, vivid prompt that re-renders the segment to match the source "
+    "closely: the same subject(s) with their identity, appearance, clothing and pose, the same "
+    "setting, composition, framing, lighting, color palette and style, and the same general "
+    "activity. Change ONLY the one specific thing the user's direction asks to change (for "
+    "example, if a jet is moving erratically, have it straighten out its flight path) and "
+    "leave every other visual element exactly as the frames show. Do not alter anything the "
+    "direction does not explicitly touch. The result must remain visually continuous with the "
+    "supplied frames. "
+    + _OUTPUT_FORMAT_INSTRUCTION
+)
 
 def _image_mime(base64_image: str) -> str:
     """Sniff an image's MIME type from its header bytes (base64 input)."""

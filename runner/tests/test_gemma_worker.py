@@ -146,6 +146,25 @@ def test_build_enhance_messages_context_frames():
     assert "EXTENSION" in msgs[0]["content"]
 
 
+def test_build_enhance_messages_retake_task():
+    """task='retake' + context_frames -> RETAKE system prompt + frames + retake note."""
+    from runner.ltx.enhance_forward import DEFAULT_RETAKE_SYSTEM_PROMPT
+    msgs, has_image = _build_enhance_messages({
+        "prompt": "the jet straightens out its flight path",
+        "context_frames": [_png_1x1_b64()],
+        "task": "retake",
+    })
+    assert has_image is True
+    user = msgs[1]["content"]
+    assert isinstance(user, list)
+    assert any(p["type"] == "image_url" for p in user)
+    text_part = next(p for p in user if p["type"] == "text")["text"]
+    assert "the jet straightens out its flight path" in text_part
+    assert "Task: re-render this selected segment." in text_part
+    assert msgs[0]["content"] == DEFAULT_RETAKE_SYSTEM_PROMPT
+    assert "RETAKE" in msgs[0]["content"]
+
+
 def test_build_enhance_messages_context_empty_text_fallback():
     """Empty/absent context_frames falls through to plain-text enhance (no multimodal)."""
     msgs, has_image = _build_enhance_messages({"prompt": "hello", "context_frames": []})

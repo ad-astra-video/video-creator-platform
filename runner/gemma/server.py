@@ -32,6 +32,7 @@ from runner.ltx.enhance_forward import (
     DEFAULT_I2V_SYSTEM_PROMPT,
     DEFAULT_T2V_SYSTEM_PROMPT,
     DEFAULT_EXTEND_SYSTEM_PROMPT,
+    DEFAULT_RETAKE_SYSTEM_PROMPT,
 )
 
 logger = logging.getLogger("video_creator.runner.gemma.server")
@@ -134,13 +135,19 @@ def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]],
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{frame}"},
             })
-        direction = str(body.get("direction") or "").strip()
-        dir_note = f" Extend direction: {direction}." if direction else ""
+        task = str(body.get("task") or "").strip()
+        if task == "retake":
+            system = system_prompt or DEFAULT_RETAKE_SYSTEM_PROMPT
+            note = " Task: re-render this selected segment."
+        else:
+            # extend (default for context_frames)
+            system = system_prompt or DEFAULT_EXTEND_SYSTEM_PROMPT
+            direction = str(body.get("direction") or "").strip()
+            note = f" Extend direction: {direction}." if direction else ""
         user_content.append({
             "type": "text",
-            "text": f"User Raw Input Prompt: {prompt}.{dir_note}",
+            "text": f"User Raw Input Prompt: {prompt}.{note}",
         })
-        system = system_prompt or DEFAULT_EXTEND_SYSTEM_PROMPT
         return [{"role": "system", "content": system},
                 {"role": "user", "content": user_content}], True
 
