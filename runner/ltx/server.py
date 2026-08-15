@@ -164,29 +164,57 @@ def _get_lora_cache():
 
 
 def _resolve_loras(loras_raw):
-    """Resolve a request's ``[{id, filename?, scale}]`` -> ``[(local_path, scale)]``.
+    """Resolve a request's lora entries -> ``(resolved, custom_paths)``.
 
-    Raises ``_LoraError`` (returned as HTTP 404) for an unknown id/file or when
-    the cache is unavailable. Catalog-only: an id must exist in the catalog.
-    """
+    ``resolved`` is ``[(local_path, scale)]`` for the sampler. Each entry is
+    either:
+
+      - a catalog LoRA ``{id, filename?, scale}`` (must exist in the catalog;
+        unknown id -> ``_LoraError`` -> HTTP 404), or
+      - a custom LoRA ``{custom_url, scale?, sha256?, hf_token?}`` (Option A):
+        downloaded from an allowlisted https URL into a one-shot temp file.
+        ``custom_paths`` holds those temp files so the caller can remove them
+        after generation (and the custom-loader TTL-sweep handles orphans).
+
+    Raises ``_LoraError`` (HTTP 404) for validation/download failures."""
     if not loras_raw:
-        return []
+        return [], []
+    if not isinstance(loras_raw, list):
+        raise _LoraError("'loras' must be a list of {id, filename?, scale} or custom entries")
+    custom = [e for e in loras_raw if isinstance(e, dict) and e.get("custom_url")]
     cache = _get_lora_cache()
+    if cache is None and custom:
+        # Custom downloads don't need a catalog; spin up a custom-only cache so a
+        # bad catalog source doesn't take down the user-LoRA path too.
+        cache = LoraCache(catalog={})
     if cache is None:
         raise _LoraError("LoRA support unavailable on this runner (catalog/cache failed to initialize)")
-    if not isinstance(loras_raw, list):
-        raise _LoraError("'loras' must be a list of {id, filename?, scale} entries")
     out = []
+    custom_paths = []
     for entry in loras_raw:
-        if not isinstance(entry, dict) or not entry.get("id"):
-            raise _LoraError("each 'loras' entry must be {id, filename?, scale}")
+        if not isinstance(entry, dict):
+            raise _LoraError("each 'loras' entry must be an object")
+        scale = float(entry.get("scale", 1.0))
+        if entry.get("custom_url"):
+            try:
+                path = cache.download_custom(
+                    entry["custom_url"],
+                    sha256=entry.get("sha256"),
+                    token=entry.get("hf_token"),
+                )
+            except Exception as exc:
+                raise _LoraError(str(exc))
+            custom_paths.append(path)
+            out.append((path, scale))
+            continue
+        if not entry.get("id"):
+            raise _LoraError("each 'loras' entry must be {id, filename?, scale} or {custom_url,...}")
         try:
             path = cache.ensure(entry["id"], entry.get("filename"))
         except KeyError as exc:
             raise _LoraError(str(exc))
-        scale = float(entry.get("scale", 1.0))
         out.append((path, scale))
-    return out
+    return out, custom_paths
 
 
 # ── Routes ───────────────────────────────────────────────
@@ -219,6 +247,7 @@ async def handle_t2v(req: web.Request) -> web.Response:
     duration = body.get("duration", 5)
     fps = body.get("fps", 24)
     aspect_ratio = body.get("aspectRatio", "16:9")
+    model = str(body.get("model", ""))
 
     # Clamp requested resolution to what the GPU can handle, then resolve size
     if resolution in ("540p", "720p", "1080p"):
@@ -232,13 +261,13 @@ async def handle_t2v(req: web.Request) -> web.Response:
     num_frames = duration * fps
 
     try:
-        loras = _resolve_loras(body.get("loras"))
+        loras, custom_paths = _resolve_loras(body.get("loras"))
     except _LoraError as exc:
         return web.json_response({"error": str(exc)}, status=404)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     try:
-        await _run_generation(engine.generate_t2v, prompt, seed, w, h, num_frames, fps, tmp.name, loras)
+        await _run_generation(engine.generate_t2v, prompt, seed, w, h, num_frames, fps, tmp.name, loras, model)
         b64 = _read_file_b64(tmp.name)
         return web.json_response({
             "video_base64": b64,
@@ -247,6 +276,8 @@ async def handle_t2v(req: web.Request) -> web.Response:
         })
     finally:
         os.unlink(tmp.name)
+        for _p in custom_paths:
+            cache.remove_custom(_p)
 
 
 async def handle_i2v(req: web.Request) -> web.Response:
@@ -260,6 +291,7 @@ async def handle_i2v(req: web.Request) -> web.Response:
     duration = body.get("duration", 5)
     fps = body.get("fps", 24)
     aspect_ratio = body.get("aspectRatio", "16:9")
+    model = str(body.get("model", ""))
 
     res_map = {"540p": (960, 544), "720p": (1280, 704), "1080p": (1920, 1088)}
     # Clamp requested resolution to what the GPU can handle
@@ -273,13 +305,13 @@ async def handle_i2v(req: web.Request) -> web.Response:
     num_frames = duration * fps
 
     try:
-        loras = _resolve_loras(body.get("loras"))
+        loras, custom_paths = _resolve_loras(body.get("loras"))
     except _LoraError as exc:
         return web.json_response({"error": str(exc)}, status=404)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     try:
-        await _run_generation(engine.generate_i2v, prompt, image_base64, seed, w, h, num_frames, fps, tmp.name, loras)
+        await _run_generation(engine.generate_i2v, prompt, image_base64, seed, w, h, num_frames, fps, tmp.name, loras, model)
         b64 = _read_file_b64(tmp.name)
         return web.json_response({
             "video_base64": b64,
@@ -288,6 +320,8 @@ async def handle_i2v(req: web.Request) -> web.Response:
         })
     finally:
         os.unlink(tmp.name)
+        for _p in custom_paths:
+            cache.remove_custom(_p)
 
 
 async def handle_a2v(req: web.Request) -> web.Response:

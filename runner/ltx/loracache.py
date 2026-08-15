@@ -17,12 +17,16 @@ it is unit-testable without torch / ltx / a GPU.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import threading
 import time
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +143,16 @@ class LoraCache:
         self.cache_dir = cache_dir or LORA_CACHE_DIR
         self.budget_bytes = int((size_gb if size_gb is not None else LORA_CACHE_SIZE_GB) * _ONE_GB)
         self._hf_token = hf_token if hf_token is not None else LORA_HF_TOKEN
+        # Operator allowlist for CUSTOM (client-supplied URL) LoRAs — see
+        # config.LORA_ALLOWED_HOSTS. Matched exact or by subdomain.
+        from runner.ltx.config import LORA_ALLOWED_HOSTS, LORA_MAX_CUSTOM_BYTES, LORA_CUSTOM_TTL_SECONDS
+        self._allowed_hosts = LORA_ALLOWED_HOSTS
+        self._max_custom_bytes = LORA_MAX_CUSTOM_BYTES
+        self._custom_ttl = LORA_CUSTOM_TTL_SECONDS
         self._lock = threading.RLock()
         os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self._custom_dir, exist_ok=True)
+        self._sweep_custom()
 
     # -- public ------------------------------------------------------------
 
@@ -180,6 +192,123 @@ class LoraCache:
             size = os.path.getsize(dest)
             logger.info("LoRA %s ready at %s (%.1f MiB)", lora_id, dest, size / (1024 ** 2))
             return dest
+
+    # -- custom (client-supplied URL) LoRAs --------------------------------
+
+    @property
+    def _custom_dir(self) -> str:
+        # Kept OUTSIDE the catalog LRU bookkeeping so custom temp files never
+        # count against LORA_CACHE_SIZE_GB or get evicted mid-generation.
+        return os.path.join(self.cache_dir, "__custom__")
+
+    def download_custom(self, url: str, sha256: str | None = None,
+                        token: str | None = None) -> str:
+        """Safely download a client-supplied LoRA to a temp file and return its path.
+
+        Enforces the custom-LoRA safeguards:
+          - https only, host allowlisted (config.LORA_ALLOWED_HOSTS; exact or subdomain)
+          - path must end in ``.safetensors``
+          - streaming size cap (config.LORA_MAX_CUSTOM_BYTES)
+          - optional sha256 verification
+          - optional per-request HF token (falls back to the runner default)
+
+        The file is one-shot: the caller must remove it with :meth:`remove_custom`
+        after the generation (TTL sweep handles crash leftovers).
+        """
+        url = self._validate_custom_url(url)
+        token = token or self._hf_token
+
+        dest = os.path.join(
+            self._custom_dir,
+            f"c-{secrets.token_hex(8)}.safetensors",
+        )
+        tmp = dest + ".part"
+        import urllib.request as _ur
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            with _ur.urlopen(_ur.Request(url, headers=headers), timeout=60) as resp:
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > self._max_custom_bytes:
+                    raise ValueError(
+                        f"custom LoRA too large ({content_length} bytes > "
+                        f"{self._max_custom_bytes} cap)"
+                    )
+                written = 0
+                digest = hashlib.sha256()
+                with open(tmp, "wb") as fh:
+                    while True:
+                        chunk = resp.read(1024 * 256)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > self._max_custom_bytes:
+                            raise ValueError(
+                                f"custom LoRA exceeds {self._max_custom_bytes}-byte cap "
+                                f"during download"
+                            )
+                        digest.update(chunk)
+                        fh.write(chunk)
+            if written == 0:
+                raise ValueError("custom LoRA download was empty")
+            if sha256:
+                if sha256.lower() != digest.hexdigest().lower():
+                    raise ValueError(
+                        "custom LoRA sha256 mismatch (expected "
+                        f"{sha256.lower()}, got {digest.hexdigest().lower()})"
+                    )
+            os.replace(tmp, dest)
+            self._sweep_custom()
+            logger.info("Custom LoRA ready at %s (%.1f MiB)", dest, written / (1024 ** 2))
+            return dest
+        except Exception:
+            if os.path.isfile(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if os.path.isfile(dest):
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+            raise
+
+    def remove_custom(self, path: str | None) -> None:
+        """Remove a one-shot custom LoRA temp file after generation."""
+        if not path:
+            return
+        try:
+            if os.path.abspath(path).startswith(os.path.abspath(self._custom_dir)) and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _sweep_custom(self) -> None:
+        """Remove orphaned custom-LoRA temp files older than the TTL."""
+        if not os.path.isdir(self._custom_dir):
+            return
+        cut = time.time() - self._custom_ttl
+        for name in os.listdir(self._custom_dir):
+            p = os.path.join(self._custom_dir, name)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cut:
+                    os.remove(p)
+            except OSError:
+                pass
+
+    def _validate_custom_url(self, url: str) -> str:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https":
+            raise ValueError("custom LoRA URL must be https")
+        host = (parsed.hostname or "").lower()
+        if not any(host == h or host.endswith("." + h) for h in self._allowed_hosts):
+            raise ValueError(
+                f"custom LoRA host {host!r} not allowed "
+                f"(allowed: {', '.join(self._allowed_hosts)})"
+            )
+        if not parsed.path.lower().endswith(".safetensors"):
+            raise ValueError("custom LoRA URL must point at a .safetensors file")
+        return url
 
     # -- internals ---------------------------------------------------------
 
@@ -244,7 +373,12 @@ class LoraCache:
             pass
 
     def _cached_files(self):
+        custom = os.path.abspath(self._custom_dir)
         for root, _dirs, files in os.walk(self.cache_dir):
+            # Custom one-shot LoRAs live outside the catalog budget (they're
+            # removed after use / TTL-swept), so exclude them from LRU accounting.
+            if os.path.abspath(root).startswith(custom):
+                continue
             for f in files:
                 yield os.path.join(root, f)
 
