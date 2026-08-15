@@ -30,6 +30,7 @@ function fetchWithTimeout(ms: number): RequestInit['signal'] {
 // so the browser can POST to the runner directly).
 const TASK_ENDPOINTS: Record<string, string> = {
   generate: '/video-creator/v1/t2v',
+  'generate-i2v': '/video-creator/v1/i2v',
   'generate-image': '/video-creator/v1/image',
   'enhance-prompt': '/video-creator/v1/prompt-enhance',
   extend: '/video-creator/v1/extend',
@@ -615,8 +616,9 @@ export async function enhancePromptViaRunner(
     } catch { /* keep status message */ }
     throw new Error(msg)
   }
-  const data = (await res.json().catch(() => null)) as { enhancedPrompt?: unknown; prompt?: unknown } | null
-  const enhanced = data?.enhancedPrompt ?? data?.prompt
+  const data = (await res.json().catch(() => null)) as
+    | { enhanced_prompt?: unknown; enhancedPrompt?: unknown; prompt?: unknown } | null
+  const enhanced = data?.enhanced_prompt ?? data?.enhancedPrompt ?? data?.prompt
   if (typeof enhanced === 'string' && enhanced.trim()) return enhanced
   throw new Error('Enhance completed without a rewritten prompt')
 }

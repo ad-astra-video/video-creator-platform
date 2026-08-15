@@ -10,7 +10,7 @@ import type { GenSpaceRetakeSource } from '../contexts/ProjectContext'
 import { useAppSettings } from '../contexts/AppSettingsContext'
 import { useGeneration, GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
 import { setActiveGenerationOwner, hasValidBaselineId } from '../lib/generation-recovery'
-import { resolveRunner, enhancePromptViaRunner } from '../lib/direct-transport'
+import { resolveRunner, enhancePromptViaRunner, pathToBase64 } from '../lib/direct-transport'
 import { withGenerationActive } from '../lib/generation-active'
 import { useVideoGenerationModelSpecs } from '../hooks/use-video-generation-model-specs'
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
@@ -591,7 +591,7 @@ function PromptBar({
   // The dropdown is only rendered when this is passed — the parent omits it (locking the
   // button to whichever single option works) unless both a local Gemma checkpoint and a
   // Gemini API key are available.
-  enhanceProvider?: 'local' | 'api'
+  enhanceProvider?: 'local' | 'api' | 'runner'
   onEnhanceProviderChange?: (provider: 'local' | 'api') => void
   canUndoPrompt?: boolean
   onUndoPrompt?: () => void
@@ -2437,6 +2437,14 @@ export function GenSpace() {
     // video (icLoraInput.videoPath), never this, so a leftover inputImage from an earlier
     // image-mode/i2v session must not leak into an IC-LoRA (or plain t2v) enhance call.
     const imagePathForEnhance = mode === 'image' || mode === 'video' ? inputImage ?? undefined : undefined
+    // The runner's prompt-enhance worker grounds the rewrite in the reference image ONLY when it
+    // receives the actual image bytes as `image_base64` (a browser web:// path is unreadable
+    // remotely, so forwarding just image_path makes the worker fall through to a generic t2v
+    // rewrite, ignoring the image). Resolve the i2v/image reference to base64 here and send it along.
+    let imageBase64: string | undefined
+    if (imagePathForEnhance) {
+      imageBase64 = (await pathToBase64(imagePathForEnhance)) ?? undefined
+    }
 
     // Local-provider Enhance runs the same GIL-holding Gemma text encoder as local video/image
     // generation (see electron/python-backend.ts) — needs the same liveness-kill suppression.
@@ -2455,6 +2463,7 @@ export function GenSpace() {
             ic_lora_id: mode === 'ic-lora' ? selectedIcLoraId ?? undefined : undefined,
             conditioning_type: conditioningType,
             image_path: imagePathForEnhance,
+            image_base64: imageBase64,
             provider: enhanceProvider,
             media_type: mode === 'image' ? 'image' : 'video',
           })
