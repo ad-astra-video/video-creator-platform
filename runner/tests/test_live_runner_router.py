@@ -1,8 +1,9 @@
 """GPU-independent tests for the live-runner swap policy + routing.
 
 Covers the ResidentWorkerManager evict-before-load invariant (only one worker
-resident at a time) and the capability->worker route table. Uses an in-memory
-fake transport — no aiohttp server, no GPU, no gateway SDK required.
+resident at a time), the capability->worker route table, and the prompt-enhance
+fallback (gemma-worker -> LTX text encoder). Uses an in-memory fake transport —
+no aiohttp server, no GPU, no gateway SDK required.
 """
 
 import asyncio
@@ -223,3 +224,151 @@ def test_health_reports_gemma_model(fake_workers):
         assert "gemma-worker" in meta["pin"]
 
     asyncio.run(_t())
+
+
+# ── Prompt-enhance fallback: gemma-worker -> LTX text encoder ─────────────────
+
+def test_candidate_workers_only_prompt_enhance_has_fallback():
+    from runner.live_runner.routing import candidate_workers
+    # prompt-enhance prefers the dedicated gemma-worker, falls back to ltx-worker
+    # (the LTX pipeline's own Gemma text encoder).
+    assert candidate_workers("prompt-enhance", "gemma-worker") == [
+        "gemma-worker", "ltx-worker"]
+    # Everything else is single-worker (no fallback, unchanged behaviour).
+    for ep in ("t2v", "i2v", "restyle", "extend", "retake", "chat", "image"):
+        assert candidate_workers(ep, "ltx-worker") == ["ltx-worker"]
+        assert candidate_workers(ep, "idv2v-worker") == ["idv2v-worker"]
+    # A prompt-enhance NOT routed to gemma-worker also gets no fallback loop.
+    assert candidate_workers("prompt-enhance", "ltx-worker") == ["ltx-worker"]
+
+
+class _FakeResp:
+    """aiohttp-style response object usable inside `async with`."""
+
+    def __init__(self, status, body=b'{"enhanced_prompt":"rewritten"}'):
+        self.status = status
+        self._body = body
+        self.content_type = "application/json"
+        self.charset = "utf-8"
+
+    async def read(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeSession:
+    """Mimics aiohttp ClientSession: post() returns a SYNC context manager whose
+    __aenter__ either raises (worker down), returns an error response (>=400),
+    or returns a success response."""
+
+    def __init__(self):
+        self.by_host = {}   # host -> status int | Exception instance
+        self.seen = []
+
+    def post(self, url, **_kw):
+        host = url.split("//")[1].split(":")[0]
+        self.seen.append(host)
+        entry = self.by_host[host]
+
+        class _CM:
+            def __init__(self, entry):
+                self._entry = entry
+
+            async def __aenter__(self):
+                if isinstance(self._entry, Exception):
+                    raise self._entry
+                if 400 <= self._entry <= 599:
+                    return _FakeResp(self._entry, b'{"error":"bad"}')
+                return _FakeResp(self._entry)
+
+            async def __aexit__(self, *a):
+                return False
+
+        return _CM(entry)
+
+
+class _FakeWM:
+    def __init__(self):
+        self.ensured = []
+
+    async def ensure(self, name):
+        self.ensured.append(name)
+
+
+def _patch_workers():
+    from runner.live_runner import config as cfg
+    old = dict(cfg.WORKERS)
+    cfg.WORKERS = {"gemma-worker": "http://gemma-worker:8993",
+                   "ltx-worker": "http://ltx-worker:8991"}
+    return cfg, old
+
+
+def test_proxy_falls_back_when_gemma_worker_down():
+    """proxy() must route prompt-enhance to ltx-worker when gemma-worker is
+    unreachable, so the LTX pipeline text encoder is used as the fallback."""
+    from runner.live_runner.routing import proxy
+    cfg, old = _patch_workers()
+    try:
+        sess = _FakeSession()
+        # gemma-worker container down -> connection error -> must fall back.
+        sess.by_host = {"gemma-worker": ConnectionError("gemma down"),
+                        "ltx-worker": 200}
+        wm = _FakeWM()
+        resp = asyncio.run(proxy(wm, sess, "tok", "gemma-worker",
+                                 "prompt-enhance", {"prompt": "hi"}))
+        assert resp.status == 200, resp
+        assert sess.seen == ["gemma-worker", "ltx-worker"], sess.seen
+        assert wm.ensured == ["gemma-worker", "ltx-worker"]
+        assert b"enhanced_prompt" in resp.body
+    finally:
+        cfg.WORKERS = old
+
+
+def test_proxy_falls_back_when_gemma_errors():
+    """Even an HTTP error from gemma-worker (up but failing) falls back to the
+    LTX text encoder rather than surfacing a hard failure."""
+    from runner.live_runner.routing import proxy
+    cfg, old = _patch_workers()
+    try:
+        sess = _FakeSession()
+        sess.by_host = {"gemma-worker": 503, "ltx-worker": 200}
+        resp = asyncio.run(proxy(_FakeWM(), sess, "tok", "gemma-worker",
+                                 "prompt-enhance", {"prompt": "hi"}))
+        assert resp.status == 200
+        assert sess.seen == ["gemma-worker", "ltx-worker"]
+    finally:
+        cfg.WORKERS = old
+
+
+def test_proxy_uses_gemma_only_when_available():
+    """When gemma-worker is up, prompt-enhance must NOT touch ltx-worker at all."""
+    from runner.live_runner.routing import proxy
+    cfg, old = _patch_workers()
+    try:
+        sess = _FakeSession()
+        sess.by_host = {"gemma-worker": 200}
+        resp = asyncio.run(proxy(_FakeWM(), sess, "tok", "gemma-worker",
+                                 "prompt-enhance", {"prompt": "hi"}))
+        assert resp.status == 200
+        assert sess.seen == ["gemma-worker"], sess.seen
+    finally:
+        cfg.WORKERS = old
+
+
+def test_proxy_reports_error_when_all_candidates_fail():
+    from runner.live_runner.routing import proxy
+    cfg, old = _patch_workers()
+    try:
+        sess = _FakeSession()
+        sess.by_host = {"gemma-worker": 503, "ltx-worker": 502}
+        resp = asyncio.run(proxy(_FakeWM(), sess, "tok", "gemma-worker",
+                                 "prompt-enhance", {"prompt": "hi"}))
+        assert resp.status >= 500
+        assert sess.seen == ["gemma-worker", "ltx-worker"]
+    finally:
+        cfg.WORKERS = old

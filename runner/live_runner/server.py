@@ -26,7 +26,7 @@ from livepeer_gateway.live_runner import (
 )
 
 from . import config
-from .routing import CAPABILITIES, ROUTES, proxy
+from .routing import CAPABILITIES, ROUTES, candidate_workers, proxy
 from .specs import build_model_specs
 from .swap import HttpWorkerTransport, ResidentWorkerManager
 
@@ -529,9 +529,7 @@ async def _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body)
     """
     worker = ROUTES[task_type]
     headers = {"X-Worker-Token": token}
-    base = config.WORKERS[worker]
-    await wm.ensure(worker)
-    url = f"{base}/video-creator/v1/{task_type}"
+    candidates = candidate_workers(task_type, worker)
     async def _send(ev: dict) -> None:
         if ws.closed:
             return
@@ -541,21 +539,31 @@ async def _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body)
         except Exception:
             pass
     await _send({"stage": "generating", "message": "Generating...", "progress": None})
-    try:
-        async with session.post(url, json=body, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
-            if r.status >= 400:
-                text = (await r.read())[:500].decode("utf-8", "replace")
-                if not ws.closed:
-                    await ws.send_json({"type": "error", "request_id": request_id,
-                                        "job_id": job_id, "error": text})
-                return
-            data = await r.json()
-    except Exception as exc:
-        logger.exception("ws proxy %s failed", task_type)
+    last_err: str | None = None
+    data: dict | None = None
+    for index, target in enumerate(candidates):
+        try:
+            base = config.WORKERS[target]
+            await wm.ensure(target)
+            url = f"{base}/video-creator/v1/{task_type}"
+            async with session.post(url, json=body, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
+                if r.status >= 400:
+                    last_err = (await r.read())[:500].decode("utf-8", "replace")
+                    logger.warning("Worker %s/%s -> %s: %s", target, task_type, r.status, last_err)
+                    continue
+                data = await r.json()
+            break
+        except Exception as exc:
+            last_err = str(exc)
+            logger.warning("Worker %s/%s failed (%s)%s", target, task_type, exc,
+                           " - falling back" if index < len(candidates) - 1 else "")
+            data = None
+    if data is None:
         if not ws.closed:
             await ws.send_json({"type": "error", "request_id": request_id,
-                                "job_id": job_id, "error": str(exc)})
+                                "job_id": job_id,
+                                "error": last_err or f"{task_type} failed on all workers"})
         return
     await _send({"stage": "finalizing", "message": "Finalizing output...", "progress": None})
     if not ws.closed:
