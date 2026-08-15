@@ -11,6 +11,7 @@ import { useAppSettings } from '../contexts/AppSettingsContext'
 import { useGeneration, GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
 import { setActiveGenerationOwner, hasValidBaselineId } from '../lib/generation-recovery'
 import { resolveRunner, enhancePromptViaRunner, pathToBase64 } from '../lib/direct-transport'
+import { extractFrame } from '../lib/runtime/web-store'
 import { withGenerationActive } from '../lib/generation-active'
 import { useVideoGenerationModelSpecs } from '../hooks/use-video-generation-model-specs'
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
@@ -1391,7 +1392,8 @@ export function GenSpace() {
   // generation runs locally or via the LTX API. If no catalog LoRA is selected (e.g. because the
   // LoRA picker is local-only), it just falls back to a generic rewrite. "retake"/"extend" have
   // no prompt input, so they're excluded.
-  const enhanceAvailableForMode = mode === 'video' || mode === 'ic-lora' || mode === 'image'
+  const enhanceAvailableForMode =
+    mode === 'video' || mode === 'ic-lora' || mode === 'image' || mode === 'extend'
   // The prompt enhancer can run the local Gemma text encoder OR Gemini's hosted API — this hook
   // tracks which of those is actually available (not just which the user prefers) and picks
   // whichever provider Enhance should use. Refetched whenever the user is in a mode the button
@@ -2413,7 +2415,37 @@ export function GenSpace() {
     setPrompt(enhancedPrompt)
   }, [promptHistory, historyIndex])
 
-  const runEnhance = useCallback(async (sourcePrompt: string) => {
+  
+// Sample up to N low-res frames from the 1s CONTEXT window of the source clip that an
+// extend continuation attaches to (the LAST second for an 'end' extension, the FIRST
+// second for a 'start' extension). Returns base64 jpegs to send to the gemma-worker's
+// multimodal enhance, or undefined when the source can't be sampled (falls back to a
+// text-only enhance of the direction).
+const EXTEND_CONTEXT_FRAMES = 3
+const EXTEND_CONTEXT_SECONDS = 1.0
+async function sampleContextFrames(
+  videoPath: string | null | undefined,
+  videoDuration: number,
+  direction: ExtendDirection,
+): Promise<string[] | undefined> {
+  if (!videoPath || !(videoDuration > 0)) return undefined
+  const startSec = direction === 'start' ? 0 : Math.max(0, videoDuration - EXTEND_CONTEXT_SECONDS)
+  const frames: string[] = []
+  for (let i = 0; i < EXTEND_CONTEXT_FRAMES; i++) {
+    const frac = EXTEND_CONTEXT_FRAMES > 1 ? i / (EXTEND_CONTEXT_FRAMES - 1) : 0
+    const seek = Math.min(startSec + frac * EXTEND_CONTEXT_SECONDS, videoDuration)
+    try {
+      const key = await extractFrame(videoPath, seek, 448, 0.85)
+      const b64 = key ? await pathToBase64(key) : null
+      if (b64) frames.push(b64)
+    } catch {
+      // a single failed frame shouldn't abort the whole enhance — skip it
+    }
+  }
+  return frames.length ? frames : undefined
+}
+
+const runEnhance = useCallback(async (sourcePrompt: string) => {
     if (isEnhancingPrompt) return
     setIsEnhancingPrompt(true)
     setEnhancePromptError(null)
@@ -2446,6 +2478,18 @@ export function GenSpace() {
       imageBase64 = (await pathToBase64(imagePathForEnhance)) ?? undefined
     }
 
+    // Extend mode: ground the enhance in the 1s CONTEXT window of the source clip the
+    // continuation attaches to (last second for 'end', first second for 'start'). Sample a
+    // few low-res frames and send them to the gemma-worker's multimodal enhance.
+    let contextFrames: string[] | undefined
+    let extendDir: ExtendDirection | undefined
+    if (mode === 'extend') {
+      extendDir = extendDirection
+      contextFrames = await sampleContextFrames(
+        extendInput.videoPath, extendInput.videoDuration, extendDir,
+      )
+    }
+
     // Local-provider Enhance runs the same GIL-holding Gemma text encoder as local video/image
     // generation (see electron/python-backend.ts) — needs the same liveness-kill suppression.
     // DIRECT transport: when Livepeer is configured with a capable runner, route prompt
@@ -2464,6 +2508,8 @@ export function GenSpace() {
             conditioning_type: conditioningType,
             image_path: imagePathForEnhance,
             image_base64: imageBase64,
+            context_frames: contextFrames,
+            direction: extendDir,
             provider: enhanceProvider,
             media_type: mode === 'image' ? 'image' : 'video',
           })
@@ -2500,7 +2546,7 @@ export function GenSpace() {
     logger.info('Enhance request succeeded, clearing recovery marker')
     localStorage.removeItem(GENERATION_RECOVERY_KEY)
     applyEnhanceResult(sourcePrompt, result.data.enhancedPrompt)
-  }, [isEnhancingPrompt, mode, selectedLoras, selectedIcLoraId, icLoraCondType, inputImage, enhanceProvider, applyEnhanceResult, writeRecoveryContext])
+  }, [isEnhancingPrompt, mode, selectedLoras, selectedIcLoraId, icLoraCondType, inputImage, extendInput, extendDirection, enhanceProvider, applyEnhanceResult, writeRecoveryContext])
 
   const handleEnhancePrompt = useCallback(() => {
     if (!canEnhancePrompt) return
