@@ -118,7 +118,7 @@ export function ICLoraPanel({
   const [downloadSessionId, setDownloadSessionId] = useState<string | null>(null)
   const [extractError, setExtractError] = useState<string | null>(null)
   const [isDragOver, setIsDragOver] = useState(false)
-  const icLoraReady = requiredIcLoraCpIds.length === 0
+  const icLoraReady = (requiredIcLoraCpIds ?? []).length === 0
 
   // Switching to an entry with a different input.kind (image vs video) invalidates the loaded
   // input — clear it so a stale video can't be submitted to an image-input entry (backend 400).
@@ -173,8 +173,14 @@ export function ICLoraPanel({
     }
 
     const recommendationPayload = result.data
-    setRequiredIcLoraCpIds(recommendationPayload.cps_to_download)
-    const isReady = recommendationPayload.cps_to_download.length === 0
+    // The local backend always returns cps_to_download, but in the web/LTX-API path this
+    // endpoint can succeed with a payload that omits it. Default to [] so we never set state
+    // to undefined (which later crashes on `.length` and blanks the panel).
+    const requiredCps: ModelCheckpointID[] = Array.isArray(recommendationPayload?.cps_to_download)
+      ? recommendationPayload.cps_to_download
+      : []
+    setRequiredIcLoraCpIds(requiredCps)
+    const isReady = requiredCps.length === 0
 
     if (isReady) {
       setIsDownloadingIcLora(false)
