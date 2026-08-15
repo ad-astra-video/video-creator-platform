@@ -1393,7 +1393,7 @@ export function GenSpace() {
   // LoRA picker is local-only), it just falls back to a generic rewrite. "retake"/"extend" have
   // no prompt input, so they're excluded.
   const enhanceAvailableForMode =
-    mode === 'video' || mode === 'ic-lora' || mode === 'image' || mode === 'extend'
+    mode === 'video' || mode === 'ic-lora' || mode === 'image' || mode === 'extend' || mode === 'retake'
   // The prompt enhancer can run the local Gemma text encoder OR Gemini's hosted API — this hook
   // tracks which of those is actually available (not just which the user prefers) and picks
   // whichever provider Enhance should use. Refetched whenever the user is in a mode the button
@@ -2416,24 +2416,26 @@ export function GenSpace() {
   }, [promptHistory, historyIndex])
 
   
-// Sample up to N low-res frames from the 1s CONTEXT window of the source clip that an
-// extend continuation attaches to (the LAST second for an 'end' extension, the FIRST
-// second for a 'start' extension). Returns base64 jpegs to send to the gemma-worker's
-// multimodal enhance, or undefined when the source can't be sampled (falls back to a
-// text-only enhance of the direction).
-const EXTEND_CONTEXT_FRAMES = 3
-const EXTEND_CONTEXT_SECONDS = 1.0
+// Sample up to N low-res frames across an arbitrary video window [start,end] (seconds)
+// and return them as base64 jpegs for the gemma-worker's multimodal enhance. Used by:
+//   - extend: the 1s CONTEXT window the continuation attaches to (last second for 'end',
+//     first second for 'start');
+//   - retake: the user's SELECTED range ([startTime, startTime+duration]).
+// Returns undefined when the source can't be sampled (falls back to text-only enhance).
+const CONTEXT_FRAMES = 3
 async function sampleContextFrames(
   videoPath: string | null | undefined,
+  windowSec: { start: number; end: number },
   videoDuration: number,
-  direction: ExtendDirection,
 ): Promise<string[] | undefined> {
   if (!videoPath || !(videoDuration > 0)) return undefined
-  const startSec = direction === 'start' ? 0 : Math.max(0, videoDuration - EXTEND_CONTEXT_SECONDS)
+  const start = Math.max(0, windowSec.start)
+  const end = Math.min(videoDuration, windowSec.end)
+  if (!(end > start)) return undefined
   const frames: string[] = []
-  for (let i = 0; i < EXTEND_CONTEXT_FRAMES; i++) {
-    const frac = EXTEND_CONTEXT_FRAMES > 1 ? i / (EXTEND_CONTEXT_FRAMES - 1) : 0
-    const seek = Math.min(startSec + frac * EXTEND_CONTEXT_SECONDS, videoDuration)
+  for (let i = 0; i < CONTEXT_FRAMES; i++) {
+    const frac = CONTEXT_FRAMES > 1 ? i / (CONTEXT_FRAMES - 1) : 0
+    const seek = start + frac * (end - start)
     try {
       const key = await extractFrame(videoPath, seek, 448, 0.85)
       const b64 = key ? await pathToBase64(key) : null
@@ -2478,15 +2480,31 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       imageBase64 = (await pathToBase64(imagePathForEnhance)) ?? undefined
     }
 
-    // Extend mode: ground the enhance in the 1s CONTEXT window of the source clip the
-    // continuation attaches to (last second for 'end', first second for 'start'). Sample a
-    // few low-res frames and send them to the gemma-worker's multimodal enhance.
+    // Extend/Retake mode: ground the enhance in the source clip via sampled frames sent to the
+    // gemma-worker's multimodal enhance. Extend samples the 1s CONTEXT window the continuation
+    // attaches to (last second for 'end', first second for 'start'); retake samples the user's
+    // SELECTED range ([startTime, startTime+duration]) so the re-render keeps everything else
+    // the same while changing only what the direction asks.
     let contextFrames: string[] | undefined
     let extendDir: ExtendDirection | undefined
+    let enhanceTask: 'extend' | 'retake' | undefined
     if (mode === 'extend') {
       extendDir = extendDirection
+      enhanceTask = 'extend'
+      const wStart = extendDirection === 'start'
+        ? 0
+        : Math.max(0, extendInput.videoDuration - 1.0)
       contextFrames = await sampleContextFrames(
-        extendInput.videoPath, extendInput.videoDuration, extendDir,
+        extendInput.videoPath,
+        { start: wStart, end: wStart + 1.0 },
+        extendInput.videoDuration,
+      )
+    } else if (mode === 'retake') {
+      enhanceTask = 'retake'
+      contextFrames = await sampleContextFrames(
+        retakeInput.videoPath,
+        { start: retakeInput.startTime, end: retakeInput.startTime + retakeInput.duration },
+        retakeInput.videoDuration,
       )
     }
 
@@ -2510,6 +2528,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             image_base64: imageBase64,
             context_frames: contextFrames,
             direction: extendDir,
+            task: enhanceTask,
             provider: enhanceProvider,
             media_type: mode === 'image' ? 'image' : 'video',
           })
@@ -2546,7 +2565,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     logger.info('Enhance request succeeded, clearing recovery marker')
     localStorage.removeItem(GENERATION_RECOVERY_KEY)
     applyEnhanceResult(sourcePrompt, result.data.enhancedPrompt)
-  }, [isEnhancingPrompt, mode, selectedLoras, selectedIcLoraId, icLoraCondType, inputImage, extendInput, extendDirection, enhanceProvider, applyEnhanceResult, writeRecoveryContext])
+  }, [isEnhancingPrompt, mode, selectedLoras, selectedIcLoraId, icLoraCondType, inputImage, extendInput, extendDirection, retakeInput, enhanceProvider, applyEnhanceResult, writeRecoveryContext])
 
   const handleEnhancePrompt = useCallback(() => {
     if (!canEnhancePrompt) return
