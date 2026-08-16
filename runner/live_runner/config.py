@@ -34,6 +34,13 @@ GPU_COUNT = int(os.environ.get("GPU_COUNT", "3"))
 # The GPU the gemma-worker loads on at startup and STAYS resident on. The
 # scheduler holds this GPU out of the task pool (marks it resident for gemma).
 GEMMA_RESIDENT_GPU = int(os.environ.get("GEMMA_RESIDENT_GPU", "0"))
+# The GPU the legacy video workers (ltx-worker + idv2v-worker) are HARDCODED to
+# (their GPU_DEVICE env). They are NOT device-aware and cannot be steered by the
+# scheduler, so this card is RESERVED for them and never handed to a
+# device-aware worker (image-worker / gemma). Without this the image model can
+# co-resident on the video card and OOM the next video generation (GPU 0 for
+# both, run out of vram).
+VIDEO_GPU = int(os.environ.get("VIDEO_GPU", "0"))
 # How long a task waits FIFO for a GPU to free up before timing out with 503.
 SCHEDULER_QUEUE_TIMEOUT_S = float(os.environ.get("SCHEDULER_QUEUE_TIMEOUT_S", "600.0"))
 

@@ -7,9 +7,10 @@ at `docker run` time).
 
 | Worker | Folder | Role |
 |--------|--------|------|
-| `live-runner` | `live_runner/` | Edge that registers + heartbeats to a Livepeer Orchestrator and routes to one resident worker |
+| `live-runner` | `live_runner/` | Edge that registers + heartbeats to a Livepeer Orchestrator, owns the multi-GPU allocation policy, and routes to the workers |
 | `ltx-worker` | `ltx/` | LTX-2.3 video generation (T2V / I2V / extend / retake) — documented below |
 | `idv2v-worker` | `idv2v/` | Wan I2V-14B restyle / masked edit |
+| `image-worker` | `image/` | Z-Image / FLUX.2 (Klein) image generation |
 | `gemma-worker` | `gemma/` | Local prompt enhancement (Gemma) |
 
 The Docker images are defined by the Dockerfiles in [`docker/`](docker/), kept
@@ -48,10 +49,11 @@ The mode is picked automatically from detected VRAM (mirroring LTX-Desktop's
 
 ```
 Video-Creator (Electron client)
-  └── requests → Livepeer Orchestrator → live-runner → resident worker
-                                                     ├── ltx-worker (LTX-2.3)
-                                                     ├── idv2v-worker (Wan)
-                                                     └── gemma-worker (enhance)
+  └── requests → Livepeer Orchestrator → live-runner (GPU scheduler)
+                                          ├── ltx-worker (LTX-2.3)   → video GPU
+                                          ├── idv2v-worker (Wan)     → video GPU
+                                          ├── image-worker (Z-Image/Klein) → a free GPU
+                                          └── gemma-worker (enhance) → resident GPU
 ```
 
 The runner:
@@ -59,6 +61,63 @@ The runner:
 2. `live-runner` registers with a Livepeer Orchestrator via `register_runner()`
 3. The LTX worker exposes HTTP endpoints for video generation (T2V, I2V, A2V)
 4. Receives inference requests from the Orchestrator (proxied from the client / Livepeer)
+
+## GPU allocation (multi-GPU scheduling)
+
+The **live-runner owns the GPU map** for every worker container. Each worker
+container is launched with `--gpus all` (all physical GPUs visible,
+`CUDA_VISIBLE_DEVICES` unset); the live-runner's scheduler decides which single
+GPU each task runs on and tells the device-aware workers via the `device` field
+in `/load`. The goal is to **keep every GPU busy and every warm model resident**
+so nothing ever cold-reloads and two models never share one GPU's VRAM.
+
+### Policy (in `live_runner/scheduler.py`)
+
+When a generation task arrives for a worker, the scheduler places it in this
+order:
+
+1. **Reuse if already warm** — if that worker's model is already loaded on some
+   GPU, route the task back to that same card (no reload).
+2. **Use a free GPU and leave it warm** — otherwise, if any GPU currently has
+   nothing resident, allocate the task there and keep the model warm on it.
+   This is what spreads image and video generation across different GPUs.
+3. **LRU-evict only when nothing is free** — only when EVERY GPU already holds a
+   warm model, evict the **least-recently-used** warm model that the incoming
+   task does NOT need, and hand its GPU over.
+
+Eviction is **VRAM-safe**: the scheduler POSTs `/evict` to the evicted worker
+(which frees the old model's VRAM) *before* the new model loads, so two models
+never transiently co-reside — this is the fix for the image-then-video OOM,
+which was a placement bug (both landing on GPU 0), not a VRAM-capacity limit.
+
+Two subtle behaviors matter for operators:
+
+- **Video workers are pinned.** `ltx-worker` and `idv2v-worker` build their
+  engine once at startup on a hardcoded `GPU_DEVICE` and ignore `device` in
+  `/load`, so the scheduler always routes them to `VIDEO_GPU` (a dedicated
+  "video card"). When a video task needs that card, the scheduler **evicts**
+  whatever else is warm there first.
+- **Image avoids the video card when another GPU is free.** `image-worker` is
+  device-aware, so it lands on a *different* card unless that's the only free
+  one — meaning a video gen right after an image gen never collides. Because
+  models stay warm resident, the map is reconciled from each worker's `/info`
+  (`device_in_use`) at every heartbeat, so a crashed/restarted worker
+  self-heals. A dead worker's slot is freed automatically; gemma's pinned card
+  is never touched by eviction.
+
+### Verification
+
+`GET /video-creator/v1/scheduler/status` (with the `X-Worker-Token` header)
+returns the live GPU map, e.g.:
+
+```json
+{"gpu_count":3,"gemma_resident_gpu":2,"gpus":[
+  {"gpu_id":0,"worker":"image-worker","state":"busy","resident":true},
+  {"gpu_id":1,"worker":null,"state":"idle","resident":false},
+  {"gpu_id":2,"worker":"gemma-worker","state":"busy","resident":true}]}
+```
+
+`resident:true` means the model is warm in VRAM on that card.
 
 ## Quick Start (node operator)
 
@@ -115,6 +174,12 @@ docker compose -f runner/docker/docker-compose.video-creator.yml up  # live-runn
 | MAX_BODY_BYTES | No | 3000000000 | Max aiohttp request body size (matches go-livepeer's 3GB cap) |
 | ZIMAGE_MODEL_DIR | No | /models/zimage | Directory for Z-Image-Turbo image-generation models |
 | ZIMAGE_DTYPE | No | bf16 | bf16 (default repo) or fp8 (single-file Comfy checkpoint) |
+| GPU_COUNT | No | 3 | Number of physical GPUs the live-runner's scheduler manages |
+| VIDEO_GPU | No | 0 | Dedicated card for the pinned video workers (`ltx-worker`, `idv2v-worker`); their `/load` ignores `device`, so the scheduler always routes them here and evicts anything else warm on it first |
+| GEMMA_RESIDENT_GPU | No | 0 | GPU where the Gemma prompt-enhancer is pinned resident (held out of the task pool; the box sets this to `2`) |
+| GEMMA_IDLE_GRACE_S | No | 20 | How long Gemma stays resident after its last use before it may be evicted |
+| SCHEDULER_QUEUE_TIMEOUT_S | No | 600 | How long a task waits for a free GPU before the scheduler gives up (→ HTTP 503, retriable) when nothing is evictable |
+| LLM_GPU_DEVICE | No | (GPU_DEVICE) | CUDA index for the local Gemma worker (box sets `2`) |
 
 ## Endpoints
 

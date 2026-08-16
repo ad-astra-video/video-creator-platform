@@ -768,16 +768,16 @@ async def on_startup(_app: web.Application) -> None:
     # Plan B: the scheduler gates concurrency per GPU (one task -> one GPU). It
     # replaces the old single Semaphore(1) that serialized ALL tasks on one GPU.
     _scheduler = GPUScheduler.from_config()
-    # Co-opt hook: when a render task needs a GPU and none is free, the
-    # scheduler evicts gemma (frees its VRAM) and hands gemma's GPU to the
-    # render task. gemma reloads later via the idle backfill (gated on
-    # gemma_slot_free()).
-    async def _coopt_evict_gemma() -> None:
+    # Eviction hook: the scheduler evicts a worker's warm model from VRAM
+    # before handing its GPU to a DIFFERENT worker's task, so two models never
+    # co-reside on one card (the image-then-video OOM). Any worker can be the
+    # victim; the generalized callback POST /evict frees its VRAM first.
+    async def _evict_worker(name: str) -> None:
         try:
-            await _worker_manager.evict("gemma-worker")
+            await _worker_manager.evict(name)
         except Exception:
-            logger.warning("gemma co-opt evict failed (may be down)", exc_info=True)
-    _scheduler.coopt_cb = _coopt_evict_gemma
+            logger.warning("worker evict failed (%s, may be down)", name, exc_info=True)
+    _scheduler.evict_cb = _evict_worker
 
     # Learn the real GPU VRAM from the worker before registering, so the very
     # first heartbeat already advertises specs for the actual card (not the env
