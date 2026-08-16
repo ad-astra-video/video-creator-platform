@@ -50,15 +50,7 @@ RUN pip install --no-cache-dir \
 COPY runner/idv2v/requirements.txt /tmp/idv2v-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/idv2v-requirements.txt
 
-# --- FLUX.2 [klein] 4B first-frame styler (black-forest-labs/flux2). ---
-# Installed with --no-deps so the pinned torch==2.8.0 / transformers==4.56.1 in
-# its pyproject CANNOT downgrade this image's authoritative cu128 torch>=2.7 /
-# transformers>=5.6. Its other deps (einops, torchvision, safetensors,
-# huggingface-hub, PIL) are already present via requirements.txt.
-# Pinned commit for reproducibility; installs the `flux` package (import `flux2`).
-ARG FLUX2_REPO=https://github.com/black-forest-labs/flux2
-ARG FLUX2_COMMIT=50fe5162777813d869182b139e83b10743caef15
-RUN pip install --no-cache-dir --no-deps "git+${FLUX2_REPO}@${FLUX2_COMMIT}"
+# FLUX.2 klein 4B moved to the image-worker (removed here).
 
 # --- diffsynth (Wan pipeline fork) + idv2v package from the reference repo. ---
 # Install with --no-deps so the stale hash-pinned torch2.6/cu11/flash-attn lines

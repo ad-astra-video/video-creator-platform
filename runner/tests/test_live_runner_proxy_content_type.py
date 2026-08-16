@@ -27,7 +27,7 @@ class FakeWorkerManager:
     def __init__(self):
         self.resident = None
 
-    async def ensure(self, name: str):
+    async def ensure(self, name: str, device: int | None = None):
         self.resident = name
 
 

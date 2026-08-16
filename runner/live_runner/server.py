@@ -26,7 +26,8 @@ from livepeer_gateway.live_runner import (
 )
 
 from . import config
-from .routing import CAPABILITIES, ROUTES, candidate_workers, proxy
+from .routing import CAPABILITIES, MODELS, ROUTES, candidate_workers, proxy
+from .scheduler import GPUScheduler, QueueTimeout
 from .specs import build_model_specs
 from .swap import HttpWorkerTransport, ResidentWorkerManager
 
@@ -40,9 +41,23 @@ _session: aiohttp.ClientSession | None = None
 _worker_manager: ResidentWorkerManager | None = None
 _registration = None
 _ready = False
-_generation_sem = None  # asyncio.Semaphore(1) — single GPU, one inference at a time
+_scheduler: GPUScheduler | None = None  # Plan B — one task -> one GPU, concurrent across GPUs
 _in_flight = 0        # active request counter (idle-backfill gate)
 _last_activity = 0.0  # monotonic ts of last request (idle-backfill grace)
+
+# Plan B deployment guard: only workers that HONOR the device field from the
+# /load body (they are on their own dedicated GPU and stay resident there) get
+# the device-aware per-worker residency path. Legacy video workers (ltx/idv2v)
+# that still share one physical GPU keep the proven evict-before-load swap so two
+# models can never co-reside on the same card. image-worker + gemma each live on
+# their own GPU, so device-aware residency is safe for them.
+_DEVICE_AWARE_WORKERS = frozenset({"image-worker", "gemma-worker"})
+
+
+def _device_for(worker: str, gpu: int) -> int | None:
+    """Effective device to send in /load: the scheduled GPU for device-aware
+    workers, None (legacy shared-GPU evict) for shared-card workers."""
+    return gpu if worker in _DEVICE_AWARE_WORKERS else None
 
 # Advertised model-spec metadata (resolution/fps/duration) for the Livepeer
 # video pipelines. Built from the GPU's ACTUAL VRAM detected at runtime from the
@@ -114,9 +129,25 @@ def _apply_detected_vram(vram_mb: int) -> None:
 
 def _need(request: web.Request):
     """Return the (worker_manager, session, token) trio, raising 503 if not up."""
-    if _worker_manager is None or _session is None:
+    if _worker_manager is None or _session is None or _scheduler is None:
         raise web.HTTPServiceUnavailable(reason="live-runner not ready")
     return _worker_manager, _session, config.worker_token()
+
+
+async def _with_gpu(scheduler: GPUScheduler, worker_manager, session, token,
+                    worker: str, endpoint: str, body: dict):
+    """Plan B dispatch: acquire a single free GPU, ensure the worker is resident
+    there (device in the /load body), run the task, then release the GPU.
+
+    No GPU free -> the scheduler queues FIFO; on timeout it raises QueueTimeout
+    which the caller maps to a retriable 503.
+    """
+    gpu = await scheduler.acquire(worker)
+    try:
+        return await proxy(worker_manager, session, token, worker, endpoint, body,
+                           device=_device_for(worker, gpu))
+    finally:
+        await scheduler.release(worker, gpu)
 
 
 async def handle_health(_req: web.Request) -> web.Response:
@@ -132,11 +163,25 @@ async def handle_info(_req: web.Request) -> web.Response:
         "capabilities": CAPABILITIES,
         "ready": _ready,
         "gpu": {"name": config.GPU_NAME, "vram_mb": _gpu_vram_mb or config.DEFAULT_VRAM_MB},
-        "metadata": {**meta, "capabilities": CAPABILITIES, "model_specs": _MODEL_SPECS},
+        "metadata": {**meta, "capabilities": CAPABILITIES, "model_specs": _MODEL_SPECS,
+                     "models": MODELS},
     })
 
 
-def _client_stage(info: dict):
+async def handle_scheduler_status(req: web.Request) -> web.Response:
+    """GET /video-creator/v1/scheduler/status — per-GPU owner snapshot.
+
+    Worker-token protected (internal): only the operator / dashboard sees the
+    advisory GPU map. Not part of the public runner surface.
+    """
+    if req.headers.get("X-Worker-Token", "") != config.worker_token():
+        raise web.HTTPForbidden(reason="missing/mismatched X-Worker-Token")
+    if _scheduler is None:
+        raise web.HTTPServiceUnavailable(reason="live-runner not ready")
+    return web.json_response(_scheduler.status())
+
+
+async def _client_stage(info: dict):
     """Map an idv2v worker progress payload to a client-facing stage/message pair."""
     st = info.get("stage", "generating")
     msg = info.get("message", "") or ""
@@ -169,7 +214,8 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
     """
     headers = {"X-Worker-Token": token}
     idv2v_base = config.WORKERS["idv2v-worker"]
-    await wm.ensure("idv2v-worker")
+    idv2v_gpu = await _scheduler.acquire("idv2v-worker")
+    await wm.ensure("idv2v-worker", device=_device_for("idv2v-worker", idv2v_gpu))
 
     job_id = str(body.get("job_id") or uuid.uuid4().hex[:12])
     rbody = {**body, "job_id": job_id}
@@ -225,6 +271,7 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
         return web.Response(status=500, text=str(exc),
                             content_type="application/json", charset="utf-8")
 
+    await _scheduler.release("idv2v-worker", idv2v_gpu)
     out_b64 = data.get("output_video")
     if not out_b64:
         return web.json_response(data, status=502)
@@ -249,7 +296,8 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
     up_body = {"video_base64": out_b64, "width": target_w, "height": target_h,
                "fps": body.get("fps", 24)}
     ltx_base = config.WORKERS["ltx-worker"]
-    await wm.ensure("ltx-worker")
+    ltx_gpu = await _scheduler.acquire("ltx-worker")
+    await wm.ensure("ltx-worker", device=_device_for("ltx-worker", ltx_gpu))
 
     async def _upscale():
         async with session.post(f"{ltx_base}/video-creator/v1/upscale",
@@ -277,6 +325,7 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
         return web.Response(status=500, text=str(exc),
                             content_type="application/json", charset="utf-8")
 
+    await _scheduler.release("ltx-worker", ltx_gpu)
     up_b64 = up.get("video_base64")
     if not up_b64:
         return web.json_response(up, status=502)
@@ -336,11 +385,23 @@ async def handle_ws(req: web.Request) -> web.Response:
             _in_flight += 1
             _last_activity = time.monotonic()
             try:
-                async with _generation_sem:
-                    if task_type == "restyle":
-                        await _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body)
-                    else:
-                        await _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body)
+                if task_type == "restyle":
+                    # Restyle chain acquires/releases its own GPUs.
+                    await _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body)
+                else:
+                    worker = ROUTES[task_type]
+                    try:
+                        gpu = await _scheduler.acquire(worker)
+                    except QueueTimeout as exc:
+                        if not ws.closed:
+                            await ws.send_json({"type": "error", "request_id": request_id,
+                                                "error": str(exc)})
+                        break
+                    try:
+                        await _ws_proxy(ws, wm, session, token, request_id, job_id,
+                                        task_type, body, device=gpu)
+                    finally:
+                        await _scheduler.release(worker, gpu)
             finally:
                 _in_flight -= 1
             break
@@ -371,7 +432,8 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
     """
     headers = {"X-Worker-Token": token}
     idv2v_base = config.WORKERS["idv2v-worker"]
-    await wm.ensure("idv2v-worker")
+    idv2v_gpu = await _scheduler.acquire("idv2v-worker")
+    await wm.ensure("idv2v-worker", device=_device_for("idv2v-worker", idv2v_gpu))
 
     def _client_stage(info: dict):
         st = info.get("stage", "generating")
@@ -444,6 +506,7 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
             await ws.send_json({"type": "error", "request_id": request_id, "error": str(exc)})
         return
 
+    await _scheduler.release("idv2v-worker", idv2v_gpu)
     if _SKIP_UPSCALE:
         # Diagnostic A/B: return the native idv2v output without the LTX
         # spatial upscale, to check whether the upscaler causes flicker.
@@ -467,7 +530,8 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
     target_w = max(16, int(body.get("width", 1280)))
     target_h = max(16, int(body.get("height", 720)))
     ltx_base = config.WORKERS["ltx-worker"]
-    await wm.ensure("ltx-worker")
+    ltx_gpu = await _scheduler.acquire("ltx-worker")
+    await wm.ensure("ltx-worker", device=_device_for("ltx-worker", ltx_gpu))
     up_body = {"video_base64": data["output_video"], "width": target_w, "height": target_h,
                "fps": body.get("fps", 24)}
 
@@ -500,6 +564,7 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
             await ws.send_json({"type": "error", "request_id": request_id, "error": str(exc)})
         return
 
+    await _scheduler.release("ltx-worker", ltx_gpu)
     payload = {
         "output_video": up_b64,
         "frames_generated": data.get("frames_generated"),
@@ -516,7 +581,8 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
                             "job_id": job_id, "payload": payload})
 
 
-async def _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body) -> None:
+async def _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body,
+                    device: int | None = None) -> None:
     """Run a non-restyle task over the WebSocket, streaming stage text + final result.
 
     Routes ``task_type`` to its worker via ROUTES, ensures the worker is resident,
@@ -544,7 +610,7 @@ async def _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body)
     for index, target in enumerate(candidates):
         try:
             base = config.WORKERS[target]
-            await wm.ensure(target)
+            await wm.ensure(target, device=_device_for(target, device))
             url = f"{base}/video-creator/v1/{task_type}"
             async with session.post(url, json=body, headers=headers,
                                     timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
@@ -597,11 +663,14 @@ async def handle_generic(req: web.Request) -> web.Response:
         _in_flight += 1
         _last_activity = time.monotonic()
         try:
-            # Serialize inference: the shared GPU runs one generation at a time.
-            async with _generation_sem:
-                if endpoint == "restyle":
-                    return await _restyle_chain(wm, session, token, body)
-                return await proxy(wm, session, token, worker, endpoint, body)
+            if endpoint == "restyle":
+                # Restyle chain acquires/releases its own GPUs (idv2v then ltx).
+                return await _restyle_chain(wm, session, token, body)
+            try:
+                return await _with_gpu(_scheduler, wm, session, token,
+                                       worker, endpoint, body)
+            except QueueTimeout as exc:
+                return web.json_response({"error": str(exc)}, status=503)
         finally:
             _in_flight -= 1
 
@@ -625,13 +694,18 @@ async def handle_generic(req: web.Request) -> web.Response:
     _in_flight += 1
     _last_activity = time.monotonic()
     try:
-        async with _generation_sem:
-            if endpoint == "restyle":
-                async def _prog(ev): await _ev("progress", ev)
-                out = await _restyle_chain(wm, session, token, body, progress_cb=_prog)
-            else:
-                await _ev("progress", {"stage": "generating", "message": "Generating...", "progress": None})
-                out = await proxy(wm, session, token, worker, endpoint, body)
+        if endpoint == "restyle":
+            async def _prog(ev): await _ev("progress", ev)
+            out = await _restyle_chain(wm, session, token, body, progress_cb=_prog)
+        else:
+            await _ev("progress", {"stage": "generating", "message": "Generating...", "progress": None})
+            try:
+                out = await _with_gpu(_scheduler, wm, session, token,
+                                      worker, endpoint, body)
+            except QueueTimeout as exc:
+                await _ev("error", {"error": str(exc)})
+                await resp.write_eof()
+                return resp
     except Exception as exc:
         logger.exception("sse %s failed", endpoint)
         await _ev("error", {"error": str(exc)})
@@ -674,22 +748,36 @@ async def handle_namespaced(req: web.Request) -> web.Response:
     _in_flight += 1
     _last_activity = time.monotonic()
     try:
-        # Serialize inference: the shared GPU runs one generation at a time.
-        async with _generation_sem:
-            return await proxy(wm, session, token, full, endpoint, body)
+        try:
+            return await _with_gpu(_scheduler, wm, session, token,
+                                   full, endpoint, body)
+        except QueueTimeout as exc:
+            return web.json_response({"error": str(exc)}, status=503)
     finally:
         _in_flight -= 1
 
 
 async def on_startup(_app: web.Application) -> None:
-    global _session, _worker_manager, _registration, _ready, _generation_sem
+    global _session, _worker_manager, _registration, _ready, _scheduler
     _session = aiohttp.ClientSession()
     _worker_manager = ResidentWorkerManager(
         transport=HttpWorkerTransport(_session, config.worker_token()),
         workers=dict(config.WORKERS),
         pinned=frozenset(["gemma-worker"]) if config.LLM_PINNED else frozenset(),
     )
-    _generation_sem = asyncio.Semaphore(1)
+    # Plan B: the scheduler gates concurrency per GPU (one task -> one GPU). It
+    # replaces the old single Semaphore(1) that serialized ALL tasks on one GPU.
+    _scheduler = GPUScheduler.from_config()
+    # Co-opt hook: when a render task needs a GPU and none is free, the
+    # scheduler evicts gemma (frees its VRAM) and hands gemma's GPU to the
+    # render task. gemma reloads later via the idle backfill (gated on
+    # gemma_slot_free()).
+    async def _coopt_evict_gemma() -> None:
+        try:
+            await _worker_manager.evict("gemma-worker")
+        except Exception:
+            logger.warning("gemma co-opt evict failed (may be down)", exc_info=True)
+    _scheduler.coopt_cb = _coopt_evict_gemma
 
     # Learn the real GPU VRAM from the worker before registering, so the very
     # first heartbeat already advertises specs for the actual card (not the env
@@ -713,6 +801,7 @@ async def on_startup(_app: web.Application) -> None:
         metadata=json.dumps({
             "capabilities": CAPABILITIES,
             "model_specs": _MODEL_SPECS,
+            "models": MODELS,
             "gpu": gpu_meta,
             "ltx_up": False,
             "idv2v_up": False,
@@ -727,16 +816,13 @@ async def on_startup(_app: web.Application) -> None:
 
     # Refresh heartbeat metadata each beat from the swap policy + live worker /health.
     asyncio.create_task(_refresh_metadata_loop())
-    # Load the LLM backend. Pinned (dedicated GPU) -> load once at boot and never
-    # evict; blank (shared GPU) -> backfill the idle slot so enhance/chat serve
-    # without a cold load. Fail-safe: the edge boots even if gemma is down.
+    # Plan B: load gemma-worker resident on GEMMA_RESIDENT_GPU and keep it there;
+    # the scheduler holds that GPU out of the task pool. Fail-safe: the edge
+    # boots even if gemma is down.
     try:
-        if config.LLM_PINNED:
-            await _worker_manager.load_pinned()
-        else:
-            await _worker_manager.backfill("gemma-worker")
+        await _worker_manager.ensure("gemma-worker", device=config.GEMMA_RESIDENT_GPU)
     except Exception:
-        logger.warning("initial LLM backfill failed (gemma-worker may be down)", exc_info=True)
+        logger.warning("initial gemma resident load failed (gemma-worker may be down)", exc_info=True)
     asyncio.create_task(_idle_backfill_loop())
     _ready = True
     logger.info("Live-runner READY")
@@ -752,15 +838,14 @@ async def _idle_backfill_loop() -> None:
     """
     while True:
         try:
-            if _worker_manager is not None:
-                if config.LLM_PINNED:
-                    # Dedicated GPU: retry the pin load until it lands (the boot-time
-                    # load can lose a race against gemma-worker's own startup). Cheap
-                    # no-op (lock + in-memory check) once it's loaded.
-                    await _worker_manager.ensure("gemma-worker")
-                elif _in_flight == 0:
-                    if _last_activity and (time.monotonic() - _last_activity) >= config.GEMMA_IDLE_GRACE_S:
-                        await _worker_manager.ensure("gemma-worker")
+            if _worker_manager is not None and _scheduler is not None:
+                # Reload gemma only when its GPU is actually free (not currently
+                # running a render task that co-opted it), then re-assert gemma
+                # residency in the advisory map so the GPU is reserved for it again.
+                if _scheduler.gemma_slot_free():
+                    await _worker_manager.ensure(
+                        "gemma-worker", device=config.GEMMA_RESIDENT_GPU)
+                    _scheduler.mark_gemma_loaded()
         except Exception:
             logger.warning("idle LLM backfill failed", exc_info=True)
         await asyncio.sleep(2)
@@ -775,9 +860,19 @@ async def _refresh_metadata_loop() -> None:
                 gpu_meta, ltx_vram = await _poll_worker_gpu_info(_session)
                 if ltx_vram:
                     _apply_detected_vram(ltx_vram)
+                # Plan B: reconcile the advisory GPU map from each worker's
+                # /info (device_in_use) so a crashed/restarted worker self-heals.
+                if _scheduler is not None:
+                    w_info = {}
+                    for _name, _url in config.WORKERS.items():
+                        _info = await _fetch_worker_info(_session, _url)
+                        if _info is not None:
+                            w_info[_name] = _info
+                    await _scheduler.reconcile(w_info)
                 meta = await _worker_manager.check_health()
                 meta["capabilities"] = CAPABILITIES
                 meta["model_specs"] = _MODEL_SPECS
+                meta["models"] = MODELS
                 meta["gpu"] = gpu_meta
                 # The registration is an in-process object owned by this runner;
                 # set its payload metadata so the next heartbeat advertises the
@@ -806,6 +901,7 @@ def create_app() -> web.Application:
     p = "/video-creator/v1"
     app.router.add_get(f"{p}/health", handle_health)
     app.router.add_get(f"{p}/info", handle_info)
+    app.router.add_get(f"{p}/scheduler/status", handle_scheduler_status)
     # One parameterized route so handle_generic can read the endpoint from
     # match_info["endpoint"] and look it up in ROUTES. (Previously these were
     # registered as static paths with no {endpoint} placeholder, so match_info

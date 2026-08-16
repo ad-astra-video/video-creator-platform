@@ -24,7 +24,7 @@ ROUTES = {
     "t2v": "ltx-worker",
     "i2v": "ltx-worker",
     "a2v": "ltx-worker",            # LTX worker answers not_supported today
-    "image": "ltx-worker",
+    "image": "image-worker",
     "extend": "ltx-worker",
     "retake": "ltx-worker",
     "prompt-enhance": "gemma-worker",
@@ -32,22 +32,35 @@ ROUTES = {
     "chat": "gemma-worker",
     "extract-conditioning": "ltx-worker",
     "ic-lora-generate": "ltx-worker",
-    "edit": "ltx-worker",
+    "edit": "image-worker",
+    "layer": "image-worker",
     "restyle": "idv2v-worker",
-    "style-frame": "idv2v-worker",
+    "style-frame": "image-worker",
     "sam3": "idv2v-worker",
 }
 
-CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", "sam3",
-                       "extend", "retake", "prompt-enhance", "suggest-gap-prompt",
-                       "chat", "extract-conditioning", "ic-lora-generate"})
+# Routing capability ids advertised for the platform (each maps 1:1 via ROUTES
+# to the worker container that serves it). `qwen-image-edit` is deliberately
+# NOT here: it was an engine label, not a route. Available image MODELS are
+# advertised separately (see MODELS) so consumers can tell z-image / flux /
+# qwen apart without a per-engine capability entry.
+CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", "layer",
+                       "sam3", "extend", "retake", "prompt-enhance",
+                       "suggest-gap-prompt", "chat", "extract-conditioning",
+                       "ic-lora-generate"})
+
+# Image models the image-worker can serve, by id. Consumed by the frontend to
+# label models (z-image = Z-Image, flux = FLUX.2 klein 4B, qwen = Qwen-Image-Edit).
+MODELS = ["z-image", "flux", "qwen"]
 
 # Endpoints served at the idv2v-worker that do NOT need the 20 GB video model
-# resident: they are image-only (FLUX.2 klein editor / SAM3 subprocess) and their
-# own internal lifecycle evicts whatever is resident. Forcing /load here would
-# build the whole WanVideoPipeline (DiT+VACE) and co-resident it with klein on
-# the shared 32 GB card -> OOM. Real video jobs (restyle) still use ensure().
-_IMAGE_ONLY_ENDPOINTS = frozenset({"style-frame", "sam3"})
+# resident: SAM3 is image-only (subprocess) and its own internal lifecycle
+# evicts whatever is resident. Forcing /load here would build the whole
+# WanVideoPipeline (DiT+VACE) and co-resident it with SAM3 on the shared
+# 32 GB card -> OOM. (style-frame used to be here too, but it now routes to the
+# image-worker, whose /load is cheap + device-aware, so it goes through the
+# normal scheduled-ensure path.) Real video jobs (restyle) still use ensure().
+_IMAGE_ONLY_ENDPOINTS = frozenset({"sam3"})
 
 
 class WorkerCallFailed(Exception):
@@ -130,6 +143,7 @@ async def proxy(
     worker: str,
     endpoint: str,
     body: dict,
+    device: int | None = None,
 ) -> web.Response:
     """Ensure ``worker`` is resident, forward the request, return the response.
 
@@ -153,7 +167,7 @@ async def proxy(
             # shared 32 GB card. Let the worker's own klein/sam3 eviction
             # lifecycle handle residency for these.
             if endpoint not in _IMAGE_ONLY_ENDPOINTS:
-                await worker_manager.ensure(target)
+                await worker_manager.ensure(target, device=device)
             return await _post_worker(session, token, target, endpoint, body)
         except WorkerCallFailed as exc:
             last = exc

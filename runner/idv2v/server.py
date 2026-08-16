@@ -27,7 +27,6 @@ import uuid
 from aiohttp import web
 
 from . import config
-from . import flux_edit
 from . import run as run_mod
 from .model import ModelManager, health_check
 
@@ -156,7 +155,7 @@ async def handle_info(request: web.Request) -> web.Response:
     return web.json_response({
         "runner_id": "",
         "app": "idv2v",
-        "capabilities": ["restyle", "sam3", "prompt-enhance", "style-frame"],
+        "capabilities": ["restyle", "sam3", "prompt-enhance"],
         "ready": model is not None,
         "gpu": _gpu_info(),
         **base,
@@ -204,29 +203,6 @@ async def handle_restyle(request: web.Request) -> web.Response:
         except Exception as exc:
             # Non-fatal: fall back to the original prompt; the pipeline still runs.
             logger.error("Gemma stage failed (falling back to original prompt): %s", exc, exc_info=True)
-
-    # Optional FLUX.2 klein 4B first-frame styling (the image-edit model for the
-    # restyle first frame). Runs AFTER the Gemma LLM stage: the styling prompt is
-    # enhanced by the loaded LLM while it is resident, then Gemma is evicted to
-    # make room for FLUX.2, the frame is styled, and FLUX.2 is evicted in turn
-    # before the video model loads. Engaged when the caller asks for it
-    # (style_first_frame=true) OR failed to pre-supply a styled first frame.
-    if config.klein4b_enabled() and (
-        bool(body.get("style_first_frame", False))
-        or not bool(body.get("stylized_first_frame"))
-    ):
-        try:
-            styled_b64, style_enhanced = _style_first_frame_from_job(
-                body, str(body.get("prompt") or ""), bool(body.get("enhance_prompt", False)),
-            )
-            if styled_b64:
-                body["stylized_first_frame"] = styled_b64
-                if style_enhanced:
-                    body.setdefault("_gemma_meta", {})
-                    body["_gemma_meta"]["styled_prompt"] = style_enhanced
-                    run_mod.set_progress(job_id, 0.08, "preprocessing", "styling first frame (FLUX.2 klein 4B)")
-        except Exception as exc:
-            logger.error("FLUX.2 first-frame styling failed (using supplied/raw frame): %s", exc, exc_info=True)
 
     # A restyle request can select which id-v2v model to run on via body["model"]
     # ("fast" = FusionX/`fusionx` subfolder, ~8 steps; "regular" = repo root, 30
@@ -411,8 +387,6 @@ def create_app() -> web.Application:
     app.router.add_post("/video-creator/v1/sam3", handle_sam3)
     app.router.add_post("/v1/prompt-enhance", handle_prompt_enhance)
     app.router.add_post("/video-creator/v1/prompt-enhance", handle_prompt_enhance)
-    app.router.add_post("/v1/style-frame", handle_style_frame)
-    app.router.add_post("/video-creator/v1/style-frame", handle_style_frame)
     return app
 
 
@@ -446,156 +420,6 @@ def _evict_video_for_gemma() -> None:
 
 
 
-# ---------------------------------------------------------------------------
-# FLUX.2 [klein] 4B first-frame styling (image-edit model for the restyle first frame)
-# ---------------------------------------------------------------------------
-
-def _enhance_image_edit(enhancer, image_pil, prompt, seed):
-    """Run prompt enhancement through the LOADED Gemma LLM before it is evicted.
-
-    This is the "enhance through the loaded LLM before evicting it" guarantee for
-    the shared-GPU case: the caller must have Gemma loaded (which evicted the
-    resident video model via its evict hook), we enhance against the frame, and
-    only THEN is Gemma unloaded to make room for the FLUX.2 editor. Returns the
-    enhanced prompt (or the original if enhancement is off / unavailable).
-    """
-    if not config.gemma_enabled() or not str(prompt or "").strip():
-        return prompt
-    try:
-        enhanced = enhancer.enhance_image(str(prompt), image_pil, seed=seed)
-        return enhanced or prompt
-    except Exception as exc:
-        logger.warning("Gemma image-edit enhance failed (using original prompt): %s", exc)
-        return prompt
-
-
-def _style_first_frame(image_pil, prompt, seed, width, height, enhance_prompt):
-    """Style ``image_pil`` with FLUX.2 klein 4B and return (styled_pil, enhanced_prompt).
-
-    CRITICAL sequencing (shared GPU / no dedicated LLM GPU): the prompt
-    enhancement runs through the LOADED Gemma LLM FIRST (loading Gemma evicts
-    any resident video model), then Gemma is UNLOADED before FLUX.2 Klein loads,
-    so the enhanced prompt is produced by the LLM while it is still loaded,
-    BEFORE it is evicted to make room for the editor. When a separate LLM GPU is
-    configured (gemma_device() != video device), Gemma loads without evicting
-    the video model and the same ordering still holds harmlessly.
-    """
-    from .flux_edit import evict_editor, get_editor
-    from .gemma import get_enhancer
-
-    final = str(prompt or "")
-    enhanced_prompt = None
-    if enhance_prompt and config.gemma_enabled():
-        enhancer = get_enhancer()
-        try:
-            enhancer.ensure_loaded()          # evicts resident video model (shared GPU)
-            final = _enhance_image_edit(enhancer, image_pil, final, seed)
-            enhanced_prompt = None if final == prompt else final
-        finally:
-            enhancer.unload()                 # free Gemma BEFORE loading FLUX.2
-    editor = get_editor()
-    try:
-        editor.ensure_loaded()                # evicts resident video model if present
-        styled = editor.edit(image_pil, final, seed, width=width, height=height)
-    finally:
-        evict_editor()                        # free FLUX.2 before the video model loads
-    return styled, enhanced_prompt
-
-
-def _style_first_frame_from_job(body, prompt, enhance_prompt):
-    """Extract frame 0 from the source video and style it with FLUX.2 klein 4B.
-
-    Returns ``(styled_b64, enhanced_prompt_or_None)``. Falls back to the RAW
-    frame 0 if extraction or styling fails so the video restyle still runs.
-    """
-    source_b64 = body.get("source_video", "")
-    if not source_b64:
-        return None, None
-    import base64 as _b64
-    import io as _io
-    import shutil
-    import tempfile
-    import numpy as np
-    import cv2
-    from PIL import Image as _Image
-
-    tmpdir = tempfile.mkdtemp(prefix="stylef_")
-    try:
-        src = os.path.join(tmpdir, "src.mp4")
-        with open(src, "wb") as fh:
-            fh.write(_b64.b64decode(source_b64))
-        cap = cv2.VideoCapture(src)
-        try:
-            ok, frame = cap.read()
-            if not ok:
-                return None, None
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil = _Image.fromarray(rgb)
-        finally:
-            cap.release()
-        try:
-            styled, enhanced = _style_first_frame(
-                pil, prompt, int(body.get("seed", 123)), None, None, enhance_prompt,
-            )
-            out = styled
-        except Exception as exc:
-            logger.error("FLUX.2 first-frame styling failed, using raw frame 0: %s", exc)
-            out = pil
-            enhanced = None
-        buf = _io.BytesIO()
-        out.save(buf, format="PNG")
-        return _b64.b64encode(buf.getvalue()).decode("ascii"), enhanced
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-async def handle_style_frame(request: web.Request) -> web.Response:
-    """Style a single image (the restyle first frame) with FLUX.2 klein 4B.
-
-    Body JSON: {image: <base64>, prompt: str, seed?: int, width?: int,
-    height?: int, enhance_prompt?: bool}. Prompt-enhanced through the loaded
-    Gemma LLM before it is evicted (shared-GPU aware), then edited by FLUX.2.
-    Returns {styled_image: <base64 PNG>, width, height, enhanced_prompt?}.
-    """
-    _require_token(request)
-    body = await request.json()
-    image_b64 = body.get("image")
-    if not image_b64:
-        return web.json_response({"error": "missing 'image' (base64)"}, status=400)
-    prompt = str(body.get("prompt") or "").strip()
-    if not prompt:
-        return web.json_response({"error": "missing 'prompt'"}, status=400)
-    if not config.klein4b_enabled():
-        return web.json_response(
-            {"error": "FLUX.2 Klein 4B not provisioned (KLEIN4B_MODEL missing)"},
-            status=503)
-    seed = int(body.get("seed", 123))
-    enhance_prompt = bool(body.get("enhance_prompt", False))
-    width = body.get("width")
-    height = body.get("height")
-
-    def _run():
-        import base64 as _b64
-        import io as _io
-        from PIL import Image as _Image
-        img = _Image.open(_io.BytesIO(_b64.b64decode(image_b64))).convert("RGB")
-        styled, enhanced = _style_first_frame(
-            img, prompt, seed, width, height, enhance_prompt,
-        )
-        buf = _io.BytesIO()
-        styled.save(buf, format="PNG")
-        return _b64.b64encode(buf.getvalue()).decode("ascii"), enhanced, styled.size
-
-    try:
-        styled_b64, enhanced, (w, h) = await asyncio.to_thread(_run)
-    except Exception as exc:
-        logger.error("style-frame failed: %s", exc, exc_info=True)
-        return web.json_response({"error": str(exc)}, status=500)
-    return web.json_response({
-        "styled_image": styled_b64, "width": w, "height": h,
-        "enhanced_prompt": enhanced,
-    })
-
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
@@ -610,10 +434,6 @@ def main() -> None:
     # and must not hold both resident).
     from .gemma import configure_evict_cb
     configure_evict_cb(_evict_video_for_gemma)
-    # FLUX.2 klein editor shares the video GPU too: evict the resident video
-    # model before the editor allocates (same shared-GPU rule as Gemma).
-    from .flux_edit import configure_evict_cb as _configure_flux_evict_cb
-    _configure_flux_evict_cb(_evict_video_for_gemma)
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:

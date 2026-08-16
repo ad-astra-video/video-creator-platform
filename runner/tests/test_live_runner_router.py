@@ -22,6 +22,7 @@ class InMemoryTransport(WorkerTransport):
 
     def __init__(self):
         self.order = []       # ["load:ltx", "evict:ltx", ...]
+        self.payloads = []    # request bodies sent with post()
         self.resident = None
 
     def _name(self, base):
@@ -33,6 +34,7 @@ class InMemoryTransport(WorkerTransport):
         name = self._name(base)
         kind = path.lstrip("/")  # "load" | "evict" | "restyle"...
         self.order.append(f"{kind}:{name}")
+        self.payloads.append(payload if payload is not None else {})
         if kind == "load":
             self.resident = name
         elif kind == "evict":
@@ -111,9 +113,25 @@ def test_check_health_reports_workers_up(fake_workers, workers_map):
 def test_routing_table_has_restyle_on_idv2v():
     from runner.live_runner.routing import ROUTES
     assert ROUTES["restyle"] == "idv2v-worker"
-    # All the old LTX endpoints route to ltx-worker.
-    for ep in ("t2v", "i2v", "retake", "extend", "image"):
+    # LTX keeps the video endpoints.
+    for ep in ("t2v", "i2v", "retake", "extend"):
         assert ROUTES[ep] == "ltx-worker"
+
+
+def test_routing_routes_image_caps_to_image_worker():
+    # image/edit/layer/style-frame move to the dedicated image-worker; sam3 and
+    # the video workers are unchanged; new capabilities + model ids advertised.
+    from runner.live_runner.routing import ROUTES, CAPABILITIES, MODELS
+    for ep in ("image", "edit", "layer", "style-frame"):
+        assert ROUTES[ep] == "image-worker"
+    # sam3 (keep-subject segmentation) stays on idv2v-worker (no sam3 changes).
+    assert ROUTES["sam3"] == "idv2v-worker"
+    # New capabilities advertised in the heartbeat.
+    assert "layer" in CAPABILITIES
+    assert "style-frame" in CAPABILITIES
+    # qwen-image-edit was an engine label, not a route — dropped; models advertised by id.
+    assert "qwen-image-edit" not in CAPABILITIES
+    assert MODELS == ["z-image", "flux", "qwen"]
 
 
 if __name__ == "__main__":
@@ -228,6 +246,30 @@ def test_health_reports_gemma_model(fake_workers):
 
 # ── Prompt-enhance fallback: gemma-worker -> LTX text encoder ─────────────────
 
+def test_ensure_device_injects_device_and_does_not_evict_other_worker(fake_workers):
+    # Plan B: ensure(name, device=N) sends device in the /load body and does
+    # not evict a worker running on a different GPU (one task -> one GPU).
+    wm = ResidentWorkerManager(
+        transport=fake_workers,
+        workers={"ltx-worker": "ltx-worker", "idv2v-worker": "idv2v-worker",
+                 "gemma-worker": "gemma-worker", "image-worker": "image-worker"},
+    )
+
+    async def _t():
+        await wm.ensure("ltx-worker", device=0)
+        await wm.ensure("image-worker", device=2)
+        # No cross-worker eviction: both stay loaded on their own GPUs.
+        assert fake_workers.order == ["load:ltx-worker", "load:image-worker"]
+        # The /load bodies carried the device index.
+        assert fake_workers.payloads[0] == {"device": 0}
+        assert fake_workers.payloads[1] == {"device": 2}
+        # A second load of the same worker on the same device is a no-op.
+        await wm.ensure("ltx-worker", device=0)
+        assert fake_workers.order == ["load:ltx-worker", "load:image-worker"]
+
+    asyncio.run(_t())
+
+
 def test_candidate_workers_only_prompt_enhance_has_fallback():
     from runner.live_runner.routing import candidate_workers
     # prompt-enhance prefers the dedicated gemma-worker, falls back to ltx-worker
@@ -295,9 +337,11 @@ class _FakeSession:
 class _FakeWM:
     def __init__(self):
         self.ensured = []
+        self.devices = []
 
-    async def ensure(self, name):
+    async def ensure(self, name, device=None):
         self.ensured.append(name)
+        self.devices.append(device)
 
 
 def _patch_workers():
@@ -372,3 +416,118 @@ def test_proxy_reports_error_when_all_candidates_fail():
         assert sess.seen == ["gemma-worker", "ltx-worker"]
     finally:
         cfg.WORKERS = old
+
+
+# ── GPU co-opt scheduler: gemma pinned to one GPU, evict-on-need ─────────────
+from runner.live_runner.scheduler import GPUScheduler  # noqa: E402
+
+
+def test_coopt_scheduler_gemma_gets_own_gpu_first():
+    """gemma always takes its own resident GPU while loaded."""
+    async def _t():
+        s = GPUScheduler(gemma_resident_gpu=2, gpu_count=3)
+        assert await s.acquire("gemma-worker") == 2
+        assert s.status()["gemma_evicted"] is False
+    asyncio.run(_t())
+
+
+def test_coopt_scheduler_render_task_uses_free_gpu():
+    """A render task grabs a genuinely free (non-gemma) GPU first."""
+    async def _t():
+        s = GPUScheduler(gemma_resident_gpu=2, gpu_count=3)
+        gpu = await s.acquire("ltx-worker")
+        assert gpu in (0, 1)
+        assert s.status()["gpus"][gpu]["worker"] == "ltx-worker"
+        assert s.status()["gemma_evicted"] is False
+    asyncio.run(_t())
+
+
+def test_coopt_scheduler_evicts_gemma_when_all_busy():
+    """When no free GPU and gemma is resident, a render task co-opts gemma's
+    GPU: coopt_cb fires (evict), gemma's GPU is handed to the render task."""
+    evicted = []
+    async def _cb():
+        evicted.append(True)
+
+    async def _t():
+        s = GPUScheduler(gemma_resident_gpu=2, gpu_count=3)
+        # Fill GPUs 0 and 1 with render tasks.
+        g0 = await s.acquire("ltx-worker")
+        g1 = await s.acquire("image-worker")
+        assert sorted((g0, g1)) == [0, 1]
+        # Wire the co-opt hook (only then is co-opt active).
+        s.coopt_cb = _cb
+        # Third render task has no free GPU -> co-opts gemma's GPU 2.
+        g2 = await s.acquire("idv2v-worker")
+        assert g2 == 2
+        assert evicted == [True]
+        st = s.status()
+        assert st["gpus"][2]["worker"] == "idv2v-worker"
+        assert st["gpus"][2]["state"] == "busy"
+        assert st["gpus"][2]["resident"] is False
+        assert st["gemma_evicted"] is True
+        # gemma itself now waits for its GPU to free (never borrows another).
+        try:
+            await asyncio.wait_for(s.acquire("gemma-worker"), timeout=0.2)
+            raise AssertionError("gemma should block while its GPU is co-opted")
+        except asyncio.TimeoutError:
+            pass
+    asyncio.run(_t())
+
+
+def test_coopt_scheduler_no_coopt_without_callback():
+    """Without coopt_cb wired, gemma's GPU is never handed to a render task
+    (old behaviour): a third task on a 3-GPU box just times out."""
+    async def _t():
+        s = GPUScheduler(gemma_resident_gpu=2, gpu_count=3)
+        await s.acquire("ltx-worker")
+        await s.acquire("image-worker")
+        try:
+            await asyncio.wait_for(s.acquire("idv2v-worker"), timeout=0.2)
+            raise AssertionError("should time out without co-opt")
+        except asyncio.TimeoutError:
+            pass
+        st = s.status()
+        assert st["gemma_evicted"] is False
+        assert st["gpus"][2]["resident"] is True
+    asyncio.run(_t())
+
+
+async def _noop_cb():
+    pass
+
+
+def test_coopt_scheduler_gemma_reload_after_release():
+    """After the co-opting task releases gemma's GPU, gemma can reclaim it, and
+    gemma_slot_free()/mark_gemma_loaded() reflect residency restored."""
+    async def _t():
+        s = GPUScheduler(gemma_resident_gpu=2, gpu_count=3)
+        s.coopt_cb = _noop_cb
+        await s.acquire("ltx-worker")    # GPU 0
+        await s.acquire("image-worker")  # GPU 1
+        g2 = await s.acquire("idv2v-worker")  # co-opts gemma GPU 2
+        assert g2 == 2
+        assert s.gemma_slot_free() is False  # render task still on GPU 2
+        await s.release("idv2v-worker", 2)
+        assert s.gemma_slot_free() is True   # GPU 2 now free for gemma
+        # gemma reloads and re-asserts residency.
+        g = await s.acquire("gemma-worker")
+        assert g == 2
+        s.mark_gemma_loaded()
+        st = s.status()
+        assert st["gemma_evicted"] is False
+        assert st["gpus"][2]["worker"] == "gemma-worker"
+        assert st["gpus"][2]["resident"] is True
+    asyncio.run(_t())
+
+
+def test_coopt_release_does_not_free_resident_gemma():
+    """A stale release of gemma's resident GPU while genuinely resident is a
+    no-op (must not free gemma's reserved GPU into the pool)."""
+    async def _t():
+        s = GPUScheduler(gemma_resident_gpu=2, gpu_count=3)
+        await s.release("gemma-worker", 2)
+        st = s.status()
+        assert st["gpus"][2]["resident"] is True
+        assert st["gpus"][2]["state"] == "busy"
+    asyncio.run(_t())

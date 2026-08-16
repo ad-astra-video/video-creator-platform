@@ -1,10 +1,11 @@
-"""FLUX.2 [klein] 4B image editor — first-frame styling for the id-v2v worker.
+"""FLUX.2 [klein] 4B image editor — style-frame for the image-worker.
 
 Wires Black Forest Labs' FLUX.2 [klein] 4B (the 4B distilled image-editing +
-generation model) in as the image-edit model that styles the restyle first
-frame. All heavy imports (torch, the BFL `flux2` package, transformers) happen
+generation model) in as the image-edit model behind /style-frame (styles the
+restyle first frame). All heavy imports (torch, the BFL `flux2` package,
+transformers) happen
 LAZILY inside `load()` so this module is importable in GPU-less test venvs —
-the same staged pattern the worker already uses for diffsynth/Gemma.
+the same staged pattern the worker already uses for the Qwen/Z-Image pipelines.
 
 Model facts (researched from the official repo black-forest-labs/flux2):
   * FLUX.2 [klein] 4B is guidance- AND step-distilled:
@@ -22,11 +23,10 @@ Model facts (researched from the official repo black-forest-labs/flux2):
         which is a SEPARATE LLM from Gemma and must share the card with the
         video model via the evict-churn lifecycle below.
 
-GPU / eviction: the editor cannot coexist on one card with the id-v2v
-DiT/VACE (~19.5 GB) or a Gemma LLM, so callers run the enhance-before-evict
-sequence (see server.py) and this editor evicts any resident video model via
-its `evict_cb` before allocating, then is itself evicted before the video
-model loads again.
+GPU / eviction: the editor cannot coexist on one card with the Qwen-Image-Edit /
+Layered / Z-Image pipelines, so the image-worker evicts those before the editor
+allocates (see inference.py _evict_other -> 'klein') and drops the editor before
+loading one of them back.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from . import config
 if TYPE_CHECKING:
     from PIL import Image
 
-logger = logging.getLogger("video_creator.runner.idv2v.flux_edit")
+logger = logging.getLogger("video_creator.runner.image.flux_edit")
 
 
 def resolve_dims(width: int, height: int, max_side: int, base: int = 16) -> tuple[int, int]:
@@ -358,8 +358,71 @@ class FluxKleinEditor:
         x = x.clamp(-1, 1)
         x = rearrange(x[0], "c h w -> h w c")
         out = (127.5 * (x + 1.0)).byte().numpy()
+        return Image.fromarray(out, mode="RGB")
+
+    def generate(
+        self,
+        prompt: str,
+        seed: int,
+        width: int = 1024,
+        height: int = 1024,
+        steps: int | None = None,
+        max_side: int | None = None,
+    ) -> "Image.Image":
+        """Pure text-to-image generation with FLUX.2 [klein] 4B (no reference).
+
+        Klein is a guidance/step-distilled model: BFL ships it at 4 steps /
+        guidance 1.0 (no CFG). Extra steps are largely wasted (distilled), so
+        quality presets map to modest step counts. ``steps`` overrides the
+        config default; ``max_side`` caps the long edge (defaults to config).
+        Runs the same flow as :meth:`edit` but denoises from pure noise with
+        ``img_cond_seq=None`` — no AE reference encode needed.
+        """
+        self.ensure_loaded()
+        import torch
+        from PIL import Image
+        from einops import rearrange
+        from flux2.sampling import (
+            batched_prc_img,
+            batched_prc_txt,
+            denoise,
+            get_schedule,
+            scatter_ids,
+        )
+
+        # Output resolution: caller dims, rounded to /16, capped at max_side.
+        cap = max_side or self._max_side
+        out_w, out_h = resolve_dims(int(width), int(height), cap)
+        n_steps = int(steps) if steps else self._steps
+
+        ctx = self._text_encoder([prompt]).to(torch.bfloat16)
+        ctx, ctx_ids = batched_prc_txt(ctx)
+        self.evict_text_encoder()
+
+        shape = (1, 128, out_h // 16, out_w // 16)
+        generator = torch.Generator(device=self._device).manual_seed(int(seed))
+        randn = torch.randn(shape, generator=generator,
+                            dtype=torch.bfloat16, device=self._device)
+        x, x_ids = batched_prc_img(randn)
+        timesteps = get_schedule(n_steps, x.shape[1])
+
+        with torch.no_grad():
+            x = denoise(
+                self._model, x, x_ids, ctx, ctx_ids,
+                timesteps=timesteps,
+                guidance=self._guidance,
+                img_cond_seq=None,
+                img_cond_seq_ids=None,
+            )
+            x = torch.cat(scatter_ids(x, x_ids)).squeeze(2)
+            x = _tiled_decode(self._ae, x, device=self._device)
+
+        x = x.clamp(-1, 1)
+        x = rearrange(x[0], "c h w -> h w c")
+        out = (127.5 * (x + 1.0)).byte().numpy()
         from PIL import Image
         return Image.fromarray(out, mode="RGB")
+
 
 
 # ---------------------------------------------------------------------------

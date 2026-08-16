@@ -94,7 +94,11 @@ services:
       - LTX_WORKER_URL=http://ltx-worker:8991
       - IDV2V_WORKER_URL=http://idv2v-worker:8992
       - GEMMA_WORKER_URL=http://gemma-worker:8993
+      - IMAGE_WORKER_URL=${IMAGE_WORKER_URL:-http://image-worker:8994}
       - LLM_GPU_DEVICE=${LLM_GPU_DEVICE:-}
+      # Plan B: one task -> one GPU, concurrent across GPUs.
+      - GPU_COUNT=${GPU_COUNT:-3}
+      - GEMMA_RESIDENT_GPU=${GEMMA_RESIDENT_GPU:-0}
       - GEMMA_IDLE_GRACE_S=${GEMMA_IDLE_GRACE_S:-20}
       - HEARTBEAT_INTERVAL_S=${HEARTBEAT_INTERVAL_S:-5}
       - PORT=8991
@@ -136,7 +140,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8991/video-creator/v1/health"]
@@ -181,7 +185,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8992/health"]
@@ -200,9 +204,13 @@ services:
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN:-}
       - GPU_DEVICE=${GPU_DEVICE:-0}
-      # Blank = shares the video GPU (idle-evictable slot). Set e.g. "1" /
-      # "cuda:1" for a dedicated LLM GPU that the live-runner never evicts.
-      - GEMMA_GPU_DEVICE=${LLM_GPU_DEVICE:-}
+      # PIN gemma to a SINGLE physical GPU (CUDA_VISIBLE_DEVICES) so llama.cpp
+      # only initializes CUDA context on that one card instead of spreading
+      # ~4 GiB of context across EVERY visible GPU. Because only one physical
+      # GPU is visible inside this container, it remaps to device index 0, so
+      # GEMMA_GPU_DEVICE must be "0" (not the physical index) here.
+      - CUDA_VISIBLE_DEVICES=${GEMMA_RESIDENT_GPU:-0}
+      - GEMMA_GPU_DEVICE=0
       - GEMMA_MODEL=${GEMMA_MODEL:-/models/gemma/gemma-4-12b-it-qat-q4_0.gguf}
       - GEMMA_MMPROJ=${GEMMA_MMPROJ:-}
       # -1 = all layers offloaded (dedicated GPU). 0 = CPU-only. Set per box.
@@ -219,7 +227,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8993/health"]
@@ -227,6 +235,45 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  image-worker:
+    # Image-worker (Qwen-Image-Edit / Qwen-Image-Layered / Z-Image).
+    # Serves /video-creator/v1/{image,edit,layer}. Sees ALL GPUs (count: all) and
+    # CUDA_VISIBLE_DEVICES is left unset; the live-runner scheduler picks a free GPU
+    # slot and passes its index in the worker /load request (device), so the worker
+    # is NOT pinned — it load-balances across every GPU on the box.
+    image: adastravideo/video-creator:image-worker
+    container_name: video-creator-image-worker
+    depends_on:
+      live-runner:
+        condition: service_healthy
+    runtime: nvidia
+    environment:
+      - WORKER_TOKEN=${WORKER_TOKEN:-}
+      - GPU_DEVICE=${IMAGE_GPU_DEVICE:-0}
+      - QWEN_EDIT_ROOT=${QWEN_EDIT_ROOT:-/models/image/edit}
+      - QWEN_LAYERED_ROOT=${QWEN_LAYERED_ROOT:-/models/image/layered}
+      - ZIMAGE_ROOT=${ZIMAGE_ROOT:-/models/image/zimage}
+      - QWEN_DTYPE=${QWEN_DTYPE:-fp8}
+      - QWEN_OFFLOAD=${QWEN_OFFLOAD:-true}
+      - PORT=8994
+    volumes:
+      - ${MODELS_DIR:-/models}:/models
+    networks:
+      - vc
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8994/video-creator/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
 
 networks:
   vc:

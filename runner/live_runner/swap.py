@@ -75,6 +75,13 @@ class ResidentWorkerManager:
     _current: str | None = field(default=None, init=False)   # shared-GPU resident (never a pinned)
     _pinned_loaded: set[str] = field(default_factory=set, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    # Plan B — per-worker device residency: worker name -> device index it is
+    # resident on. Workers loaded via ensure(name, device=<idx>) stay resident
+    # on that GPU and are NEVER evicted by another worker loading on a different
+    # GPU (each task owns one GPU; cross-GPU eviction would tear down a
+    # concurrently-running task's model). Only the same worker reloads (evict +
+    # rebuild) when asked to move to a different device index.
+    _resident: dict[str, int] = field(default_factory=dict, init=False)
 
     def _base(self, name: str) -> str:
         """Resolve a worker name to its base URL from the injected mapping."""
@@ -102,13 +109,38 @@ class ResidentWorkerManager:
                     self._pinned_loaded.add(name)
                     logger.info("GPU pin: %s resident (dedicated)", name)
 
-    async def ensure(self, name: str) -> None:
+    async def ensure(self, name: str, device: int | None = None) -> None:
         """Make ``name`` resident: evict the current shared resident (if any), load ``name``.
 
         Pinned workers load (once) and are never evicted; shared-GPU workers (a
         pinned worker is never ``_current``) evict each other.
+
+        Plan B (``device`` supplied): ``name`` is loaded resident on that single
+        GPU index and stays there — it is tracked in ``_resident`` and is never
+        evicted by another worker (which runs on a different GPU). If the same
+        worker is asked to move to a different device, it evicts + reloads. This
+        lets different tasks run concurrently on different GPUs.
         """
         async with self._lock:
+            if device is not None:
+                if self._resident.get(name) == device:
+                    return  # already resident on that GPU
+                if name in self.pinned:
+                    self._resident[name] = device
+                    self._pinned_loaded.add(name)
+                    await self.transport.post(self._base(name), "/load",
+                                              {"device": device})
+                    return
+                # Load (or relocate) this worker on the given device. Per-worker
+                # residency: no cross-worker eviction (different GPUs).
+                self._resident[name] = device
+                await self.transport.post(self._base(name), "/load",
+                                          {"device": device})
+                if self._current == name:
+                    self._current = None
+                logger.info("GPU pin: %s resident on GPU %d", name, device)
+                return
+            # Legacy shared-GPU path (no device): evict-before-load.
             if name in self.pinned:
                 if name not in self._pinned_loaded:
                     await self.transport.post(self._base(name), "/load")
@@ -122,6 +154,15 @@ class ResidentWorkerManager:
             await self.transport.post(self._base(name), "/load")
             self._current = name
             logger.info("GPU swap: %s resident", name)
+
+    async def evict(self, name: str) -> None:
+        """Evict a specific worker's residency (Plan B / manual)."""
+        async with self._lock:
+            self._resident.pop(name, None)
+            if self._current == name:
+                self._current = None
+            await self.transport.post(self._base(name), "/evict")
+            logger.info("GPU swap: evicted %s", name)
 
     async def backfill(self, name: str) -> None:
         """Load ``name`` only if it won't displace anything (idle-safe, no eviction)."""

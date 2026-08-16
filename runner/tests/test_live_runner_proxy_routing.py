@@ -27,7 +27,7 @@ def handle_endpoint(endpoint: str):
 
 @pytest.mark.parametrize("endpoint,expected_worker", [
     ("restyle", "idv2v-worker"),
-    ("image", "ltx-worker"),
+    ("image", "image-worker"),
     ("t2v", "ltx-worker"),
     ("i2v", "ltx-worker"),
 ])

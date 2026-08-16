@@ -71,22 +71,6 @@ IDV2V_VRAM_BUFFER = int(os.environ.get("IDV2V_VRAM_BUFFER", "10"))
 # so the worker no longer needs to int8-quantize the T5/CLIP to fit.
 IDV2V_STAGED = os.environ.get("IDV2V_STAGED", "true").lower() in {"1", "true", "yes"}
 
-# TeaCache: skip redundant DiT-block computation across denoise steps by
-# reusing the stored residual when the (rescaled) relative-L1 drift of the
-# modulated time-embedding stays below the threshold. Cheap throughput win with
-# minimal visual change when the threshold is kept low. The first and last
-# denoise steps are ALWAYS computed (built into the algorithm).
-#   IDV2V_TEACACHE        "1"/"0"      master switch (default ON)
-#   IDV2V_TEACACHE_THRESH float        rel-L1 accumulation threshold. LOWER =
-#                           more steps computed = less visual degradation, less
-#                           speedup. Conservative default 0.10; 0.06-0.08 for
-#                           near-invisible; 0.15-0.25 aggressive (flicker risk).
-#   IDV2V_TEACACHE_MODEL  str          one of diffsynth's supported ids; "" =
-#                           auto-select from height (I2V-14B-480P / -720P).
-IDV2V_TEACACHE = os.environ.get("IDV2V_TEACACHE", "1").lower() in {"1", "true", "yes"}
-IDV2V_TEACACHE_THRESH = float(os.environ.get("IDV2V_TEACACHE_THRESH", "0.10"))
-IDV2V_TEACACHE_MODEL = os.environ.get("IDV2V_TEACACHE_MODEL", "")
-
 # Gemma 3 LLM support (prompt enhancement + automatic video captioning).
 # Reuses the already-provisioned Lightricks/gemma-3-12b-it-qat-q4_0-unquantized
 # checkpoint on the shared /models/gemma mount (the LTX runner drops it there).
@@ -159,84 +143,3 @@ def _random_token() -> str:
     import random
     import string
     return "".join(random.choices(string.ascii_letters + string.digits, k=32))
-
-
-# FLUX.2 [klein] 4B image editing (first-frame styling).
-#
-# BFL's earliest/lightest 4B image-editing model — a guidance- AND
-# step-distilled rectified-flow transformer. Distillation fixes both knobs:
-#   * num_steps = 4        (the 50-step "klein-base-4B" is for fine-tuning/control,
-#                           not production editing — we use the distilled model)
-#   * guidance  = 1.0      (no CFG; `denoise`, not `denoise_cfg`)
-# Editing is single-reference conditioning: the first frame is encoded through
-# the FLUX.2 AE into `ref_tokens` and passed to `denoise` as `img_cond_seq`;
-# the prompt describes the DESIRED (styled) result.
-#
-# Three components must be resident to edit:
-#   * the 4B flow transformer  (<KLEIN4B_MODEL>, ~8 GB bf16)
-#   * the FLUX.2 autoencoder   (<KLEIN4B_AE>, from the FLUX.2-dev repo)
-#   * a Qwen3 4B text embedder (<KLEIN4B_TEXT_ENC>, hidden states [9,18,27]) —
-#     a SEPARATE LLM from Gemma. It cannot coexist on one card with the id-v2v
-#     DiT/VACE (~19.5 GB) or a Gemma LLM, so the editor uses the same staged/
-#     evict lifecycle (see flux_edit.py).
-#
-#   KLEIN4B_ENABLED   "auto" (use only if <KLEIN4B_MODEL> exists) | "1" | "0"
-#                     | "force" (error if absent). Frames are styled with FLUX.2
-#                     only when this is on AND the caller requests it.
-#   KLEIN4B_MODEL     path to flux-2-klein-4b.safetensors (env KLEIN_4B_MODEL_PATH
-#                     is what the BFL loader reads; we set it before load).
-#   KLEIN4B_AE        path to ae.safetensors (env AE_MODEL_PATH).
-#   KLEIN4B_TEXT_ENC  HF id of the Qwen3 text embedder (default Qwen/Qwen3-4B, bf16).
-#   KLEIN4B_GPU_DEVICE device for the editor (default "" = video GPU_DEVICE; set
-#                     e.g. cuda:1 for a card that doesn't contend with the video).
-#   KLEIN4B_STEPS / KLEIN4B_GUIDANCE  distilled defaults (4 / 1.0) — overridable
-#                     only for experimentation; BFL intends them fixed.
-#   KLEIN4B_MAX_SIDE  cap on the styled frame's long edge. Default 1472 = the
-#                     empirically-tested ceiling on a 31.4 GB card (flow 8 + AE +
-#                     Qwen3 bf16 ~16 GB weights + encode/denoise activations): a
-#                     1080p 1920 frame OOMs at the AE encode, 1472 fits. It anchors
-#                     With tiled AE (ref encode capped at KLEIN4B_REF_SIDE, decode
-#                     tiled), the OUTPUT can be native 1920x1080; MAX_SIDE only
-#                     guards against a stray unbounded input. Callers pass explicit
-#                     1920x1080 for full-HD output.
-#   KLEIN4B_REF_SIDE  cap on the long edge of the REFERENCE image fed to the AE
-#                     for conditioning (default 1024). The reference only yields
-#                     ref_tokens; it is re-encoded at this size so the AE encode
-#                     stays VRAM-light even for a native-1080p edit. This is what
-#                     makes full-HD output fit on a 31.4 GB card.
-KLEIN4B_ENABLED = os.environ.get("KLEIN4B_ENABLED", "auto")
-KLEIN4B_MODEL = os.environ.get("KLEIN4B_MODEL", "/models/flux2/flux-2-klein-4b.safetensors")
-KLEIN4B_AE = os.environ.get("KLEIN4B_AE", "/models/flux2/ae.safetensors")
-KLEIN4B_TEXT_ENC = os.environ.get("KLEIN4B_TEXT_ENC", "Qwen/Qwen3-4B")
-KLEIN4B_GPU_DEVICE = os.environ.get("KLEIN4B_GPU_DEVICE", "")
-KLEIN4B_STEPS = int(os.environ.get("KLEIN4B_STEPS", "4"))
-KLEIN4B_GUIDANCE = float(os.environ.get("KLEIN4B_GUIDANCE", "1.0"))
-KLEIN4B_MAX_SIDE = int(os.environ.get("KLEIN4B_MAX_SIDE", "1920"))
-KLEIN4B_REF_SIDE = int(os.environ.get("KLEIN4B_REF_SIDE", "1024"))
-
-
-def klein4b_device() -> str:
-    """GPU the FLUX.2 Klein editor runs on (defaults to the video model's)."""
-    return KLEIN4B_GPU_DEVICE or GPU_DEVICE
-
-
-def klein4b_steps() -> int:
-    return KLEIN4B_STEPS
-
-
-def klein4b_guidance() -> float:
-    return KLEIN4B_GUIDANCE
-
-
-def klein4b_enabled() -> bool:
-    """Whether the FLUX.2 Klein first-frame editor may be engaged.
-
-    "auto": engage when the flow weight is present on disk. "1"/"force": always
-    (a missing weight then surfaces as a load error). "0": never.
-    """
-    mode = KLEIN4B_ENABLED.strip().lower()
-    if mode in ("0", "false", "no", "off"):
-        return False
-    if mode in ("1", "true", "yes", "force"):
-        return True
-    return os.path.isfile(KLEIN4B_MODEL)

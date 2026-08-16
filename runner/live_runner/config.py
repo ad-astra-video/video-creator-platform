@@ -23,6 +23,19 @@ HEARTBEAT_INTERVAL_S = float(os.environ.get("HEARTBEAT_INTERVAL_S", "5"))
 LTX_WORKER_URL = os.environ.get("LTX_WORKER_URL", "http://ltx-worker:8991")
 IDV2V_WORKER_URL = os.environ.get("IDV2V_WORKER_URL", "http://idv2v-worker:8992")
 GEMMA_WORKER_URL = os.environ.get("GEMMA_WORKER_URL", "http://gemma-worker:8993")
+IMAGE_WORKER_URL = os.environ.get("IMAGE_WORKER_URL", "http://image-worker:8994")
+
+# Plan B — GPU concurrency scheduler (one task -> one GPU, concurrent across GPUs).
+# -----------------------------------------------------------------------------
+# The box's GPU count (Docker gives every worker container access to ALL GPUs;
+# the live-runner picks which single GPU each task runs on and sends it in the
+# /load body). Default 3 (the .151 box is 3x RTX 5090).
+GPU_COUNT = int(os.environ.get("GPU_COUNT", "3"))
+# The GPU the gemma-worker loads on at startup and STAYS resident on. The
+# scheduler holds this GPU out of the task pool (marks it resident for gemma).
+GEMMA_RESIDENT_GPU = int(os.environ.get("GEMMA_RESIDENT_GPU", "0"))
+# How long a task waits FIFO for a GPU to free up before timing out with 503.
+SCHEDULER_QUEUE_TIMEOUT_S = float(os.environ.get("SCHEDULER_QUEUE_TIMEOUT_S", "600.0"))
 
 # Gemma LLM backend residency (drives the swap policy + idle backfill).
 #   LLM_GPU_DEVICE = "" (BLANK)  -> LLM shares the video GPU: idle-resident
@@ -59,4 +72,5 @@ WORKERS = {
     "ltx-worker": LTX_WORKER_URL,
     "idv2v-worker": IDV2V_WORKER_URL,
     "gemma-worker": GEMMA_WORKER_URL,
+    "image-worker": IMAGE_WORKER_URL,
 }
