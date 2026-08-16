@@ -193,3 +193,89 @@ def test_handle_image_routes_klein(monkeypatch):
             await client.close()
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Qwen-Image-Layered — nested output extraction + RGBA input (the fixes)
+# ---------------------------------------------------------------------------
+
+class _Out:
+    """Mimics diffusers QwenImageLayeredPipeline's nested return:
+    out.images == [ [layer_0, ...] ] (outer = batches, inner = layer frames)."""
+    def __init__(self, framesis):
+        self.images = framesis
+
+
+def test_extract_layers_handles_nested_diffusers_batch_output():
+    """Regression: diffusers returns out.images = [[L0, L1, L2, L3]] (nested per
+    batch). The old code treated it as a FLAT list, found no PILs, and fell back
+    to the naive split. We must unwrap the first batch and return the layers."""
+    from runner.image.inference import _extract_layers
+    layers = [Image.new("RGBA", (8, 8), c) for c in
+              ((255,0,0,255),(0,255,0,255),(0,0,255,255),(255,255,0,255))]
+    out = _Out([layers])          # one batch -> nested list of 4 layers
+    got = _extract_layers(out, 4)
+    assert got is not None and len(got) == 4
+    assert all(im.mode == "RGBA" for im in got)
+
+
+def test_extract_layers_falls_back_when_fewer_frames_than_requested():
+    from runner.image.inference import _extract_layers
+    layers = [Image.new("RGBA", (8, 8))]
+    out = _Out([layers])
+    assert _extract_layers(out, 4) is None  # 1 < 4 -> caller uses naive fallback
+
+
+def test_extract_layers_accepts_flat_list_too():
+    from runner.image.inference import _extract_layers
+    layers = [Image.new("RGBA", (8, 8)) for _ in range(4)]
+    out = _Out(layers)             # some versions may return a flat list
+    got = _extract_layers(out, 4)
+    assert got is not None and len(got) == 4
+
+
+def test_extract_layers_returns_none_when_not_introspectable():
+    from runner.image.inference import _extract_layers
+    class _Weird:
+        def __init__(self): self.images = None
+    assert _extract_layers(_Weird(), 4) is None
+
+
+def test_layered_decompose_feeds_rgba_not_rgb(monkeypatch):
+    """Regression: the layered VAE first-conv wants a 4-channel RGBA input, but
+    _decoded_pil returns RGB (3ch) -> "expected ... 4 channels, but got 3".
+    layered_decompose must convert the source to RGBA before the pipeline call."""
+    from runner.image.inference import ImageInferenceEngine, _extract_layers
+    import runner.image.config as _img_cfg
+
+    captured = {}
+    class _FakePipe:
+        def __call__(self, **kw):
+            captured.update(kw)
+            # Return 4 nested RGBA layers so real extraction path runs
+            layers = [Image.new("RGBA", (16, 16), c) for c in
+                      ((255,0,0,255),(0,255,0,255),(0,0,255,255),(255,255,0,255))]
+            return _Out([layers])
+
+    eng = ImageInferenceEngine.__new__(ImageInferenceEngine)
+    eng._qwen_layered = _FakePipe()
+    eng._model_lock = __import__("threading").RLock()
+    # _evict_other does `import torch`; not in the test env -> stub it.
+    eng._evict_other = lambda keeper: None
+    monkeypatch.setattr(_img_cfg, "QWEN_LAYERS", 4)
+    monkeypatch.setattr(_img_cfg, "QWEN_MAX_LAYERS", 8)
+    monkeypatch.setattr(_img_cfg, "QWEN_LAYER_MAX_INPUT_SIDE", 1024)
+    monkeypatch.setattr(_img_cfg, "QWEN_LAYER_PREVIEW_SIDE", 8)
+
+    src = Image.new("RGB", (16, 16), (200, 100, 50))  # 3-channel source
+    res = eng.layered_decompose(src, layers=4, preview_only=False)
+    # The pipeline must have received an RGBA (4-channel) image.
+    assert "image" in captured
+    assert captured["image"].mode == "RGBA"
+    assert captured["layers"] == 4
+    # Real layers (not naive): each layer RGBA, labels present, composite exists.
+    assert len(res["layers"]) == 4
+    assert [l["label"] for l in res["layers"]] == [
+        "foreground", "midground", "midground", "background"]
+    assert all(l["rgba_b64"] for l in res["layers"])
+    assert res["composite"]

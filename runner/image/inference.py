@@ -105,14 +105,29 @@ def _naive_layers(src: Image.Image, n: int) -> list[Image.Image]:
 
 def _extract_layers(out: Any, n: int) -> list[Image.Image] | None:
     """Best-effort extraction of ``n`` per-layer RGBA images from a layered-pipeline
-    return. Returns None (caller falls back) on any shape we can't parse."""
+    return. Returns None (caller falls back) on any shape we can't parse.
+
+    diffusers' QwenImageLayeredPipeline returns a *nested* ``out.images``: one inner
+    list per batch item, each holding that batch's layer frames (the raw composite
+    frame is stripped by the pipeline before decode, so every inner element is a
+    single decomposed layer). E.g. for 4 layers / batch=1::
+
+        out.images == [ [layer_0, layer_1, layer_2, layer_3] ]
+
+    We take the first batch's inner list and keep the first ``n`` PIL frames.
+    """
     try:
         images = getattr(out, "images", None)
-        if images is None:
-            return None
         if isinstance(images, Image.Image):
             images = [images]
-        images = [im for im in images if isinstance(im, Image.Image)]
+        if isinstance(images, (list, tuple)):
+            # Unwrap one level of batching: if the outer sequence holds lists/tuples
+            # (diffusers nested output), flatten to the first batch's frames.
+            if images and isinstance(images[0], (list, tuple)):
+                images = list(images[0])
+            images = [im for im in images if isinstance(im, Image.Image)]
+        else:
+            return None
         if len(images) < n:
             return None
         return [im.convert("RGBA") for im in images[:n]]
@@ -214,10 +229,10 @@ class ImageInferenceEngine:
 
         Honors QWEN_LAYERED_DTYPE independently of QWEN_DTYPE. When 'fp8'
         (default), the transformer is the PRE-QUANTIZED FP8 (E4M3FN) single-file
-        checkpoint from T5B/Qwen-Image-Layered-FP8: it is loaded directly and
-        widened fp8->bf16 in one streamed copy, so NO in-flight torchao
-        quantization runs at load (avoid quantizing in flight). 'bf16'/'int8'
-        fall back to the bf16-load path (int8 then applies torchao at load).
+        checkpoint from T5B/Qwen-Image-Layered-FP8. It is loaded with fp8 only on
+        the transformer (text_encoder + vae stay bf16 via PipelineQuantizationConfig)
+        so the pre-quantized fp8 fits the card AND every matmul is dtype-consistent.
+        'bf16'/'int8' fall back to the bf16-load path (int8 then applies torchao).
         """
         with self._model_lock:
             if self._qwen_layered is None:
@@ -227,10 +242,37 @@ class ImageInferenceEngine:
                 logger.info("Loading Qwen-Image-Layered from %s (layered_dtype=%s, offload=%s)",
                             _cfg.QWEN_LAYERED_ROOT, ldt, _cfg.QWEN_OFFLOAD)
                 if ldt == "fp8":
-                    self._qwen_layered = QwenImageLayeredPipeline.from_pretrained(
-                        _cfg.QWEN_LAYERED_ROOT,
-                        torch_dtype=torch.bfloat16,
+                    # Qwen-Image-Layered-FP8 is PRE-QUANTIZED (mixed F8_E4M3 + BF16
+                    # on disk). Pitfalls that break naive loads:
+                    #  * torch_dtype=torch.bfloat16 WIDENS the fp8 weights to bf16
+                    #    (~2x VRAM) -> OOM on 24-32GB cards.
+                    #  * torch_dtype=None on the WHOLE pipeline keeps fp8 but leaves
+                    #    the text_encoder/VAE as fp32 -> dtype mismatch on their convs.
+                    #  * torch_dtype=float8_e4m3fn on the WHOLE pipeline cannot
+                    #    deserialize (set_default_dtype(fp8) unsupported for the
+                    #    transformers text_encoder).
+                    # Correct load: per-component. Transformer loads at its NATIVE
+                    # pre-quantized dtype (fp8 deserialized as torchao Float8Tensor,
+                    # so fp8xbf16 scaled matmul dispatches correctly); text_encoder +
+                    # vae load at bf16 (they aren't fp8 and must be dtype-consistent).
+                    from transformers import (
+                        AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration,
                     )
+                    from diffusers import (
+                        AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler,
+                        QwenImageTransformer2DModel,
+                    )
+                    root = _cfg.QWEN_LAYERED_ROOT
+                    _sched = FlowMatchEulerDiscreteScheduler.from_pretrained(f"{root}/scheduler")
+                    _vae = AutoencoderKLQwenImage.from_pretrained(f"{root}/vae", torch_dtype=torch.bfloat16)
+                    _te = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        f"{root}/text_encoder", torch_dtype=torch.bfloat16)
+                    _tok = AutoTokenizer.from_pretrained(f"{root}/tokenizer")
+                    _proc = AutoProcessor.from_pretrained(f"{root}/processor")
+                    _tr = QwenImageTransformer2DModel.from_pretrained(f"{root}/transformer")
+                    self._qwen_layered = QwenImageLayeredPipeline(
+                        scheduler=_sched, vae=_vae, text_encoder=_te,
+                        tokenizer=_tok, processor=_proc, transformer=_tr)
                 else:
                     self._qwen_layered = QwenImageLayeredPipeline.from_pretrained(
                         _cfg.QWEN_LAYERED_ROOT,
@@ -435,12 +477,18 @@ class ImageInferenceEngine:
         n = layers if layers is not None else _cfg.QWEN_LAYERS
         n = max(2, min(int(n), _cfg.QWEN_MAX_LAYERS))
 
+        # Qwen-Image-Layered's VAE first-conv expects a 4-channel RGBA input
+        # (the layers are spawned FROM the source's alpha-bearing image). The
+        # generic decoder returns RGB, so promote to RGBA for the layered call
+        # (unused channels are opaque white, matching the official example).
+        layered_src = src.convert("RGBA")
+
         layer_imgs: list[Image.Image] | None = None
         if not preview_only:
             try:
                 self._evict_other("layered")
                 pipe = self._qwen_layered_pipe()
-                call_kw = dict(image=src, layers=n)
+                call_kw = dict(image=layered_src, layers=n)
                 if resolution:
                     call_kw["resolution"] = resolution
                 out = pipe(**call_kw)
