@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { DollarSign, Info, RefreshCw, Server } from 'lucide-react'
+import { AlertTriangle, DollarSign, Info, RefreshCw, Server } from 'lucide-react'
 import { ApiClient } from '../../lib/api-client'
 import { getEthUsd, weiToUsd } from '../../lib/ethPrice'
 import { Button } from '../ui/button'
@@ -19,6 +19,7 @@ interface ProviderDto {
   excluded: boolean
   demo?: boolean
   capabilities?: RunnerCap[]
+  models?: string[]
 }
 
 // Browser-local list of runner addresses the user has chosen not to use ("excluded"),
@@ -175,6 +176,16 @@ export function RunnersSection() {
         </div>
       ) : (
         <div className="space-y-2">
+          {demo && (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200 leading-relaxed">
+              <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+              <span>
+                <span className="font-semibold">Demo placeholders.</span> The runners below are sample
+                entries from the platform catalog and <span className="font-semibold">cannot perform real work</span>.
+                Configure a Livepeer Discovery URL in Settings to connect real runners.
+              </span>
+            </div>
+          )}
           {providers.map(p => {
             const ex = isExcluded(p)
             return (
@@ -229,6 +240,16 @@ export function RunnersSection() {
                     {p.capabilities!.map(c => (
                       <span key={c.id} className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400">
                         {c.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {p.models && p.models.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500">
+                    <span>Models:</span>
+                    {p.models.map(m => (
+                      <span key={m} className="px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-400">
+                        {m}
                       </span>
                     ))}
                   </div>

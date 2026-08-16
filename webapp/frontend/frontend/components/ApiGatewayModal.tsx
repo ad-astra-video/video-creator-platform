@@ -19,6 +19,11 @@ export interface ApiGatewaySection {
   onSaveLivepeer?: (discoveryUrl: string, apiKey: string) => Promise<void> | void
   onGetKey?: () => void
   getKeyLabel?: string
+  // Current configured value(s) shown in read-only form once isConfigured is true.
+  /** Display value for the primary field when configured (e.g. the Livepeer Discovery URL). */
+  currentValue?: string
+  /** Whether a secret (API key) is already saved for this section (shown as a masked set marker). */
+  secretConfigured?: boolean
 }
 
 export interface ApiGatewayModalProps {
@@ -60,6 +65,9 @@ export function ApiGatewayModal({
   const [livepeerKey, setLivepeerKey] = useState('')
   const [isSaving, setIsSaving] = useState<Record<ApiKeyType, boolean>>({ ltx: false, fal: false, livepeer: false })
   const [errors, setErrors] = useState<Record<ApiKeyType, string | null>>({ ltx: null, fal: null, livepeer: null })
+  // Per-section edit mode: true means the user clicked "Update" on an already-configured
+  // section and the editable fields are shown.
+  const [editing, setEditing] = useState<Record<ApiKeyType, boolean>>({ ltx: false, fal: false, livepeer: false })
 
   useEffect(() => {
     if (!isOpen) return
@@ -67,6 +75,7 @@ export function ApiGatewayModal({
     setLivepeerKey('')
     setIsSaving({ ltx: false, fal: false, livepeer: false })
     setErrors({ ltx: null, fal: null, livepeer: null })
+    setEditing({ ltx: false, fal: false, livepeer: false })
   }, [isOpen])
 
   const allRequiredConfigured = useMemo(() => {
@@ -94,6 +103,20 @@ export function ApiGatewayModal({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [isOpen, onClose])
 
+  // Flip a configured section into edit mode. For Livepeer the discovery URL is prefilled
+  // with the current value so the user can see and adjust it; secrets are never prefilled
+  // (they are only stored one-way).
+  const startEditing = (section: ApiGatewaySection) => {
+    if (section.keyType === 'livepeer') {
+      setValues((prev) => ({ ...prev, livepeer: section.currentValue ?? '' }))
+      setLivepeerKey('')
+    } else {
+      setValues((prev) => ({ ...prev, [section.keyType]: '' }))
+    }
+    setErrors((prev) => ({ ...prev, [section.keyType]: null }))
+    setEditing((prev) => ({ ...prev, [section.keyType]: true }))
+  }
+
   const handleSave = async (section: ApiGatewaySection) => {
     const keyType = section.keyType
 
@@ -110,6 +133,7 @@ export function ApiGatewayModal({
         await section.onSaveLivepeer(url, key)
         setValues((prev) => ({ ...prev, livepeer: '' }))
         setLivepeerKey('')
+        setEditing((prev) => ({ ...prev, livepeer: false }))
       } catch (err) {
         if (err instanceof Error && err.message.trim()) {
           setErrors((prev) => ({ ...prev, livepeer: err.message }))
@@ -133,6 +157,7 @@ export function ApiGatewayModal({
     try {
       await section.onSave(trimmedKey)
       setValues((prev) => ({ ...prev, [keyType]: '' }))
+      setEditing((prev) => ({ ...prev, [keyType]: false }))
     } catch (err) {
       if (err instanceof Error && err.message.trim()) {
         setErrors((prev) => ({ ...prev, [keyType]: err.message }))
@@ -152,9 +177,9 @@ export function ApiGatewayModal({
   if (!isOpen) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-      <div className="w-full max-w-[620px] rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl overflow-hidden">
-        <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-[620px] my-[5vh] flex-col overflow-hidden rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl">
+        <div className="flex shrink-0 items-center justify-between border-b border-zinc-800 px-5 py-4">
           <div className="flex items-center gap-2.5">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-500/15 text-blue-300">
               <KeyRound className="h-4 w-4" />
@@ -170,7 +195,7 @@ export function ApiGatewayModal({
           </button>
         </div>
 
-        <div className="space-y-5 px-5 py-5">
+        <div className="space-y-5 overflow-y-auto px-5 py-5">
           <p className="text-sm leading-relaxed text-zinc-300">{description}</p>
 
           <div className="space-y-4">
@@ -182,6 +207,10 @@ export function ApiGatewayModal({
               const saving = isSaving[section.keyType]
               const value = values[section.keyType] ?? ''
               const error = errors[section.keyType]
+              const isEditing = editing[section.keyType]
+              // Show editable fields when the section isn't configured yet, or when the
+              // user explicitly clicked "Update" on an already-configured section.
+              const showEdit = !configured || isEditing
               const canSubmit =
                 section.keyType === 'livepeer'
                   ? value.trim().length > 0 && !saving
@@ -205,7 +234,7 @@ export function ApiGatewayModal({
                     </div>
                   </div>
 
-                  {!configured && (
+                  {showEdit ? (
                     <div className="space-y-2">
                       {isLivepeer ? (
                         <>
@@ -228,18 +257,24 @@ export function ApiGatewayModal({
                       ) : (
                         <>
                           <label className="block text-xs text-zinc-300">{section.inputLabel}</label>
-                          <div className="flex gap-2">
-                            <LtxApiKeyInput
-                              value={value}
-                              onChange={(event) => setValues((prev) => ({ ...prev, [section.keyType]: event.target.value }))}
-                              placeholder={section.placeholder ?? 'Paste your API key'}
-                              className="flex-1"
-                            />
-                          </div>
+                          <LtxApiKeyInput
+                            value={value}
+                            onChange={(event) => setValues((prev) => ({ ...prev, [section.keyType]: event.target.value }))}
+                            placeholder={section.placeholder ?? 'Paste your API key'}
+                            className="w-full"
+                          />
                         </>
                       )}
 
                       <div className="flex gap-2 justify-end">
+                        {configured && (
+                          <button
+                            onClick={() => setEditing((prev) => ({ ...prev, [section.keyType]: false }))}
+                            className="px-3 py-2 text-sm text-zinc-400 rounded-lg hover:bg-zinc-800 hover:text-zinc-200 transition-colors whitespace-nowrap"
+                          >
+                            Cancel
+                          </button>
+                        )}
                         <button
                           onClick={() => handleSave(section)}
                           disabled={!canSubmit}
@@ -251,6 +286,50 @@ export function ApiGatewayModal({
                       {section.onGetKey && (
                         <ApiKeyHelperRow label={section.getKeyLabel ?? 'Get API key'} onOpenKey={section.onGetKey} />
                       )}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {isLivepeer ? (
+                        <>
+                          <label className="block text-xs text-zinc-300">{section.primaryLabel ?? 'Livepeer Discovery URL'}</label>
+                          <LtxApiKeyInput
+                            value={section.currentValue ?? ''}
+                            onChange={() => {}}
+                            placeholder="Not configured"
+                            masked={false}
+                            disabled
+                            className="w-full"
+                          />
+                          <label className="block text-xs text-zinc-300">{section.inputLabel}</label>
+                          <LtxApiKeyInput
+                            value=""
+                            onChange={() => {}}
+                            placeholder={section.secretConfigured ? '•••••••••• (set)' : 'Not configured'}
+                            disabled
+                            className="w-full"
+                          />
+                        </>
+                      ) : (
+                        <>
+                          <label className="block text-xs text-zinc-300">{section.inputLabel}</label>
+                          <LtxApiKeyInput
+                            value=""
+                            onChange={() => {}}
+                            placeholder={section.secretConfigured ? '•••••••••• (set)' : 'Not configured'}
+                            disabled
+                            className="w-full"
+                          />
+                        </>
+                      )}
+
+                      <div className="flex justify-end">
+                        <button
+                          onClick={() => startEditing(section)}
+                          className="px-3 py-2 text-sm rounded-lg border border-zinc-600 text-zinc-200 hover:bg-zinc-800 transition-colors whitespace-nowrap"
+                        >
+                          Update
+                        </button>
+                      </div>
                     </div>
                   )}
 

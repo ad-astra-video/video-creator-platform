@@ -456,6 +456,8 @@ function AppContent() {
         primaryPlaceholder: 'https://orchestrator:8935/discovery',
         inputLabel: 'Livepeer API key',
         placeholder: 'Enter your Livepeer API key...',
+        currentValue: settings.livepeerDiscoveryUrl,
+        secretConfigured: settings.hasLivepeerApiKey,
         onSave: saveLivepeerDiscoveryUrl,
         onSaveLivepeer: async (url, key) => {
           await saveLivepeerDiscoveryUrl(url)
@@ -472,6 +474,7 @@ function AppContent() {
         isConfigured: settings.hasLtxApiKey,
         inputLabel: 'LTX API key',
         placeholder: 'Enter your LTX API key...',
+        secretConfigured: settings.hasLtxApiKey,
         onSave: handleSaveLtxKey,
         onGetKey: () => window.electronAPI.openLtxApiKeyPage(),
         getKeyLabel: 'Get LTX API key',
@@ -484,6 +487,7 @@ function AppContent() {
         isConfigured: settings.hasFalApiKey,
         inputLabel: 'FAL AI API key',
         placeholder: 'Enter your FAL AI API key...',
+        secretConfigured: settings.hasFalApiKey,
         onSave: saveFalApiKey,
         onGetKey: () => window.electronAPI.openFalApiKeyPage(),
         getKeyLabel: 'Get FAL API key',
