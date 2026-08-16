@@ -350,6 +350,7 @@ class ImageInferenceEngine:
             self._evict_other("zimage")
             pipe = self._zimage_pipe()
             call_kw = dict(prompt=prompt, strength=strength)
+            self._zimage_call_kw(kw)
             if mask_img is not None:
                 # Use the Z-Image inpaint pipeline for a masked edit.
                 from diffusers import ZImageInpaintPipeline  # lazy
@@ -383,6 +384,7 @@ class ImageInferenceEngine:
     def plain_image(self, prompt, **kw) -> Image.Image:
         """Text-to-image generation via Z-Image (Turbo) -> a single PIL.Image."""
         self._evict_other("zimage")
+        self._zimage_call_kw(kw)
         pipe = self._zimage_pipe()
         out = pipe(prompt=prompt, **kw)
         return _to_pil(out)
@@ -494,6 +496,24 @@ class ImageInferenceEngine:
             # burst of style-frame requests reuses the loaded editor (like other
             # pipelines). free() drops it.
             pass
+
+    def _zimage_call_kw(self, kw: dict) -> dict:
+        """Translate a ``seed`` kwarg into the ``generator`` Z-Image expects.
+
+        ZImagePipeline / ZImageImg2ImgPipeline / ZImageInpaintPipeline take a
+        ``generator`` (a seeded torch.Generator) for reproducibility and DO NOT
+        accept a bare ``seed`` key — passing one raises TypeError. When a seed is
+        present, pop it and build a generator seeded with it; otherwise leave the
+        kwargs untouched (random draw). Return the (possibly mutated) kwargs dict.
+        """
+        if "seed" not in kw:
+            return kw
+        import torch  # lazy
+        seed = int(kw.pop("seed"))
+        idx = self.current_device
+        device = f"cuda:{idx}" if idx is not None else "cpu"
+        kw["generator"] = torch.Generator(device=device).manual_seed(seed)
+        return kw
 
     def _pipe_kwargs(self) -> dict:
         """Shared kwargs for from_pretrained pipeline loads (dtype resolution)."""

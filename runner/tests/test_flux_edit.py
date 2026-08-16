@@ -89,6 +89,44 @@ def test_image_klein_steps_presets():
     assert image_server._image_klein_steps({"quality": "bogus"}) == 4
 
 
+def test_zimage_call_kw_seed_to_generator(monkeypatch):
+    """Z-Image pipelines take a seeded torch.Generator, not a bare 'seed' key.
+
+    `_zimage_call_kw` must pop `seed` and build a generator; leaving `seed` in
+    the kwargs would make ZImagePipeline.__call__ raise TypeError (the live 500
+    this guards against). Torch isn't installed in the test env, so we stub it.
+    """
+    import sys
+
+    calls = {}
+
+    class _FakeGenerator:
+        def __init__(self, device): self.device = device; self._seed = None
+        def manual_seed(self, s): self._seed = s; return self
+
+    class _FakeTorch:
+        @staticmethod
+        def Generator(device=None):
+            calls["device"] = device
+            return _FakeGenerator(device)
+
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch())
+
+    from runner.image.inference import ImageInferenceEngine
+    eng = ImageInferenceEngine.__new__(ImageInferenceEngine)
+    eng.current_device = 2
+
+    # seed present -> popped, generator built on that device
+    out = eng._zimage_call_kw({"seed": 42, "width": 512})
+    assert "seed" not in out
+    assert "generator" in out and out["width"] == 512
+    assert out["generator"]._seed == 42
+    assert calls.get("device") == "cuda:2"
+
+    # no seed -> untouched
+    assert eng._zimage_call_kw({"width": 512}) == {"width": 512}
+
+
 class _DummyImageEngine:
     """Never touches torch — records the dispatch and returns a tiny image.
 
@@ -104,7 +142,7 @@ class _DummyImageEngine:
 
     def klein_image(self, prompt, seed=123, width=1024, height=1024,
                     num_inference_steps=None, **kw):
-        self.last = ("klein_image", prompt, kw, width, height)
+        self.last = ("klein_image", prompt, kw, width, height, seed)
         return Image.new("RGB", (8, 8), (255, 0, 0))
 
 
@@ -144,10 +182,13 @@ def test_handle_image_routes_klein(monkeypatch):
             body = await resp.json()
             assert body["engine"] == "klein"
             assert body["num_inference_steps"] == 12  # quality=high preset
+            assert body["seed"] == 7  # echoed back verbatim
             assert eng.last[0] == "klein_image"
-            _, prompt, kw, width, height = eng.last
+            _, prompt, kw, width, height, seed = eng.last
             assert prompt == "a red sports car on a coastal road"
             assert width == 1024 and height == 576
+            # The client seed reached the engine's klein_image seed param.
+            assert seed == 7
         finally:
             await client.close()
 

@@ -18,6 +18,7 @@ import asyncio
 import functools
 import logging
 import os
+import random
 import uuid
 
 from aiohttp import web
@@ -311,9 +312,14 @@ async def handle_image(req: web.Request) -> web.Response:
             status=503,
         )
     kw = {}
-    for k in ("width", "height", "seed"):
+    for k in ("width", "height"):
         if body.get(k) is not None:
             kw[k] = body.get(k)
+    # Resolve the seed: client-supplied passes through (deterministic replay);
+    # otherwise mint a fresh random one so each bare request differs. Forwarded
+    # to BOTH engines so the response can truthfully report which seed ran.
+    seed = int(body["seed"]) if body.get("seed") is not None else random.randrange(0, 2**31 - 1)
+    kw["seed"] = seed
     # Classic Z-Image Turbo: default 4 steps (its distilled native). Forward
     # step/guidance to Z-Image when the client sends a snake-case field.
     if body.get("num_inference_steps") is not None:
@@ -332,7 +338,12 @@ async def handle_image(req: web.Request) -> web.Response:
         )
     else:
         img = await _run_generation(engine.plain_image, prompt, **kw)
-    resp = {"image": _pil_to_b64(img), "content_type": "image/png", "engine": engine_name}
+    resp = {
+        "image": _pil_to_b64(img),
+        "content_type": "image/png",
+        "engine": engine_name,
+        "seed": seed,
+    }
     if engine_name == "klein":
         resp["num_inference_steps"] = _image_klein_steps(body)
     return web.json_response(resp)
