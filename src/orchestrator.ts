@@ -33,6 +33,8 @@ export interface RunnerInfo {
   gpu?: { name?: string; vram_mb?: number };
   /** Runner-advertised video model specs (resolution/fps/duration) from its metadata. */
   modelSpecs?: unknown;
+  /** Runner-advertised image model ids (e.g. z-image, flux, qwen). */
+  models?: string[];
 }
 
 export interface JobPayload {
@@ -82,7 +84,7 @@ function parseMeta(v: unknown): Record<string, unknown> {
 
 /** Livepeer orchestrator client. */
 export class OrchestratorClient {
-  private baseUrl: string;
+  readonly baseUrl: string;
   private fetchImpl: typeof fetch;
 
   constructor(opts: OrchestratorOptions) {
@@ -112,6 +114,7 @@ export class OrchestratorClient {
   async discoverRunners(requiredCapabilities: string[] = []): Promise<RunnerInfo[]> {
     const caps = new Set(requiredCapabilities);
     let lastErr: unknown = null;
+    let sawOk = false; // any candidate answered with a 2xx (orchestrator reachable)
     for (const url of this.discoveryCandidates()) {
       try {
         const res = await this.fetchImpl(url, {
@@ -119,9 +122,10 @@ export class OrchestratorClient {
           headers: { accept: "application/json" },
         });
         if (!res.ok) {
-          lastErr = new Error(`discovery ${res.status}: ${await res.text()}`);
+          lastErr = new Error(`discovery ${res.status} at ${url}: ${await res.text()}`);
           continue;
         }
+        sawOk = true;
         const data: unknown = await res.json();
         const parsed = this.parseDiscovery(data);
         if (parsed.length > 0) {
@@ -133,7 +137,10 @@ export class OrchestratorClient {
         lastErr = e;
       }
     }
-    void lastErr;
+    // Reachable but no ready runners advertised -> empty (caller decides messaging).
+    if (sawOk) return [];
+    // Never reached the orchestrator (DNS / refused / timeout / wrong path) -> surface it.
+    if (lastErr) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
     return [];
   }
 
@@ -179,6 +186,9 @@ export class OrchestratorClient {
       if (Array.isArray(meta.capabilities)) caps = (meta.capabilities as unknown[]).map(String);
     }
     const modelSpecs = Array.isArray(meta.model_specs) ? meta.model_specs : undefined;
+    const models = Array.isArray(meta.models)
+      ? (meta.models as unknown[]).map(String)
+      : undefined;
     // Price is taken from the upstream payload only. And only when it is
     // actually present — we never invent one.
     //
@@ -242,6 +252,7 @@ export class OrchestratorClient {
     ...(priceInfo ? { priceInfo } : {}),
       ...(gpu.name !== undefined || gpu.vram_mb !== undefined ? { gpu } : {}),
       ...(modelSpecs !== undefined ? { modelSpecs } : {}),
+      ...(models && models.length ? { models } : {}),
     };
   }
 

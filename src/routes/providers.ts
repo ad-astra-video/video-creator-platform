@@ -104,6 +104,7 @@ function toProviderDto(
       id: t,
       label: TASK_LABELS[t] ?? t,
     })),
+    ...(r.models && r.models.length ? { models: r.models } : {}),
     selected: r.id === chosenId,
     excluded: false,
     demo,
