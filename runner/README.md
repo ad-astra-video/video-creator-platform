@@ -1,4 +1,4 @@
-# Video-Creator Runner
+﻿# Video-Creator Runner
 
 The GPU inference backend for Video-Creator. This `runner/` folder holds the
 self-contained inference services that **node operators launch** as Docker
@@ -165,8 +165,6 @@ docker compose -f runner/docker/docker-compose.video-creator.yml up  # live-runn
 | ENHANCE_FORWARD_MODEL | No | — | Model id sent to the forwarded endpoint |
 | ENHANCE_FORWARD_API_KEY | No | — | Bearer API key for the forwarded endpoint |
 | ENHANCE_FORWARD_TIMEOUT | No | 120 | Upstream request timeout (seconds) |
-| ENHANCE_T2V_SYSTEM_PROMPT | No | built-in | Override the default t2v system prompt |
-| ENHANCE_I2V_SYSTEM_PROMPT | No | built-in | Override the default i2v system prompt |
 | LORA_CACHE_DIR | No | /models/loras | Directory where downloaded catalog LoRAs are cached |
 | LORA_CACHE_SIZE_GB | No | 2.0 | Operator disk budget for the LoRA cache (GiB); LRU-evicts |
 | LORA_CATALOG_SOURCE | No | main LTX-Desktop repo | URL or local path to `lora_catalog.json` |
@@ -221,6 +219,50 @@ runner downloads and applies them:
    Gemma loads on a separate CUDA index from the video pipeline.
 3. **Local on the video GPU** (default): Gemma loads on `GPU_DEVICE`,
    evicting/reloading the video pipeline around the call.
+
+## LTX 2.5 (optional) model requirements
+
+LTX 2.5 (`model: "ltx-2.5"`) is a NEW 22B audio-video model family. It runs
+through the same `ltx_pipelines` `DistilledPipeline` as LTX-2.3, but needs its
+OWN model kit downloaded by `runner/ltx/download_ltx25.sh` (a ComfyUI-style
+subtree under `<models>/ltx-2.5/`), plus a pinned `ltx_pipelines` rev that ships
+the `ModelPaths` API. **All of the following are REQUIRED for 2.5 generation:**
+
+| File (under `<models>/ltx-2.5/`) | Source repo (all gated) | Purpose |
+|----------------------------------|-------------------------|---------|
+| `diffusion_models/ltx-2.5-22b-distilled-transformer-{nvfp4,int8-convrot}.safetensors` | `Lightricks/LTX-2.5` | Distilled transformer (NVFP4 on Blackwell, INT8+ConvRot otherwise) |
+| `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` | `Lightricks/LTX-2.5` | Gemma 4 12B text encoder w/ 2.5 projection (bf16) |
+| `vae/ltx-2.5-video-vae-bf16.safetensors` | `Lightricks/LTX-2.5` | Video VAE |
+| `vae/ltx-2.5-audio-vae-bf16.safetensors` | `Lightricks/LTX-2.5` | Audio VAE |
+| `model_patches/ltx-2.5-duration-head-bf16.safetensors` | `Lightricks/LTX-2.5` | Duration-head model patch |
+| `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` | `Lightricks/LTX-2.5` | LATENT spatial upscaler x2 (2.5-specific) |
+| **`loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`** | **`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`** | **IC-LoRA Pixel Spatial Upscaler x2 — REQUIRED for pixel-space upscaling** |
+
+Important notes for operators:
+
+- **The IC-LoRA Pixel Spatial Upscaler lives in its OWN SEPARATE gated repo**
+  (`Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`). You must accept a
+  **second agreement** on huggingface.co (in addition to the `Lightricks/LTX-2.5`
+  repo) before your HF token can download it. Without it, LTX-2.5 pixel-space
+  upscaling is unavailable; `download_ltx25.sh` fails at step [7/7] with
+  "Access denied ... requires approval".
+- **Both repos are gated** — the same `HUGGING_FACE_HUB_TOKEN` (with both
+  agreements accepted) is used by `download_ltx25.sh`.
+- **Latent vs pixel upscaler are NOT interchangeable**: the *latent* spatial
+  upscaler (`latent_upscale_models/`) and the *IC-LoRA pixel* upscaler (`loras/`)
+  are separate 2.5 artifacts for different upscale passes. Keep both.
+- **To provision the kit on a GPU box:**
+  ```bash
+  export HUGGING_FACE_HUB_TOKEN=hf_...
+  MODEL_DIR=/path/to/models bash runner/ltx/download_ltx25.sh   # LTX25_VARIANT=nvfp4|int8
+  ```
+
+The ltx-worker currently serves LTX 2.3 (`model` default). The 2.5 code path is
+selected by `model: "ltx-2.5"` once the runner is built against an
+`ltx_pipelines` revision with the `ModelPaths` API (`Lightricks/LTX-2` >=
+`fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`) and the kit above is present. See
+`ltx/config.py` `LTX25_*` for the single-sourced artifact names, and
+`ltx/download_ltx25.sh` for the downloader.
 
 ## Notes for node operators
 
