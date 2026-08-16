@@ -274,3 +274,108 @@ export async function recordSignedTicket(
 
 // Re-exported for index.ts convenience
 export { hashSecret, generateRecoveryCode as _gen } from "./utils";
+
+// ---------------------------------------------------------------------------
+// Optimistic debit mirror (optimistic balance reduction on ticket send)
+//
+// NON-AUTHORITATIVE display counter. Each signed Livepeer ticket is mirrored here
+// (deduped by request_id) so `balance` reads can subtract the outstanding total
+// from PymtHouse's authoritative balance immediately. Rows are reconciled away as
+// PymtHouse's metering consumes the allowance (see balance.ts) or pruned by TTL.
+// Money itself is NEVER moved here — only PymtHouse debits.
+// ---------------------------------------------------------------------------
+
+export interface OptimisticDebitRow {
+  id: number;
+  external_user_id: string;
+  request_id: string;
+  /** Ticket expected value in USD micros (ticketEV) — what PymtHouse charges, fixed at ticket-send time. */
+  expected_value_usd_micros: number;
+  created_at: string;
+}
+
+/** True if a (user, requestId) debit is already recorded (dedupe). */
+export async function optimisticDebitExists(db: D1Database, externalUserId: string, requestId: string): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT id FROM optimistic_debits WHERE external_user_id = ?1 AND request_id = ?2")
+    .bind(externalUserId, requestId)
+    .first<{ id: number }>();
+  return !!row;
+}
+
+/** Record one optimistic debit (idempotent by (user, requestId)). Returns true only if newly inserted. */
+export async function recordOptimisticDebit(
+  db: D1Database,
+  externalUserId: string,
+  requestId: string,
+  expectedValueUsdMicros: number,
+): Promise<boolean> {
+  const inserted = await db
+    .prepare(
+      `INSERT OR IGNORE INTO optimistic_debits (external_user_id, request_id, expected_value_usd_micros)
+       VALUES (?1, ?2, ?3)`,
+    )
+    .bind(externalUserId, requestId, Math.max(0, Math.floor(expectedValueUsdMicros)))
+    .run();
+  return (inserted.meta.changes ?? 0) > 0;
+}
+
+/** All outstanding optimistic debits for a user, oldest first. */
+export async function listOptimisticDebits(db: D1Database, externalUserId: string): Promise<OptimisticDebitRow[]> {
+  const res = await db
+    .prepare("SELECT * FROM optimistic_debits WHERE external_user_id = ?1 ORDER BY id ASC")
+    .bind(externalUserId)
+    .all<OptimisticDebitRow>();
+  return res.results as OptimisticDebitRow[];
+}
+
+export async function deleteOptimisticDebit(db: D1Database, id: number): Promise<void> {
+  await db.prepare("DELETE FROM optimistic_debits WHERE id = ?1").bind(id).run();
+}
+
+/** Delete mirrored debits older than cutoffIso "YYYY-MM-DD HH:MM:SS" (UTC). */
+export async function pruneOptimisticDebits(db: D1Database, externalUserId: string, cutoffIso: string): Promise<void> {
+  await db.prepare("DELETE FROM optimistic_debits WHERE external_user_id = ?1 AND created_at < ?2").bind(externalUserId, cutoffIso).run();
+}
+
+/**
+ * Prune stale rows then SUM the remaining outstanding face value for a user.
+ * Returns a bigint of total optimistic debits not yet absorbed by PymtHouse.
+ */
+export async function sumOptimisticDebits(db: D1Database, externalUserId: string, ttlMs = 24 * 60 * 60 * 1000): Promise<bigint> {
+  const cutoff = new Date(Date.now() - ttlMs).toISOString().replace("T", " ").slice(0, 19);
+  await pruneOptimisticDebits(db, externalUserId, cutoff);
+  const rows = await listOptimisticDebits(db, externalUserId);
+  let total = 0n;
+  for (const r of rows) total += BigInt(r.expected_value_usd_micros || 0);
+  return total;
+}
+
+export interface BalanceSyncRow {
+  external_user_id: string;
+  last_consumed_usd_micros: number;
+  updated_at: string;
+}
+
+export async function getBalanceSync(db: D1Database, externalUserId: string): Promise<BalanceSyncRow | null> {
+  const row = await db
+    .prepare("SELECT * FROM balance_sync WHERE external_user_id = ?1")
+    .bind(externalUserId)
+    .first<BalanceSyncRow>();
+  return row ?? null;
+}
+
+/** Seed/update the per-user consumed baseline (source of the absorption delta). */
+export async function setBalanceSync(db: D1Database, externalUserId: string, lastConsumedUsdMicros: bigint | number): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO balance_sync (external_user_id, last_consumed_usd_micros, updated_at)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT(external_user_id) DO UPDATE SET
+         last_consumed_usd_micros = excluded.last_consumed_usd_micros,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(externalUserId, Number(lastConsumedUsdMicros), nowIso())
+    .run();
+}
+

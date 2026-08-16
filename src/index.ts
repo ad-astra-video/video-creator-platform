@@ -21,7 +21,11 @@ import {
   clearPendingEmail,
   setBackupCode,
   useBackupCode,
+  recordOptimisticDebit,
+  getBalanceSync,
+  setBalanceSync,
 } from "./ledger";
+import { resolveUserBalance } from "./balance";
 import { sendCodeEmail } from "./recovery";
 import { createCheckoutSession, verifyWebhook } from "./stripe";
 import type { Env } from "./types";
@@ -213,7 +217,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       if (method === "POST" && path === "/checkout") return await postCheckout(request, env, uid);
       if (method === "GET" && path === "/balance") return await getBalance(env, uid);
       if (method === "GET" && path === "/usage") return await getUsage(env, uid);
-      if (method === "POST" && path === "/sign-ticket") return await (await getSignerProxy(env))(request);
+      if (method === "POST" && path === "/sign-ticket") return await handleSignTicket(request, env, uid);
       if (method === "GET" && path === "/signer/address") return await getPayerAddress(env, uid);
       if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env, uid);
       if (method === "POST" && path === "/link-email/verify") return await verifyLinkEmail(request, env, uid);
@@ -312,11 +316,11 @@ async function postCheckout(request: Request, env: Env, externalUserId: string):
 }
 
 async function getBalance(env: Env, externalUserId: string): Promise<Response> {
-  return ok(await new PymtHouseClient(env).getBalance(externalUserId));
+  return ok(await resolveUserBalance(env, externalUserId));
 }
 
 async function getUsage(env: Env, externalUserId: string): Promise<Response> {
-  return ok({ externalUserId, balance: await new PymtHouseClient(env).getBalance(externalUserId) });
+  return ok({ externalUserId, balance: await resolveUserBalance(env, externalUserId) });
 }
 
 type LinkEmailBody = { email: string };
@@ -405,8 +409,8 @@ async function postRecoverBackup(request: Request, env: Env): Promise<Response> 
 
 async function getPlatformBalance(env: Env, externalUserId: string): Promise<Response> {
   try {
-    const balance = await new PymtHouseClient(env).getBalance(externalUserId);
-    return ok({ ...balance, configured: true });
+    const view = await resolveUserBalance(env, externalUserId);
+    return ok({ ...view, configured: true });
   } catch {
     return ok({
       hasAccess: false,
@@ -414,6 +418,8 @@ async function getPlatformBalance(env: Env, externalUserId: string): Promise<Res
       remainingUsdMicros: "0",
       consumedUsdMicros: "0",
       lifetimeGrantedUsdMicros: "0",
+      pendingUsdMicros: "0",
+      authorityUsdMicros: "0",
       configured: false,
     });
   }
@@ -465,6 +471,123 @@ async function postPlatformRecoverConfirm(request: Request, env: Env): Promise<R
 }
 
 // ---------------------------------------------------------------------------
+// POST /sign-ticket — PymtHouse DMZ signing proxy + OPTIMISTIC balance debit.
+//
+// Delegates signing to the PymtHouse direct signer proxy (which mints the
+// sign:job JWT and forwards to the DMZ /generate-live-payment), then — on a
+// SUCCESSFUL sign — reads the TICKET EXPECTED VALUE (ticketEV) from the
+// response's usage snapshot (`usage.computed_fee_usd_micros` /
+// `usage.computedFeeUsdMicros`) and records an idempotent optimistic debit
+// (keyed by `usage.request_id`) so the user's displayed balance drops
+// immediately by the exact amount PymtHouse will charge.
+//
+// WHAT VALUE: PymtHouse charges the ticket's EXPECTED VALUE, and that value is
+// fixed at the moment the ticket is sent (it rides along in the sign response)
+// — NOT computed later at orchestrator redemption. So debiting `computedFeeUsdMicros`
+// here at sign time is the accurate charge, not an estimate. `computedFeeWei` is
+// the on-chain wei amount; the USD debit we mirror is `computedFeeUsdMicros`.
+// The upstream response is relayed to the browser unchanged.
+// ---------------------------------------------------------------------------
+async function handleSignTicket(request: Request, env: Env, externalUserId: string): Promise<Response> {
+  let upstream: Response;
+  try {
+    upstream = await (await getSignerProxy(env))(request);
+  } catch (e) {
+    return err(`sign-ticket failure: ${(e as Error).message}`, 502);
+  }
+
+  const okStatus = upstream.status >= 200 && upstream.status < 300;
+  if (!okStatus) return upstream; // 401/402/5xx — nothing was signed, nothing to debit.
+
+  // Read the body so we can (a) inspect the usage and (b) rebuild the response
+  // (reading the body consumes the stream; the caller's CORS wrapper needs a
+  // fresh body on the rebuilt Response).
+  const text = await upstream.text();
+  const rebuilt = new Response(text, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: new Headers(upstream.headers),
+  });
+
+  try {
+    const usage = extractTicketUsage(text);
+    if (usage && usage.requestId && usage.ticketEvUsdMicros > 0) {
+      await recordOptimisticDebitForUser(env, externalUserId, usage.requestId, usage.ticketEvUsdMicros);
+    }
+  } catch {
+    // Optimistic debit is best-effort audit/display; never fail the client.
+  }
+  return rebuilt;
+}
+
+interface TicketUsage {
+  requestId: string;
+  /** Ticket expected value in USD micros (ticketEV) — what PymtHouse charges, fixed at ticket-send time. */
+  ticketEvUsdMicros: number;
+}
+
+/** Pull requestId + ticketEV out of the DMZ /generate-live-payment usage snapshot.
+ *  Mirrors the field names the PymtHouse SDK's parseSignerUsageSnapshot reads:
+ *  usage.computed_fee_usd_micros / usage.computedFeeUsdMicros + usage.request_id/requestId. */
+function extractTicketUsage(text: string): TicketUsage | null {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const usage = (parsed.usage && typeof parsed.usage === "object" ? (parsed.usage as Record<string, unknown>) : {}) as Record<string, unknown>;
+  const pickStr = (...keys: string[]): string => {
+    for (const k of keys) {
+      const v = usage[k] ?? parsed[k];
+      if (typeof v === "string" && v.trim()) return v.trim();
+      if (typeof v === "number" && Number.isFinite(v)) return String(Math.trunc(v));
+    }
+    return "";
+  };
+  const requestId =
+    pickStr("request_id", "requestId") ||
+    (typeof parsed.requestId === "string" ? parsed.requestId : "");
+  // ticketEV = the expected value PymtHouse charges for this ticket.
+  const ticketEvRaw = pickStr("computed_fee_usd_micros", "computedFeeUsdMicros");
+  const ticketEv = Number(ticketEvRaw);
+  if (!requestId || !Number.isFinite(ticketEv) || ticketEv <= 0) return null;
+  return { requestId, ticketEvUsdMicros: Math.floor(ticketEv) };
+}
+
+/**
+ * Record one optimistic debit (idempotent by requestId). On a user's FIRST ever
+ * recorded debit, seed the reconciliation baseline with the current PymtHouse
+ * `consumedUsdMicros` so the mirror never absorbs pre-existing consumption.
+ */
+async function recordOptimisticDebitForUser(
+  env: Env,
+  externalUserId: string,
+  requestId: string,
+  ticketEvUsdMicros: number,
+): Promise<void> {
+  if (!env.DB) return;
+  try {
+    const sync = await getBalanceSync(env.DB, externalUserId);
+    if (!sync) {
+      let consumed = 0n;
+      try {
+        const b = await new PymtHouseClient(env).getBalance(externalUserId);
+        consumed = BigInt(b?.consumedUsdMicros || "0");
+      } catch {
+        consumed = 0n;
+      }
+      await setBalanceSync(env.DB, externalUserId, consumed);
+    }
+    await recordOptimisticDebit(env.DB, externalUserId, requestId, ticketEvUsdMicros);
+  } catch {
+    // best-effort only
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Admin
 // ---------------------------------------------------------------------------
 
@@ -481,7 +604,7 @@ async function adminUsers(request: Request, env: Env): Promise<Response> {
 async function adminBalance(request: Request, env: Env): Promise<Response> {
   const externalUserId = new URL(request.url).searchParams.get("externalUserId") || "";
   if (!externalUserId) return err("externalUserId required", 400);
-  return ok({ externalUserId, balance: await new PymtHouseClient(env).getBalance(externalUserId) });
+  return ok({ externalUserId, balance: await resolveUserBalance(env, externalUserId) });
 }
 
 async function adminApiKeys(env: Env): Promise<Response> {

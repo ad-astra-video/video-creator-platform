@@ -1,21 +1,29 @@
 import { createDirectSignerProxyHandler, mintUserSignerToken } from "@pymthouse/builder-sdk/signer/server";
-import { getExternalUserByKeyHash } from "./ledger";
+import { getExternalUserByKeyHash, sumOptimisticDebits } from "./ledger";
 import { PymtHouseClient } from "./pymthouse";
 import { err, json, ok, readJson, sha256Hex } from "./utils";
 import type { AuthzSessionRow, Env } from "./types";
 
 // ───────────────────────────────────────────────────────────────────────────
 // INVARIANT: every balance debit MUST be authorized through PymtHouse.
-// This Worker NEVER debits a balance itself — no direct D1 balance writes,
-// no local ledger decrements. The only mechanism that moves money out of a
-// user's allowance is PymtHouse: the DMZ signs a ticket on
-// `/generate-live-payment`, and PymtHouse's metering performs the debit
-// (reserving the expected value) — gated by the allowance and the `sign:job`
-// JWT this module mints. Routes here only (a) auth the user, (b) request
-// PymtHouse to sign, and (c) gate the sign on a *read* of the PymtHouse
-// balance. If you add any code that decreases a stored balance outside
-// PymtHouse, you are breaking this invariant — route the debit through
-// PymtHouse instead.
+// This Worker NEVER debits the authoritative balance itself — no direct D1
+// balance writes on the money, no authoritative ledger decrements. The only
+// mechanism that moves money OUT of a user's allowance is PymtHouse: the DMZ
+// signs a ticket on `/generate-live-payment`, and PymtHouse's metering performs
+// the debit (reserving the expected value) — gated by the allowance and the
+// `sign:job` JWT this module mints.
+//
+// The ONE local number we maintain is an OPTIMISTIC DEBIT MIRROR (ledger.ts /
+// migrations/0003_optimistic_debits.sql): a non-authoritative counter that
+// records each signed ticket's USD face value (deduped by request_id) so the
+// DISPLAYED balance can drop the instant a ticket is signed, and is reconciled
+// away as PymtHouse's metering consumes. It never changes the authoritative
+// balance. Routes here (a) auth the user, (b) request PymtHouse to sign,
+// (c) gate the sign on a read of the PymtHouse balance MINUS any outstanding
+// optimistic debits (so a fast spender can't oversubtract the display), and
+// (d) mirror the signed ticket for display. If you add code that decreases the
+// authoritative stored balance outside PymtHouse, you are breaking this
+// invariant — route the debit through PymtHouse instead.
 // ───────────────────────────────────────────────────────────────────────────
 
 // ---------------------------------------------------------------------------
@@ -86,16 +94,29 @@ export async function getSignerProxy(env: Env) {
         }
         return (session as { externalUserId: string }).externalUserId;
       },
-      // Balance gate: block signing (and thus debit) when the user has no allowance.
-      beforeSign: async ({ token }) => {
-        const balance = Number(token.balanceUsdMicros ?? "0");
+      // Balance gate: block signing (and thus debit) when the user has no
+      // allowance. `token.balanceUsdMicros` is the PymtHouse snapshot from the
+      // last token refresh (seconds–minutes stale), so we ALSO subtract any
+      // pending optimistic debits — tickets signed since that refresh that
+      // PymtHouse's async metering hasn't consumed yet. This stops a fast
+      // spender from over-signing while still letting PymtHouse be the only
+      // authority on the real balance.
+      beforeSign: async ({ token, externalUserId }) => {
+        const snapshotBalance = Number(token.balanceUsdMicros ?? "0");
+        let pending = 0n;
+        try {
+          pending = (await sumOptimisticDebits(env.DB, externalUserId)) || 0n;
+        } catch {
+          pending = 0n;
+        }
+        const balance = snapshotBalance - Number(pending);
         if (balance <= 0) {
           return {
             status: 402,
             body: {
               ok: false,
               error: "Insufficient balance — add credits to continue",
-              balanceUsdMicros: token.balanceUsdMicros ?? "0",
+              balanceUsdMicros: String(Math.max(balance, 0)),
             },
           };
         }
