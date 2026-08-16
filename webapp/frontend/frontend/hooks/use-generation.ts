@@ -443,12 +443,19 @@ export function useGeneration(): UseGenerationReturn {
               prompt: finalPrompt,
               width: dims.width,
               height: dims.height,
-              numSteps,
+              num_inference_steps: numSteps,
               numImages,
               seed: 42,
               guidanceScale: 0.0,
               strength: isEditing ? (settings.imageEditStrength ?? 0.6) : 0.6,
               keepSubject: false,
+              // Engine selection: image EDIT -> Qwen-Image-Edit (default) vs Z-Image
+              // keep-subject; text-to-image -> Z-Image Turbo (default) vs FLUX.2 Klein 4B.
+              // Forwarded to the runner's /video-creator/v1/edit|image so the engine is
+              // selected server-side.
+              engine: isEditing
+                ? (settings.imageEditEngine ?? 'qwen-edit')
+                : (settings.imageModel ?? 'zimage'),
               ...(isEditing ? { imagePath: editSource } : {}),
             }
             const mediaBlob = await postImageToRunnerSSE(livepeerRunner, imageBody, {

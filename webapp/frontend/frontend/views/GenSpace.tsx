@@ -577,7 +577,9 @@ function PromptBar({
   buttonIcon,
   restyleTab,
   restyleModel,
+  restyleFps,
   onRestyleModelChange,
+  onRestyleFpsChange,
     restyleEnhancePrompt,
     onRestyleEnhancePromptChange,
     extendDirection,
@@ -645,6 +647,9 @@ function PromptBar({
     audio?: boolean
     imageEditStrength?: number
     imageSteps?: number
+    imageEditEngine?: 'qwen-edit' | 'zimage'
+    imageModel?: 'zimage' | 'klein'
+    first_frame_engine?: 'qwen-edit' | 'klein'
   }
   onSettingsChange: (settings: any) => void
   videoModelSpecs: VideoGenerationModelSpecItem[]
@@ -682,6 +687,8 @@ function PromptBar({
   restyleTab?: 'image' | 'video'
   restyleModel?: 'fast' | 'regular'
   onRestyleModelChange?: (v: 'fast' | 'regular') => void
+  restyleFps?: 'auto' | 24 | 25 | 30
+  onRestyleFpsChange?: (v: 'auto' | 24 | 25 | 30) => void
   restyleEnhancePrompt?: boolean
   onRestyleEnhancePromptChange?: (v: boolean) => void
 }) {
@@ -931,12 +938,26 @@ function PromptBar({
         
         {isRestyleImage ? (
           <>
-            {/* First-frame editor model: FLUX.2 [klein] 4B (fixed 4-step distilled
-                single-reference edit — no strength / keep-subject / mask inputs). */}
-            <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-zinc-800/50">
-              <Sparkles className="h-3.5 w-3.5" />
-              <span className="text-zinc-300 font-medium">FLUX.2 Klein 4B</span>
-            </div>
+            {/* First-frame editor engine: Qwen-Image-Edit (default) vs FLUX.2 [klein] 4B
+                (fast alternate). Qwen runs the ltx-worker's /video-creator/v1/edit task;
+                klein keeps the id-v2v worker's /style-frame rail. */}
+            <SettingsDropdown
+              title="FIRST-FRAME EDITOR"
+              value={settings.first_frame_engine ?? 'qwen-edit'}
+              onChange={(v) => onSettingsChange({ ...settings, first_frame_engine: v as 'qwen-edit' | 'klein' })}
+              options={[
+                { value: 'qwen-edit', label: 'Qwen-Image-Edit' },
+                { value: 'klein', label: 'FLUX.2 klein (fast)' },
+              ]}
+              trigger={
+                <>
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <span>{settings.first_frame_engine === 'klein' ? 'FLUX.2 klein' : 'Qwen-Edit'}</span>
+                  <ChevronUp className="h-3 w-3 text-zinc-500" />
+                </>
+              }
+              tooltip="Engine that styles the restyle first frame: Qwen-Image-Edit (default) or FLUX.2 klein 4B (fast alternate)"
+            />
             <div className="w-px h-4 bg-zinc-700 mx-0.5" />
             <label
               className="flex items-center gap-1.5 text-[11px] text-zinc-400 cursor-pointer select-none"
@@ -969,6 +990,27 @@ function PromptBar({
                   <ChevronUp className="h-3 w-3 text-zinc-500" />
                 </>
               }
+            />
+            <SettingsDropdown
+              title="FPS"
+              value={`${restyleFps ?? 'auto'}`}
+              onChange={(v) => onRestyleFpsChange?.(
+                v === 'auto' ? 'auto' : (Number(v) as 24 | 25 | 30),
+              )}
+              options={[
+                { value: 'auto', label: 'Auto (source fps)' },
+                { value: '24', label: '24 fps' },
+                { value: '25', label: '25 fps' },
+                { value: '30', label: '30 fps' },
+              ]}
+              trigger={
+                <>
+                  <Clock className="h-3.5 w-3.5" />
+                  <span>{restyleFps === 'auto' ? 'Auto' : `${restyleFps} fps`}</span>
+                  <ChevronUp className="h-3 w-3 text-zinc-500" />
+                </>
+              }
+              tooltip="Output fps: Auto matches the source video's frame rate; pick 24/25/30 to override"
             />
             <label
               className="flex items-center gap-1.5 text-[11px] text-zinc-400 cursor-pointer select-none"
@@ -1031,27 +1073,59 @@ function PromptBar({
         <IcLoraSettingsControls {...icLoraControls} />
         ) : mode === 'image' ? (
           <>
-            {/* Model indicator */}
-            <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-zinc-800/50">
-              <ZitIcon className="h-3.5 w-3.5" />
-              <span className="text-zinc-300 font-medium">Z-Image Turbo{imageUsesFalApi ? ' (API)' : ''}</span>
-            </div>
+            {/* Text-to-image model selector: Z-Image Turbo (default) | FLUX.2 Klein 4B */}
+            <SettingsDropdown
+              title="MODEL"
+              value={settings.imageModel ?? 'zimage'}
+              onChange={(v) => onSettingsChange({ ...settings, imageModel: v as 'zimage' | 'klein' })}
+              options={[
+                { value: 'zimage', label: 'Z-Image Turbo' },
+                { value: 'klein', label: 'FLUX.2 Klein 4B' },
+              ]}
+              trigger={
+                <>
+                  <ZitIcon className="h-3.5 w-3.5" />
+                  <span className="text-zinc-300 font-medium">
+                    {settings.imageModel === 'klein' ? 'FLUX.2 Klein' : 'Z-Image Turbo'}{imageUsesFalApi ? ' (API)' : ''}
+                  </span>
+                  <ChevronUp className="h-3 w-3 text-zinc-500" />
+                </>
+              }
+            />
 
             {isEditingImage ? (
               // Edit runs at the source image's resolution — resolution/ratio don't apply.
-              <div className="flex items-center gap-1.5 px-2 text-[10px] text-zinc-400">
-                <span>Strength</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  value={settings.imageEditStrength ?? 0.6}
-                  onChange={(e) => onSettingsChange({ ...settings, imageEditStrength: parseFloat(e.target.value) })}
-                  className="w-20 accent-white"
+              <>
+                <SettingsDropdown
+                  title="ENGINE"
+                  value={settings.imageEditEngine ?? 'qwen-edit'}
+                  onChange={(v) => onSettingsChange({ ...settings, imageEditEngine: v })}
+                  options={[
+                    { value: 'qwen-edit', label: 'Qwen-Image-Edit' },
+                    { value: 'zimage', label: 'Z-Image (keep-subject)' },
+                  ]}
+                  trigger={
+                    <>
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>{settings.imageEditEngine === 'zimage' ? 'Z-Image' : 'Qwen-Edit'}</span>
+                      <ChevronUp className="h-3 w-3 text-zinc-500" />
+                    </>
+                  }
                 />
-                <span className="w-8 text-right">{(settings.imageEditStrength ?? 0.6).toFixed(2)}</span>
-              </div>
+                <div className="flex items-center gap-1.5 px-2 text-[10px] text-zinc-400">
+                  <span>Strength</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={settings.imageEditStrength ?? 0.6}
+                    onChange={(e) => onSettingsChange({ ...settings, imageEditStrength: parseFloat(e.target.value) })}
+                    className="w-20 accent-white"
+                  />
+                  <span className="w-8 text-right">{(settings.imageEditStrength ?? 0.6).toFixed(2)}</span>
+                </div>
+              </>
             ) : (
               <>
                 {/* Resolution dropdown */}
@@ -1367,6 +1441,10 @@ const DEFAULT_VIDEO_SETTINGS = {
   audio: true,
   imageEditStrength: 0.6,
   imageSteps: IMAGE_STEPS_GENERATE,
+  // Qwen-Image-Edit is the default engine for image edits and restyle first-frames.
+  imageEditEngine: 'qwen-edit' as 'qwen-edit' | 'zimage',
+  imageModel: 'zimage' as 'zimage' | 'klein',
+  first_frame_engine: 'qwen-edit' as 'qwen-edit' | 'klein',
 }
 
 export function GenSpace() {
@@ -1725,6 +1803,8 @@ export function GenSpace() {
   const [restyleTab, setRestyleTab] = useState<'image' | 'video'>('video')
   // id-v2v model variant: "fast" = FusionX (~8 steps), "regular" = original (30).
   const [restyleModel, setRestyleModel] = useState<'fast' | 'regular'>('fast')
+  // Output fps: 'auto' (encode at the source video's fps) | 24 | 25 | 30.
+  const [restyleFps, setRestyleFps] = useState<'auto' | 24 | 25 | 30>('auto')
   // Default the restyle Enhance checkbox to match the Prompt Enhancer setting:
   // checked when "Generate with Livepeer for prompt enhancements" is on (and a
   // Discovery URL is configured). The user can still toggle it per-run.
@@ -1750,6 +1830,10 @@ export function GenSpace() {
     createdAt: number
   }>>([])
   const [restyleSelectedAttemptId, setRestyleSelectedAttemptId] = useState<string | null>(null)
+  // Full playback preview for a returned restyle take — set when the user clicks a
+  // take thumbnail so the returned video can actually be watched (plays with controls
+  // in a modal, with prev/next across takes) instead of just being silently selected.
+  const [restylePreviewAttemptId, setRestylePreviewAttemptId] = useState<string | null>(null)
 
   const [retakeInitial, setRetakeInitial] = useState<{
     videoPath: string | null
@@ -2233,10 +2317,37 @@ export function GenSpace() {
       stylizedImagePath: restyleInput.stylizedImagePath,
       prompt,
       model: restyleModel,
+      fps: restyleFps,
       enhancePrompt: restyleEnhancePrompt,
       seed: nextSeed,
     })
   }
+
+  // Full playback preview of a returned restyle take: clicking a thumbnail opens a
+  // modal that plays it, with prev/next navigation across the collected takes.
+  const restylePreviewAttempt = restyleAttempts.find(a => a.id === restylePreviewAttemptId) ?? null
+  const restylePreviewIndex = restylePreviewAttempt ? restyleAttempts.findIndex(a => a.id === restylePreviewAttemptId) : -1
+  const restylePreviewCanPrev = restylePreviewIndex > 0
+  const restylePreviewCanNext = restylePreviewIndex >= 0 && restylePreviewIndex < restyleAttempts.length - 1
+  const restylePreviewGoPrev = useCallback(() => {
+    if (restylePreviewIndex < 1) return
+    setRestylePreviewAttemptId(restyleAttempts[restylePreviewIndex - 1].id)
+  }, [restylePreviewIndex, restyleAttempts])
+  const restylePreviewGoNext = useCallback(() => {
+    if (restylePreviewIndex < 0 || restylePreviewIndex >= restyleAttempts.length - 1) return
+    setRestylePreviewAttemptId(restyleAttempts[restylePreviewIndex + 1].id)
+  }, [restylePreviewIndex, restyleAttempts])
+  // Keyboard navigation for the restyle preview modal (mirrors the asset preview modal).
+  useEffect(() => {
+    if (!restylePreviewAttempt) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); restylePreviewGoPrev() }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); restylePreviewGoNext() }
+      else if (e.key === 'Escape') setRestylePreviewAttemptId(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [restylePreviewAttempt, restylePreviewGoPrev, restylePreviewGoNext])
 
   // When extend completes, save the longer video as a new asset.
   useEffect(() => {
@@ -2871,6 +2982,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         const started = await restylePanelRef.current?.restyleFrame({
           prompt,
           enhance: restyleEnhancePrompt,
+          engine: settings.first_frame_engine ?? 'qwen-edit',
         })
         if (!started) return
         return
@@ -2882,6 +2994,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         stylizedImagePath: restyleInput.stylizedImagePath,
         prompt,
         model: restyleModel,
+        fps: restyleFps,
         enhancePrompt: restyleEnhancePrompt,
         seed: restyleSeed,
       })
@@ -2932,6 +3045,8 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         imageSteps: editSource ? IMAGE_STEPS_EDIT : (settings.imageSteps ?? IMAGE_STEPS_GENERATE),
         variations: settings.variations,
         imageEditStrength: settings.imageEditStrength,
+        imageEditEngine: settings.imageEditEngine,
+        imageModel: settings.imageModel ?? 'zimage',
       }
       await writeRecoveryContext({ prompt, settings: imageSettings, genType: 'image', inputImageUrl: editSource ?? undefined })
       generateImage(prompt, imageSettings, editSource)
@@ -3392,11 +3507,15 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                   {restyleAttempts.map(a => (
                     <button
                       key={a.id}
-                      onClick={() => setRestyleSelectedAttemptId(a.id)}
+                      onClick={() => {
+                        setRestyleSelectedAttemptId(a.id)
+                        // Clicking a returned restyle take opens its full playback preview.
+                        setRestylePreviewAttemptId(a.id)
+                      }}
                       className={`relative w-28 flex-shrink-0 aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
                         restyleSelectedAttemptId === a.id ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
                       }`}
-                      title={`seed ${a.seed}`}
+                      title={`Click to preview · seed ${a.seed}`}
                     >
                       <video src={pathToFileUrl(a.videoPath)} muted preload="metadata" playsInline className="w-full h-full object-cover" />
                       <span className="absolute bottom-0 inset-x-0 bg-black/60 text-[9px] text-zinc-300 px-1 py-0.5 text-left">seed {a.seed}</span>
@@ -3515,6 +3634,8 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           restyleTab={restyleTab}
           restyleModel={restyleModel}
           onRestyleModelChange={setRestyleModel}
+          restyleFps={restyleFps}
+          onRestyleFpsChange={setRestyleFps}
           restyleEnhancePrompt={restyleEnhancePrompt}
           onRestyleEnhancePromptChange={setRestyleEnhancePrompt}
           extendDirection={extendDirection}
@@ -3666,6 +3787,81 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                   selectedAsset.duration ? `${formatSeconds(selectedAsset.duration)}s` : 'Image',
                 ].filter(Boolean).join(' • ')}
               </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Restyle take preview modal: plays the returned restyle video when a take is
+          clicked. Prev/next navigate across the collected takes; Keep persists the
+          currently selected take to the project library. */}
+      {restylePreviewAttempt && (
+        <div
+          className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center"
+          onClick={() => setRestylePreviewAttemptId(null)}
+        >
+          {/* Previous take */}
+          <button
+            onClick={(e) => { e.stopPropagation(); restylePreviewGoPrev() }}
+            disabled={!restylePreviewCanPrev}
+            className={`absolute left-4 top-1/2 -translate-y-1/2 z-10 p-3 rounded-full backdrop-blur-md transition-all ${
+              restylePreviewCanPrev
+                ? 'bg-white/10 text-white hover:bg-white/20 cursor-pointer'
+                : 'bg-white/5 text-zinc-600 cursor-default'
+            }`}
+          >
+            <ChevronLeft className="h-6 w-6" />
+          </button>
+
+          {/* Next take */}
+          <button
+            onClick={(e) => { e.stopPropagation(); restylePreviewGoNext() }}
+            disabled={!restylePreviewCanNext}
+            className={`absolute right-4 top-1/2 -translate-y-1/2 z-10 p-3 rounded-full backdrop-blur-md transition-all ${
+              restylePreviewCanNext
+                ? 'bg-white/10 text-white hover:bg-white/20 cursor-pointer'
+                : 'bg-white/5 text-zinc-600 cursor-default'
+            }`}
+          >
+            <ChevronRight className="h-6 w-6" />
+          </button>
+
+          <div className="relative max-w-5xl w-full max-h-full px-20 py-8" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-sm text-zinc-500 font-medium">
+                Restyle take {restylePreviewIndex + 1} / {restyleAttempts.length} · seed {restylePreviewAttempt.seed}
+              </span>
+              <button
+                onClick={() => setRestylePreviewAttemptId(null)}
+                className="p-2 rounded-md text-zinc-400 hover:text-white transition-colors"
+              >
+                <X className="h-6 w-6" />
+              </button>
+            </div>
+
+            <video
+              key={restylePreviewAttempt.id}
+              src={pathToFileUrl(restylePreviewAttempt.videoPath)}
+              controls
+              autoPlay
+              className="w-full rounded-xl object-contain max-h-[65vh]"
+            />
+
+            <div className="mt-4 flex items-center justify-center gap-2">
+              <button
+                onClick={() => restyleSelectedAttemptId && finalizeRestyleAttempt(restyleSelectedAttemptId)}
+                disabled={!restyleSelectedAttemptId}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-md bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                <Check className="h-3.5 w-3.5" /> Keep this one
+              </button>
+              <button
+                onClick={redoRestyle}
+                disabled={isRestyling || !restyleInput.ready}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-md bg-zinc-800 text-white text-xs font-medium hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                <Redo2 className="h-3.5 w-3.5" /> Redo
+              </button>
             </div>
           </div>
         </div>

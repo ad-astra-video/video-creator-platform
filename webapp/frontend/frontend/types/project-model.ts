@@ -65,6 +65,11 @@ export const generationParamsSchema = z.object({
   imageAspectRatio: z.string().optional(),
   imageSteps: z.number().optional(),
   imageEditStrength: z.number().optional(),
+  // Image-edit engine: Qwen-Image-Edit (default) | Z-Image masked keep-subject.
+  imageEditEngine: z.enum(['qwen-edit', 'zimage']).optional(),
+  imageModel: z.enum(['zimage', 'klein']).optional(),
+  // Restyle first-frame engine: Qwen-Image-Edit (default) | FLUX.2 klein (fast).
+  first_frame_engine: z.enum(['qwen-edit', 'klein']).optional(),
   inputImageUrl: z.string().optional(),
   inputAudioUrl: z.string().optional(),
   retakeVideoPath: z.string().optional(),

@@ -20,7 +20,7 @@ export interface LoraSelection {
 }
 
 export interface GenerationSettings {
-  model: 'fast' | 'pro'
+  model: 'fast' | 'pro' | 'ltx-2.5'
   duration: number
   videoResolution: string
   fps: number
@@ -34,6 +34,8 @@ export interface GenerationSettings {
   imageSteps: number
   variations?: number  // Number of image variations to generate
   imageEditStrength?: number  // Denoising strength when editing an existing image
+  imageEditEngine?: 'qwen-edit' | 'zimage'  // Image-edit engine: Qwen-Image-Edit (default) | Z-Image keep-subject
+  imageModel?: 'zimage' | 'klein'  // Text-to-image model: Z-Image Turbo (default) | FLUX.2 Klein 4B
 }
 
 interface SettingsPanelProps {
@@ -106,7 +108,16 @@ export function SettingsPanel({
   if (isImageMode) {
     return (
       <div className="space-y-4">
-        {/* Aspect Ratio and Quality side by side */}
+        {/* Model + Aspect Ratio and Quality */}
+        <Select
+          label="Model"
+          value={settings.imageModel ?? 'zimage'}
+          onChange={(e) => handleChange('imageModel', e.target.value as 'zimage' | 'klein')}
+          disabled={disabled}
+        >
+          <option value="zimage">Z-Image Turbo</option>
+          <option value="klein">FLUX.2 Klein 4B</option>
+        </Select>
         <div className="grid grid-cols-2 gap-3">
           <Select
             label="Aspect Ratio"

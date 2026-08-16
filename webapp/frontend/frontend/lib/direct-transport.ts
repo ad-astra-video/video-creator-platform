@@ -16,6 +16,7 @@
 
 import { ApiClient } from './api-client'
 import { getBlob, getBlobUrl, registerBlob, setDimensions } from './runtime/web-store'
+import { decodeMediaPayload } from './media-decode'
 import { logger } from './logger'
 
 /** Fetch with an AbortSignal.timeout guard so a hung hop surfaces as an error instead of a silent await. */
@@ -42,6 +43,7 @@ const TASK_ENDPOINTS: Record<string, string> = {
   'ic-lora': '/video-creator/v1/ic-lora-generate',
   'ic-lora:extract-conditioning': '/video-creator/v1/extract-conditioning',
   edit: '/video-creator/v1/edit',
+  layer: '/video-creator/v1/layer',
 }
 export function endpointForTask(type: string): string {
   return TASK_ENDPOINTS[type] || `/video-creator/v1/${type}`
@@ -56,6 +58,7 @@ export interface RunnerDto {
   gpu?: { name?: string; vram_mb?: number } | null
   price_info?: { price?: number; currency?: string; unit?: string } | null
   capabilities?: Array<{ id: string; label: string }>
+  models?: string[]
 }
 
 export interface SignTicketMaterial {
@@ -198,6 +201,132 @@ export async function styleFrameViaRunner(
     width: typeof data?.width === 'number' ? data.width : undefined,
     height: typeof data?.height === 'number' ? data.height : undefined,
     enhancedPrompt: typeof data?.enhanced_prompt === 'string' ? data.enhanced_prompt : undefined,
+  }
+}
+
+/**
+ * Run a Qwen-Image-Edit instruction edit of a base image DIRECTLY on a runner (paid
+ * Livepeer rail) via /video-creator/v1/edit with the `engine` field set to `qwen-edit`
+ * (the ltx-worker Qwen-Image-Edit pipeline). Used to style the restyle first frame when
+ * the user picks the Qwen first-frame engine. Mirrors styleFrameViaRunner's contract:
+ * the returned value is a `web://<uuid>` key (registerBlob) that webAssetUrl() can resolve.
+ */
+export interface EditMediaResult {
+  imageUrl: string
+  width?: number
+  height?: number
+}
+export async function editImageViaRunner(
+  runner: RunnerDto,
+  imageBase64: string,
+  prompt: string,
+  opts?: { engine?: string; seed?: number; strength?: number; enhance?: boolean; signal?: AbortSignal },
+): Promise<EditMediaResult> {
+  const res = await postToRunnerWithTicket(
+    runner,
+    'edit',
+    {
+      image: imageBase64,
+      prompt,
+      engine: opts?.engine ?? 'qwen-edit',
+      seed: opts?.seed,
+      strength: opts?.strength,
+      enhance_prompt: opts?.enhance ?? false,
+    },
+    opts,
+  )
+  if (!res.ok) {
+    let detail = `Image edit failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (j && typeof j.error === 'string') detail = j.error
+    } catch { /* keep status message */ }
+    throw new Error(detail)
+  }
+  const data = (await res.json().catch(() => null)) as
+    | { image?: unknown; image_b64?: unknown; edited_image?: unknown; width?: unknown; height?: unknown } | null
+  const b64 = (typeof data?.image_b64 === 'string' ? data.image_b64
+    : typeof data?.image === 'string' ? data.image
+    : typeof data?.edited_image === 'string' ? data.edited_image : null)
+  if (!b64) throw new Error('Image edit completed without an image')
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  const key = registerBlob(new Blob([bytes], { type: 'image/png' }), 'edit.png', 'image/png')
+  if (data?.width != null && data?.height != null) {
+    try { setDimensions(key, Number(data.width), Number(data.height)) } catch { /* non-fatal */ }
+  }
+  return {
+    imageUrl: key,
+    width: typeof data?.width === 'number' ? data.width : undefined,
+    height: typeof data?.height === 'number' ? data.height : undefined,
+  }
+}
+
+/**
+ * Layered preprocessing: decompose an image into N RGBA layers via /video-creator/v1/layer
+ * (Qwen-Image-Layered on the ltx-worker). `preview_only:true` keeps the interaction cheap —
+ * the runner returns composited-on-black previews for the UI picker. Each preview is
+ * re-registered as a `web://<uuid>` key so webAssetUrl() can render it. This is a
+ * PREPROCESSING step: the layer output lives purely in component state and is NEVER
+ * serialized into any video-request conditioning field.
+ */
+export interface LayerPreview {
+  index: number
+  previewKey: string
+}
+export interface LayerResult {
+  layers: LayerPreview[]
+  compositeKey?: string
+  width?: number
+  height?: number
+}
+export async function layerImageViaRunner(
+  runner: RunnerDto,
+  imageBase64: string,
+  layersCount: number,
+  opts?: { signal?: AbortSignal },
+): Promise<LayerResult> {
+  const res = await postToRunnerWithTicket(
+    runner,
+    'layer',
+    { image: imageBase64, layers: layersCount, preview_only: true },
+    opts,
+  )
+  if (!res.ok) {
+    let detail = `Layered preprocessing failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (j && typeof j.error === 'string') detail = j.error
+    } catch { /* keep status message */ }
+    throw new Error(detail)
+  }
+  const data = (await res.json().catch(() => null)) as
+    | {
+        layers?: Array<{ index?: unknown; preview_b64?: unknown; image_b64?: unknown }>
+        composite?: unknown
+        width?: unknown
+        height?: unknown
+      } | null
+  const decodeToWebKey = (b64: string, name: string): string => {
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    return registerBlob(new Blob([bytes], { type: 'image/png' }), name, 'image/png')
+  }
+  const rawLayers = data?.layers ?? []
+  const layers: LayerPreview[] = rawLayers
+    .filter((l) => typeof l.preview_b64 === 'string' && (l.preview_b64 as string))
+    .map((l, i) => ({
+      index: typeof l.index === 'number' ? l.index : i,
+      previewKey: decodeToWebKey(l.preview_b64 as string, `layer-${Date.now()}-${i}.png`),
+    }))
+  if (layers.length === 0) throw new Error('Layered preprocessing returned no readable layers')
+  return {
+    layers,
+    compositeKey: typeof data?.composite === 'string' ? decodeToWebKey(data.composite, 'layer-composite.png') : undefined,
+    width: typeof data?.width === 'number' ? data.width : undefined,
+    height: typeof data?.height === 'number' ? data.height : undefined,
   }
 }
 
@@ -673,28 +802,6 @@ export interface RunnerProgressEvent {
   progress?: number | null
 }
 
-/**
- * Decode the runner complete payload into a media Blob, if it carries one.
- * Video tasks return video_base64, image tasks image_base64/styled_image,
- * restyle output_video (all base64). Returns undefined for text-only payloads
- * (e.g. prompt-enhance -> enhanced_prompt).
- */
-function decodeMediaPayload(payload: Record<string, unknown>): Blob | undefined {
-  for (const key of ['video_base64', 'image_base64', 'output_video', 'styled_image'] as const) {
-    const b64 = payload[key]
-    if (typeof b64 === 'string' && b64) {
-      const contentType =
-        typeof payload.content_type === 'string' ? payload.content_type
-        : key === 'video_base64' || key === 'output_video' ? 'video/mp4'
-        : 'image/png'
-      const binary = atob(b64)
-      const bytes = new Uint8Array(binary.length)
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-      return new Blob([bytes], { type: contentType })
-    }
-  }
-  return undefined
-}
 
 /**
  * Open ONE WebSocket to a runner (runner.url http->ws / https->wss +
