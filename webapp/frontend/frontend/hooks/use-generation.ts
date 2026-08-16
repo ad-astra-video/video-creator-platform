@@ -444,24 +444,41 @@ export function useGeneration(): UseGenerationReturn {
           }
           if (livepeerRunner) {
             const imageSeed = Math.floor(Math.random() * 0x7fffffff)
-            const imageBody = {
-              prompt: finalPrompt,
-              width: dims.width,
-              height: dims.height,
-              num_inference_steps: numSteps,
-              numImages,
-              seed: imageSeed,
-              guidanceScale: 0.0,
-              strength: isEditing ? (settings.imageEditStrength ?? 0.6) : 0.6,
-              keepSubject: false,
-              // Engine selection: image EDIT -> Qwen-Image-Edit (default) vs Z-Image
-              // keep-subject; text-to-image -> Z-Image Turbo (default) vs FLUX.2 Klein 4B.
-              // Forwarded to the runner's /video-creator/v1/edit|image so the engine is
-              // selected server-side.
-              engine: isEditing
-                ? (settings.imageEditEngine ?? 'qwen-edit')
-                : (settings.imageModel ?? 'zimage'),
-              ...(isEditing ? { imagePath: editSource } : {}),
+            // Engine selection: image EDIT -> Qwen-Image-Edit (default) vs Z-Image
+            // keep-subject; text-to-image -> Z-Image Turbo (default) vs FLUX.2 Klein 4B.
+            // Forwarded to the runner's /video-creator/v1/edit|image so the engine is
+            // selected server-side.
+            const engine = isEditing
+              ? (settings.imageEditEngine ?? 'qwen-edit')
+              : (settings.imageModel ?? 'zimage')
+            // Edits go to the /edit endpoint (accepts qwen-edit|zimage) and MUST carry
+            // the source image as base64 bytes — a remote runner can't fetch a browser
+            // web:// or blob: path. T2I goes to /image (accepts zimage|klein) with a prompt.
+            const srcEditTask = isEditing ? 'edit' : 'generate-image'
+            let imageBody: Record<string, unknown>
+            if (isEditing) {
+              if (!editSource) throw new Error('Edit source image required')
+              const image = await pathToBase64(editSource)
+              if (!image) throw new Error('Could not read the edit source image')
+              imageBody = {
+                prompt: finalPrompt,
+                image,
+                engine,
+                seed: imageSeed,
+                num_inference_steps: numSteps,
+                strength: settings.imageEditStrength ?? 0.6,
+                keepSubject: false,
+              }
+            } else {
+              imageBody = {
+                prompt: finalPrompt,
+                width: dims.width,
+                height: dims.height,
+                num_inference_steps: numSteps,
+                numImages,
+                seed: imageSeed,
+                engine,
+              }
             }
             const imgRes = await postImageToRunnerSSE(livepeerRunner, imageBody, {
               signal: abortController.signal,
@@ -471,7 +488,7 @@ export function useGeneration(): UseGenerationReturn {
                   statusMessage: ev.message || prev.statusMessage,
                 }))
               },
-            })
+            }, srcEditTask)
             // Persist the ACTUAL seed the runner used (it echoes it back), falling
             // back to the one we sent — so metadata always shows a real seed.
             latestImageSeedRef.current = typeof imgRes.seed === 'number' ? imgRes.seed : imageSeed

@@ -611,8 +611,11 @@ export async function postImageToRunnerSSE(
   runner: RunnerDto,
   body: unknown,
   opts?: { signal?: AbortSignal; onProgress?: (ev: RunnerProgressEvent) => void },
+  /** Task/endpoint to hit. Defaults to T2I (`/image`, engines zimage|klein);
+   *  pass `edit` to hit `/edit` (engines qwen-edit|zimage). */
+  task: string = 'generate-image',
 ): Promise<RunnerImageResult> {
-  const res = await postRunnerTaskWithTicketSSE(runner, 'generate-image', body, opts)
+  const res = await postRunnerTaskWithTicketSSE(runner, task, body, opts)
   if (res.mediaBlob) {
     const seed = typeof res.payload?.seed === 'number' ? res.payload.seed
       : typeof res.payload?.seed === 'string' && res.payload.seed !== ''
