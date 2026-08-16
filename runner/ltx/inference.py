@@ -25,6 +25,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _reflect_pad_to_target(image: "Image.Image", width: int, height: int) -> "Image.Image":
+    """Resize (contain) + reflect-pad a start image to the exact target dims.
+
+    Mirrors ltx_pipelines' ResizeMode.REFLECT_PAD conditioning behaviour: preserve
+    the source aspect ratio (fit within), then reflect-pad the shorter axis to the
+    exact (width, height). Because the result is already exactly the target size,
+    the pipeline's downstream ``resize_and_center_crop`` becomes a no-op, so the
+    image is never centre-cropped and its full framing survives on frame 0. Falls
+    back to edge padding when a padding strip would be too wide for a reflect pad
+    (same guard ltx_pipelines uses).
+    """
+    import numpy as np
+
+    src_w, src_h = image.size
+    if height >= src_h and width >= src_w:
+        new_w, new_h = src_w, src_h
+    else:
+        scale = min(height / src_h, width / src_w)
+        new_w = round(src_w * scale)
+        new_h = round(src_h * scale)
+        image = image.resize((new_w, new_h), Image.BILINEAR)
+    pad_bottom = height - new_h
+    pad_right = width - new_w
+    if pad_bottom > 0 or pad_right > 0:
+        mode = "reflect" if pad_bottom < new_h and pad_right < new_w else "edge"
+        arr = np.pad(
+            np.asarray(image),
+            ((0, pad_bottom), (0, pad_right), (0, 0)),
+            mode=mode,
+        )
+        image = Image.fromarray(arr)
+    return image
+
+
 # Sentinel: audio latent encoder not yet built (None means build attempted+failed).
 _AUDIO_COND_MISSING = object()
 
@@ -90,6 +125,15 @@ class VideoCreatorInferenceEngine:
         self._enhance_device = enhance_device if enhance_device is not None else device
         self._profile = profile
         self._pipeline: "DistilledPipeline | None" = None
+        # LTX-2.5 additive pipeline (activated by model='ltx-2.5'). Kept as a SEPARATE
+        # instance from self._pipeline so the LTX-2.3 default is never disturbed; it is
+        # loaded lazily only when a 2.5 request arrives.
+        self._pipeline25 = None
+        # DistilledPipeline API generation of the installed ltx_pipelines: 'old'
+        # (distilled_checkpoint_path / gemma_root constructor, LTX-2.3 monolith only) or
+        # 'new' (ModelPaths constructor, LTX-2.5-capable). Resolved lazily on first load.
+        self._pipe_api: str | None = None
+        self._loaded_loras25: list[tuple[str, float]] | None = None
         self._zimage_pipe = None  # ZImagePipeline, lazily built (text-to-image)
         self._zimg2img_pipe = None  # ZImageImg2ImgPipeline, lazily built (whole-frame edit)
         self._zinpaint_pipe = None  # ZImageInpaintPipeline, lazily built (masked edit)
@@ -109,6 +153,28 @@ class VideoCreatorInferenceEngine:
     # ------------------------------------------------------------------
     # Pipeline lifecycle
     # ------------------------------------------------------------------
+
+    def _api_generation(self, pipe_cls: type) -> str:
+        """Return the DistilledPipeline API generation of the installed ltx_pipelines:
+        ``'new'`` (ModelPaths-based, LTX-2.5-capable) or ``'old'``.
+
+        The upstream ltx-pipelines revision that added LTX-2.5 support replaced the old
+        ``distilled_checkpoint_path``/``gemma_root`` constructor with a single
+        ``model_paths: ModelPaths`` and changed ``__call__`` to return a 4-tuple. ``'new'``
+        is required to load the 2.5 split kit; ``'old'`` only knows the LTX-2.3 monolith.
+        Detected by inspecting the constructor signature (no torch import needed) and cached
+        per engine so it is resolved at most once.
+        """
+        if self._pipe_api is not None:
+            return self._pipe_api
+        import inspect
+        try:
+            params = inspect.signature(pipe_cls.__init__).parameters
+            api = "new" if "model_paths" in params else "old"
+        except (TypeError, ValueError):
+            api = "old"
+        self._pipe_api = api
+        return api
 
     def _load_pipeline(self, loras: list[tuple[str, float]] | None = None) -> None:
         """Load (or reload) the DistilledPipeline."""
@@ -150,17 +216,117 @@ class VideoCreatorInferenceEngine:
             quantization is not None,
         )
 
-        self._pipeline = DistilledPipeline(
-            distilled_checkpoint_path=self._checkpoint,
-            gemma_root=self._gemma_root,
-            spatial_upsampler_path=self._upsampler_path,
+        # LTX-2.3 uses the fat ("monolith") checkpoint. The new ModelPaths API expresses it
+        # via ModelPaths.from_monolith; the old API via distilled_checkpoint_path/gemma_root.
+        if self._api_generation(DistilledPipeline) == "new":
+            from ltx_pipelines.utils.model_paths import ModelPaths
+            self._pipeline = DistilledPipeline(
+                model_paths=ModelPaths.from_monolith(
+                    self._checkpoint, gemma_root=self._gemma_root,
+                ),
+                spatial_upsampler_path=self._upsampler_path,
+                loras=lora_entries,
+                device=self._device,
+                quantization=quantization,
+                offload_mode=offload_mode,
+            )
+        else:
+            self._pipeline = DistilledPipeline(
+                distilled_checkpoint_path=self._checkpoint,
+                gemma_root=self._gemma_root,
+                spatial_upsampler_path=self._upsampler_path,
+                loras=lora_entries,
+                device=self._device,
+                quantization=quantization,
+                offload_mode=offload_mode,
+            )
+        logger.info("DistilledPipeline loaded (api=%s, offload=%s, fp8=%s)",
+                    self._pipe_api, offload_mode, quantization is not None)
+
+    def _load_pipeline25(self, loras: list[tuple[str, float]] | None = None) -> None:
+        """Load the LTX-2.5 DistilledPipeline into ``self._pipeline25`` (model='ltx-2.5').
+
+        Builds a SEPARATE pipeline instance from the ComfyUI-style 2.5 split kit downloaded by
+        ``runner/ltx/download_ltx25.sh`` (diffusion_models + gemma4-proj text encoder +
+        video/audio VAEs + duration-head patch + the 2.5 latent spatial upscaler), using the
+        new ltx-pipelines ``ModelPaths.from_split`` interface. The LTX-2.3 default pipeline
+        (``self._pipeline``) is left untouched.
+
+        REQUIRES the upstream ltx-pipelines revision that ships the ModelPaths API
+        (Lightricks/LTX-2 >= fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca). The currently pinned
+        rev 9377758131b1ffde4b7f766804590a6617bf2ab9 does NOT expose ModelPaths and cannot
+        load 2.5 at all — this raises a clear, actionable error there instead of failing deep
+        inside a forward pass.
+        """
+        from runner.ltx import config as _cfg
+        from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+        from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
+        from ltx_pipelines.distilled import DistilledPipeline
+        from ltx_pipelines.utils.model_paths import ModelPaths
+        from ltx_pipelines.utils.types import OffloadMode
+
+        if self._api_generation(DistilledPipeline) != "new":
+            raise RuntimeError(
+                "LTX-2.5 requires the ModelPaths-based ltx-pipelines API. Apply the pin bump: "
+                "Lightricks/LTX-2 -> fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca for BOTH "
+                "packages/ltx-core and packages/ltx-pipelines, then rebuild the ltx-worker "
+                "image (the API change is not backward compatible with rev 9377758131...)."
+            )
+
+        loras = loras or self._loras
+        lora_entries = [
+            LoraPathStrengthAndSDOps(path=path, strength=scale, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
+            for path, scale in loras
+        ]
+
+        if self._profile is not None and self._profile.offload_mode == "CPU":
+            offload_mode = OffloadMode.CPU
+        else:
+            offload_mode = OffloadMode.NONE
+
+        # ComfyUI-style 2.5 kit layout under LTX25_MODEL_DIR (single-sourced from config).
+        model_dir = _cfg.LTX25_MODEL_DIR
+        transformer = os.path.join(model_dir, "diffusion_models", _cfg.ltx25_transformer_filename())
+        text_encoder = os.path.join(model_dir, "text_encoders", _cfg.LTX25_TEXT_ENCODER)
+        video_vae = os.path.join(model_dir, "vae", _cfg.LTX25_VIDEO_VAE)
+        audio_vae = os.path.join(model_dir, "vae", _cfg.LTX25_AUDIO_VAE)
+        duration_head = os.path.join(model_dir, "model_patches", _cfg.LTX25_DURATION_HEAD)
+        upscaler25 = _cfg.ltx25_spatial_upscaler_path()
+
+        missing = [
+            p for p in (transformer, text_encoder, video_vae, audio_vae, duration_head, upscaler25)
+            if not os.path.exists(p)
+        ]
+        if missing:
+            raise RuntimeError(
+                "LTX-2.5 kit is incomplete; missing: " + ", ".join(missing)
+                + ". Run runner/ltx/download_ltx25.sh on the GPU box (HUGGING_FACE_HUB_TOKEN "
+                "required) and confirm the latent spatial upscaler is downloaded, then restart."
+            )
+
+        logger.info(
+            "Loading LTX-2.5 DistilledPipeline (api=new, transformer=%s, upscaler=%r, offload=%s)",
+            transformer, upscaler25, offload_mode,
+        )
+        # The NVFP4 (Blackwell) vs INT8+ConvRot transformer variant is selected by filename via
+        # ltx25_transformer_filename(); ltx-core detects the quantization from the safetensors
+        # header. No fp8 cast policy is applied here (that policy is 2.3-specific and keyed to
+        # the 2.3 checkpoint path) — matching the upstream distilled CLI default for 2.5.
+        self._pipeline25 = DistilledPipeline(
+            model_paths=ModelPaths.from_split(
+                transformer_path=transformer,
+                text_encoder_path=text_encoder,
+                video_vae_path=video_vae,
+                audio_vae_path=audio_vae,
+                duration_head_path=duration_head,
+            ),
+            spatial_upsampler_path=upscaler25,
             loras=lora_entries,
             device=self._device,
-            quantization=quantization,
+            quantization=None,
             offload_mode=offload_mode,
         )
-        logger.info("DistilledPipeline loaded (offload=%s, fp8=%s)",
-                    offload_mode, quantization is not None)
+        logger.info("LTX-2.5 DistilledPipeline loaded")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -182,10 +348,11 @@ class VideoCreatorInferenceEngine:
             self._free_vram()
 
     def _evict_video(self) -> None:
-        """Drop the video pipeline from GPU. Called before the image model loads."""
-        if self._pipeline is not None:
-            logger.info("Evicting video pipeline from GPU before loading image model")
+        """Drop the video pipelines (2.3 + 2.5) from GPU before an image model loads."""
+        if self._pipeline is not None or self._pipeline25 is not None:
+            logger.info("Evicting video pipelines (2.3 + 2.5) from GPU before loading image model")
             self._pipeline = None
+            self._pipeline25 = None
             self._free_vram()
 
     def free(self) -> None:
@@ -199,12 +366,14 @@ class VideoCreatorInferenceEngine:
         with self._model_lock:
             if (
                 self._pipeline is not None
+                or self._pipeline25 is not None
                 or self._zimage_pipe is not None
                 or self._zimg2img_pipe is not None
                 or self._zinpaint_pipe is not None
             ):
                 logger.info("Freeing full engine (video + image pipelines) from GPU")
                 self._pipeline = None
+                self._pipeline25 = None
                 self._zimage_pipe = None
                 self._zimg2img_pipe = None
                 self._zinpaint_pipe = None
@@ -218,20 +387,32 @@ class VideoCreatorInferenceEngine:
         with self._model_lock:
             self._loras = list(loras) if loras else []
 
-    def _ensure_pipeline(self) -> None:
-        """Load the video pipeline, first evicting the image pipeline so only one
-        model occupies VRAM (bf16 Z-Image + video DiT cannot coexist on 32 GB).
+    def _ensure_pipeline(self, model: str = "") -> Any:
+        """Load and return the video pipeline for a request, first evicting the image
+        pipeline so only one model occupies VRAM (bf16 Z-Image + video DiT cannot coexist
+        on 32 GB).
 
-        Reloads when the requested LoRA set changed: LoRAs are baked into the
-        DistilledPipeline at construction, so a different set needs a reload (the
+        ``model=='ltx-2.5'`` selects the additive LTX-2.5 pipeline (``self._pipeline25``,
+        loaded lazily on first 2.5 request); anything else uses the LTX-2.3 default
+        (``self._pipeline``). Each reloads when the requested LoRA set changed: LoRAs are
+        baked into the pipeline at construction, so a different set needs a reload (the
         server's generation lock serializes this)."""
         with self._model_lock:
+            if model == "ltx-2.5":
+                if self._pipeline25 is None or self._loras != self._loaded_loras25:
+                    if self._pipeline25 is not None:
+                        logger.info("Requested LoRA set changed — reloading LTX-2.5 pipeline")
+                    self._evict_zimage()
+                    self._load_pipeline25()
+                    self._loaded_loras25 = list(self._loras)
+                return self._pipeline25
             if self._pipeline is None or self._loras != self._loaded_loras:
                 if self._pipeline is not None:
                     logger.info("Requested LoRA set changed — reloading pipeline")
                 self._evict_zimage()
                 self._load_pipeline()
                 self._loaded_loras = list(self._loras)
+            return self._pipeline
 
     def _pad_latent_frames(self, latent: torch.Tensor, pad_frames: int, at: str) -> torch.Tensor:
         """Zero-pad a latent on its temporal axis (dim 2): front for ``start``, back for
@@ -326,6 +507,47 @@ class VideoCreatorInferenceEngine:
     # T2V / I2V generation
     # ------------------------------------------------------------------
 
+    def _call_pipeline(
+        self,
+        pipe,
+        *,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images,
+        tiling_config,
+    ) -> tuple[Any, Any, int, Any]:
+        """Invoke ``DistilledPipeline.__call__`` transparently across the old vs new API.
+
+        The new (LTX-2.5-era) ``__call__`` returns a 4-tuple ``(video, audio, num_frames,
+        tiling_config)`` and requires ``vae_dtype``; the old API returns a 2-tuple and takes
+        neither. Returns ``(video, audio, num_frames, tiling_config)`` uniformly — for the old
+        API the requested values are echoed back so chunking/encoding logic is identical.
+        ``api`` is resolved lazily (pipeline loads have already pinned ``self._pipe_api``).
+        """
+        api = self._pipe_api or self._api_generation(pipe.__class__)
+        kwargs = dict(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            images=images,
+            tiling_config=tiling_config,
+        )
+        if api == "new":
+            video, audio, out_frames, out_tiling = pipe(
+                **kwargs, vae_dtype=self._dtype, enhance_prompt=False,
+            )
+        else:
+            video, audio = pipe(**kwargs)
+            out_frames, out_tiling = num_frames, tiling_config
+        return video, audio, out_frames, out_tiling
+
     @torch.inference_mode()
     def generate_t2v(
         self,
@@ -337,15 +559,20 @@ class VideoCreatorInferenceEngine:
         fps: int,
         output_path: str,
         loras: list[tuple[str, float]] | None = None,
+        model: str = "",
     ) -> None:
-        """Text-to-video generation (optionally applying the given catalog LoRAs)."""
+        """Text-to-video generation (optionally applying the given catalog LoRAs).
+
+        ``model=='ltx-2.5'`` routes to the additive LTX-2.5 pipeline; anything else uses the
+        default LTX-2.3 pipeline.
+        """
         if loras is not None:
             self.set_loras(loras)
-        self._ensure_pipeline()
+        pipe = self._ensure_pipeline(model=model)
         tiling_config = self.default_tiling_config()
-        chunks = self.video_chunks_number(num_frames, tiling_config)
 
-        video, audio = self._pipeline(
+        video, audio, out_frames, out_tiling = self._call_pipeline(
+            pipe,
             prompt=prompt,
             seed=seed,
             height=height,
@@ -355,6 +582,7 @@ class VideoCreatorInferenceEngine:
             images=[],
             tiling_config=tiling_config,
         )
+        chunks = self.video_chunks_number(out_frames, out_tiling)
 
         self.encode_video_output(
             video=video,
@@ -375,25 +603,33 @@ class VideoCreatorInferenceEngine:
         fps: int,
         output_path: str,
         loras: list[tuple[str, float]] | None = None,
+        model: str = "",
     ) -> None:
-        """Image-to-video generation (optionally applying the given catalog LoRAs)."""
+        """Image-to-video generation (optionally applying the given catalog LoRAs).
+
+        ``model=='ltx-2.5'`` routes to the additive LTX-2.5 pipeline; anything else uses the
+        default LTX-2.3 pipeline.
+        """
         from ltx_pipelines.utils.args import ImageConditioningInput as _LtxImageInput
 
         if loras is not None:
             self.set_loras(loras)
-        self._ensure_pipeline()
+        pipe = self._ensure_pipeline(model=model)
 
-        # Decode base64 to temporary PNG
+        # Decode base64, reflect-pad to the exact generation dims (no centre-crop).
         img_bytes = base64.b64decode(image_base64)
+        with Image.open(io.BytesIO(img_bytes)) as _img:
+            _img = _img.convert("RGB")
+            start_img = _reflect_pad_to_target(_img, width, height)
         tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         try:
-            tmp_img.write(img_bytes)
+            start_img.save(tmp_img.name, format="PNG")
             tmp_img.close()
 
             tiling_config = self.default_tiling_config()
-            chunks = self.video_chunks_number(num_frames, tiling_config)
 
-            video, audio = self._pipeline(
+            video, audio, out_frames, out_tiling = self._call_pipeline(
+                pipe,
                 prompt=prompt,
                 seed=seed,
                 height=height,
@@ -403,6 +639,7 @@ class VideoCreatorInferenceEngine:
                 images=[_LtxImageInput(tmp_img.name, frame_idx=0, strength=1.0)],
                 tiling_config=tiling_config,
             )
+            chunks = self.video_chunks_number(out_frames, out_tiling)
 
             self.encode_video_output(
                 video=video,

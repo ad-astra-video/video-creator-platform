@@ -1,4 +1,4 @@
-"""LTX worker server — serves /video-creator/v1/* + token-gated /load /evict
+﻿"""LTX worker server — serves /video-creator/v1/* + token-gated /load /evict
 
 Pure internal worker behind the live-runner edge. Does NOT register with the
 Orchestrator (that is live-runner's job); it only serves the inference surface
@@ -27,8 +27,6 @@ from runner.ltx.config import (
     ENHANCE_FORWARD_TIMEOUT,
     ENHANCE_FORWARD_URL,
     ENHANCE_GPU_DEVICE,
-    ENHANCE_I2V_SYSTEM_PROMPT,
-    ENHANCE_T2V_SYSTEM_PROMPT,
     GPU_DEVICE,
     GPU_NAME,
     GPU_VRAM_GB,
@@ -50,8 +48,8 @@ APP_ID = "video-creator"
 # Effective default system prompts for forwarded enhancement: an env override
 # wins, otherwise the built-in default used by enhance_forward (mirrors the
 # desktop's generic free-rewrite fallback).
-_ENHANCE_T2V_DEFAULT = ENHANCE_T2V_SYSTEM_PROMPT or enhance_forward.DEFAULT_T2V_SYSTEM_PROMPT
-_ENHANCE_I2V_DEFAULT = ENHANCE_I2V_SYSTEM_PROMPT or enhance_forward.DEFAULT_I2V_SYSTEM_PROMPT
+_ENHANCE_T2V_DEFAULT = enhance_forward.DEFAULT_T2V_SYSTEM_PROMPT
+_ENHANCE_I2V_DEFAULT = enhance_forward.DEFAULT_I2V_SYSTEM_PROMPT
 
 # Cap for the aiohttp request body. Default matches go-livepeer's declared
 # max AI request size (server/ai_http.go: MaxAIRequestSize = 3000000000 // 3GB),

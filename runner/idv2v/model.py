@@ -741,7 +741,6 @@ class ModelManager:
         from diffsynth.pipelines.wan_video_new_multiVace_svi import (
             WanVideoUnit_PromptEmbedder,
             WanVideoUnit_ImageEmbedder,
-            TeaCache,
         )
 
         scheduler = pipe.scheduler
@@ -749,12 +748,10 @@ class ModelManager:
 
         inputs_posi = {
             "prompt": prompt,
-            "tea_cache_l1_thresh": None, "tea_cache_model_id": "",
             "num_inference_steps": num_inference_steps,
         }
         inputs_nega = {
             "negative_prompt": negative_prompt,
-            "tea_cache_l1_thresh": None, "tea_cache_model_id": "",
             "num_inference_steps": num_inference_steps,
         }
         inputs_shared = {
@@ -870,20 +867,6 @@ class ModelManager:
                     ]
             return pipe.model_fn(**kw)
 
-        # -- TeaCache: reuse DiT residual across steps when drift is low ---
-        tea_posi = tea_nega = None
-        tea_thresh = config.IDV2V_TEACACHE_THRESH if config.IDV2V_TEACACHE else None
-        if tea_thresh is not None:
-            model_id = config.IDV2V_TEACACHE_MODEL or (
-                "Wan2.1-I2V-14B-720P" if height >= 700 else "Wan2.1-I2V-14B-480P"
-            )
-            tea_posi = TeaCache(num_inference_steps, rel_l1_thresh=tea_thresh, model_id=model_id)
-            tea_nega = TeaCache(num_inference_steps, rel_l1_thresh=tea_thresh, model_id=model_id)
-            logger.info(
-                "TeaCache enabled (thresh=%.3f model=%s) — first/last denoise steps always computed",
-                tea_thresh, model_id,
-            )
-
         for progress_id, timestep in enumerate(scheduler.timesteps):
             timestep = timestep.unsqueeze(0).to(dtype=self._torch_dtype, device=pipe.device)
             inputs_shared["latents"] = inputs_shared["latents"].to(
@@ -891,12 +874,10 @@ class ModelManager:
             )
             noise_pred_posi = bf16_model_fn(
                 **models, **inputs_shared, **inputs_posi, timestep=timestep,
-                tea_cache=tea_posi,
             )
             if cfg_scale != 1.0:
                 noise_pred_nega = bf16_model_fn(
                     **models, **inputs_shared, **inputs_nega, timestep=timestep,
-                    tea_cache=tea_nega,
                 )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:

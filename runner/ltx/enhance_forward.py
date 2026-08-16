@@ -1,4 +1,4 @@
-"""Forwarded (remote) prompt enhancement via an OpenAI-compatible endpoint.
+﻿"""Forwarded (remote) prompt enhancement via an OpenAI-compatible endpoint.
 
 By default prompt enhancement runs the runner's local Gemma encoder. This module
 backstops an alternate deployment where a fleet of runners share ONE enhancement
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Default system prompts, mirroring the desktop app's generic free-rewrite
 # fallback (services/prompt_enhancement/system_prompt.py). Overridable per-
-# deployment via ENHANCE_T2V_SYSTEM_PROMPT / ENHANCE_I2V_SYSTEM_PROMPT.
+# (system prompts are fixed constants — not env-overridable on the runner).
 _OUTPUT_FORMAT_INSTRUCTION = (
     "Respond with ONLY the rewritten prompt, as a single continuous paragraph of "
     "natural language. No titles, headings, prefaces, explanations, quotes, or "

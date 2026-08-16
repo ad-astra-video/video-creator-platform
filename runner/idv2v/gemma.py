@@ -51,12 +51,35 @@ ENHANCE_T2V_SYSTEM_PROMPT = (
     "instructions, headings, or preamble."
 )
 
+# Dedicated prompt for the RESTYLE task's enhance (run.py _gemma_stage). Kept
+# separate from ENHANCE_T2V_SYSTEM_PROMPT because the generic video-create
+# Enhance path must stay untouched — only the restyle task needs the color-
+# fidelity constraint (the restyled first frame sets the color palette, and it
+# must not drift/warm/cool as the video progresses).
+RESTYLE_ENHANCE_SYSTEM_PROMPT = (
+    "You are an expert at writing prompts for video generation models. "
+    "Rewrite and expand the user's prompt into a vivid, detailed video "
+    "description that captures the scene, subject, style and motion. "
+    "This video is a RESTYLE of a first frame: the opening frame has "
+    "already been restyled into a specific look. State explicitly, in the "
+    "prompt itself, that the entire video must keep the exact same color "
+    "palette and tone as that restyled first frame, and that colors must "
+    "stay constant for the whole clip (no gradual color shift, drift, or "
+    "warming/cooling as the video progresses). Keep it to a single "
+    "natural-language paragraph. Do not add instructions, headings, or "
+    "preamble."
+)
+
 IMAGE_ENHANCE_SYSTEM_PROMPT = (
     "You are an expert at writing image-editing prompts. Given a reference "
     "image and the user's edit direction, rewrite and expand the direction into "
     "a vivid, detailed prompt describing the desired NEW version of the image (the "
-    "edit result). Keep it to a single natural-language paragraph. Do not add "
-    "instructions, headings, or preamble."
+    "edit result). Preserve the original composition: the framing, camera angle, "
+    "subject scale, position and layout must stay exactly as in the reference "
+    "image, and say so explicitly in the prompt (e.g. \"keep the same framing and "
+    "camera angle\"). Change only the style, materials, lighting mood and other "
+    "visual attributes the user asks for. Keep it to a single natural-language "
+    "paragraph. Do not add instructions, headings, or preamble."
 )
 
 CAPTION_SYSTEM_PROMPT = (
@@ -183,6 +206,21 @@ class GemmaEnhancer:
         self.ensure_loaded()
         messages = [
             {"role": "system", "content": ENHANCE_T2V_SYSTEM_PROMPT},
+            {"role": "user", "content": f"user prompt: {prompt}"},
+        ]
+        return self._generate(messages, images=None, seed=seed)
+
+    def enhance_restyle(self, prompt: str, seed: int | None = None) -> str:
+        """Rewrite/expand a text prompt for the RESTYLE task (text-only).
+
+        Same as :meth:`enhance_text` but uses the restyle-specific system
+        prompt (RESTYLE_ENHANCE_SYSTEM_PROMPT), which injects the color-
+        fidelity constraint so the generated video keeps the restyled first
+        frame's color palette instead of drifting as it progresses.
+        """
+        self.ensure_loaded()
+        messages = [
+            {"role": "system", "content": RESTYLE_ENHANCE_SYSTEM_PROMPT},
             {"role": "user", "content": f"user prompt: {prompt}"},
         ]
         return self._generate(messages, images=None, seed=seed)

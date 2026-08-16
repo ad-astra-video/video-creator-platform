@@ -1,4 +1,4 @@
-"""Regression test: ltx-worker serves root /load and /evict.
+﻿"""Regression test: ltx-worker serves root /load and /evict.
 
 The live-runner's HttpWorkerTransport calls base + "/load" (swap.py), and the
 idv2v-worker already serves root /load /evict. The ltx-worker previously
@@ -42,11 +42,11 @@ def ltx_server(monkeypatch):
     for k, v in {
         "ENHANCE_FORWARD_API_KEY": "", "ENHANCE_FORWARD_MODEL": "",
         "ENHANCE_FORWARD_TIMEOUT": 30, "ENHANCE_FORWARD_URL": "",
-        "ENHANCE_GPU_DEVICE": "0", "ENHANCE_I2V_SYSTEM_PROMPT": "",
-        "ENHANCE_T2V_SYSTEM_PROMPT": "", "GPU_DEVICE": "0", "GPU_NAME": "RTX 5090",
+        "ENHANCE_GPU_DEVICE": "0", "GPU_DEVICE": "0", "GPU_NAME": "RTX 5090",
         "GPU_VRAM_GB": 0, "HOST": "0.0.0.0", "MODEL_CHECKPOINT": "/models/x",
         "PORT": 8991, "TEXT_ENCODER_ROOT": "/models/gemma", "UPSCALER_PATH": "",
-        "WARMUP": False, "worker_token": lambda: "tok",
+        "WARMUP": False, "IDV2V_WORKER_URL": "http://idv2v-worker:8992",
+        "worker_token": lambda: "tok",
     }.items():
         setattr(cfg, k, v)
     monkeypatch.setitem(sys.modules, "runner.ltx.config", cfg)

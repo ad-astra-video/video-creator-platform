@@ -12,6 +12,11 @@
 #   <MODELS_DIR>/gemma/gemma-3-12b-it-qat-q4_0-unquantized/
 #   <MODELS_DIR>/gemma/gemma-4-12b-it-qat-q4_0.gguf   (Gemma 4 LLM backend: gemma-worker)
 #   <MODELS_DIR>/upscaler/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+#   <MODELS_DIR>/ltx-2.5/...                (LTX 2.5 kit, optional; runner/ltx/download_ltx25.sh -
+#                                              NVFP4 on Blackwell, INT8+ConvRot otherwise.
+#                                              Includes the 2.5 latent spatial upscaler under
+#                                              latent_upscale_models/ needed by the distilled
+#                                              pipeline)
 #   <MODELS_DIR>/z-image/Z-Image-Turbo/
 #   <MODELS_DIR>/processors/{dpt-hybrid-midas, yolox_l.torchscript.pt, dw-ll_ucoco_384_bs5.torchscript.pt}
 #   <MODELS_DIR>/idv2v.pth                      (Eyeline-Labs/ID-V2V)
@@ -96,10 +101,24 @@ MODEL_DIR="$MODELS_DIR" bash "$(dirname "$0")/gemma/download_models.sh" || {
     echo "WARN: gemma-4 downloader exited nonzero (token may not cover Gemma 4)." >&2
 }
 
-echo ">>> [8/8] Verifying"
+echo ">>> [8/9] LTX 2.5 model kit (runner/ltx/download_ltx25.sh)"
+# Auto-picks NVFP4 (Blackwell) vs INT8+ConvRot (other GPUs). Optional explicit
+# choice via LTX25_VARIANT=int8|nvfp4. Gated repo — needs the HF token.
+MODEL_DIR="$MODELS_DIR" bash "$(dirname "$0")/ltx/download_ltx25.sh" || {
+    echo "WARN: LTX 2.5 downloader exited nonzero (token may not cover LTX-2.5)." >&2
+}
+
+# ---------------------------------------------------------- image-worker stack --
+echo ">>> [image] Qwen-Image-Edit / Qwen-Image-Layered / Z-Image (image-worker)"
+MODEL_DIR="$MODELS_DIR" bash "$(dirname "$0")/image/download_models.sh" || {
+    echo "WARN: image downloader exited nonzero (token may not cover gated Qwen-Image repos)." >&2
+}
+
+echo ">>> [9/9] Verifying"
 du -sh "$MODELS_DIR" 2>/dev/null || true
 echo ">>> Done. Now set MODELS_DIR=$MODELS_DIR before docker compose up."
 
 echo
 echo "Expect roughly: checkpoint/ 46G, gemma/ 25G, z-image/ 31G, idv2v.pth ~28G,"
-echo "wan/ + sam3/ several GB. Total on the order of 130-150 GB."
+echo "wan/ + sam3/ several GB. LTX 2.5 kit (optional): ~19 GB nvfp4 / ~22 GB int8 "
+echo "on top of the LTX 2.3 stack above. Total on the order of 150-175 GB + LTX 2.5."

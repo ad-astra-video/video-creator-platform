@@ -1,4 +1,4 @@
-"""Configuration from environment variables."""
+﻿"""Configuration from environment variables."""
 import json
 import os
 
@@ -165,15 +165,11 @@ GPU_NAME = os.environ.get("GPU_NAME") or None          # display name
 #   * ENHANCE_FORWARD_MODEL / ENHANCE_FORWARD_API_KEY — optional model id and
 #     Bearer key for the upstream endpoint.
 #   * ENHANCE_FORWARD_TIMEOUT — upstream request timeout in seconds.
-#   * ENHANCE_T2V_SYSTEM_PROMPT / ENHANCE_I2V_SYSTEM_PROMPT — optional override
-#     of the default system prompt sent upstream when a request has none.
 ENHANCE_GPU_DEVICE = os.environ.get("ENHANCE_GPU_DEVICE") or None
 ENHANCE_FORWARD_URL = os.environ.get("ENHANCE_FORWARD_URL") or None
 ENHANCE_FORWARD_MODEL = os.environ.get("ENHANCE_FORWARD_MODEL") or None
 ENHANCE_FORWARD_API_KEY = os.environ.get("ENHANCE_FORWARD_API_KEY") or None
 ENHANCE_FORWARD_TIMEOUT = float(os.environ.get("ENHANCE_FORWARD_TIMEOUT", "120"))
-ENHANCE_T2V_SYSTEM_PROMPT = os.environ.get("ENHANCE_T2V_SYSTEM_PROMPT") or None
-ENHANCE_I2V_SYSTEM_PROMPT = os.environ.get("ENHANCE_I2V_SYSTEM_PROMPT") or None
 
 # ── LoRA cache (catalog download + disk budget + LRU eviction) ──────────────
 LORA_CACHE_DIR = os.environ.get("LORA_CACHE_DIR", "/models/loras")

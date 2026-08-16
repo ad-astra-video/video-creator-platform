@@ -48,7 +48,20 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
     start = time.time()
 
     prompt = body.get("prompt", "")
-    max_frames = int(body.get("max_frames", 81))
+    # No default frame cap: when the caller does not request a specific budget,
+    # restyle reproduces the FULL source video length, chunked into per-clip
+    # windows (num_frames_per_clip, default 81 = ~3s) so longer inputs stay
+    # VRAM-manageable. Defaulting to 81 here truncated every restyle to one
+    # ~3s clip (the "only processes 3 seconds" regression).
+    _raw_max = body.get("max_frames")
+    max_frames = int(_raw_max) if _raw_max not in (None, "") else None
+    # Output fps: an explicit 24/25/30 wins; otherwise (or on a non-standard
+    # value) the output is encoded at the SOURCE video's fps so the returned
+    # restyle plays at the same rate/duration as the input.
+    _raw_fps = body.get("fps")
+    _explicit_fps = int(_raw_fps) if _raw_fps not in (None, "") else None
+    if _explicit_fps is not None and _explicit_fps not in (24, 25, 30):
+        _explicit_fps = None
     # A 0/omitted inference_steps resolves to the loaded model variant's default
     # budget (fast=8, regular=30). An explicit >0 value is honored as-is.
     inference_steps = int(body.get("inference_steps") or config.steps_for(model.variant))
@@ -57,9 +70,10 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
     width = int(body.get("width", 1280))
     height = int(body.get("height", 720))
     # Cap generation resolution so the fp8 DiT + activations fit the 31 GB
-    # GPU (720p/81fr does not fit this box). The LTX spatial upscaler in the
-    # live-runner chain restores full resolution afterward, so the final
-    # output is not limited by this cap. Default max side 640 (generates 360p for a 720p source, so the 2x upscaler returns ~720p).
+    # GPU (720p/81fr does not fit this box). This worker emits its output at
+    # whatever resolution it generates; the LTX spatial upscaler is a separate
+    # live-runner stage (gated by IDV2V_SKIP_UPSCALE, currently disabled on
+    # deployment). Default max side 640 (360p for a 720p source).
     gen_max_side = int(os.environ.get("IDV2V_GEN_MAX_SIDE", "640"))
     _sc = gen_max_side / max(width, height) if max(width, height) > gen_max_side else 1.0
     width = max(256, int(round(width * _sc) // 16 * 16))
@@ -76,7 +90,7 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
     keyframes = body.get("keyframes", [])   # [{"frame": N, "image": "<b64>"}, ...]
 
     logger.info(
-        "Processing restyle job: prompt=%r, max_frames=%d, steps=%d, cfg=%.1f",
+        "Processing restyle job: prompt=%r, max_frames=%s, steps=%d, cfg=%.1f",
         prompt, max_frames, inference_steps, cfg_scale,
     )
 
@@ -122,7 +136,7 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
             model, source_b64, stylized_b64, prompt,
             max_frames, inference_steps, cfg_scale, vace_scale,
             num_frames_per_clip, seed, keyframe_specs, width, height,
-            _prog,
+            _explicit_fps, _prog,
         )
     finally:
         set_generation_active(False)
@@ -144,7 +158,8 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
 
 def _run_pipeline(model, source_b64, stylized_b64, prompt, max_frames,
                   inference_steps, cfg_scale, vace_scale, num_frames_per_clip,
-                  seed, keyframe_specs, width, height, progress_cb=None) -> dict:
+                  seed, keyframe_specs, width, height,
+                  fps=None, progress_cb=None) -> dict:
     """Synchronous pipeline body (runs in a worker thread)."""
     tmpdir = tempfile.mkdtemp(prefix="idv2v_")
 
@@ -177,7 +192,13 @@ def _run_pipeline(model, source_b64, stylized_b64, prompt, max_frames,
         progress_cb=progress_cb,
     )
 
-    b64 = _encode_frames_mp4(frames)
+    # Output fps: explicit 24/25/30 wins; otherwise match the source video's fps
+    # (falling back to 24 if the container doesn't carry a sane rate).
+    src_fps = _read_source_fps(source_path)
+    out_fps = fps if fps is not None else (src_fps or 24.0)
+    logger.info("restyle output fps=%s (requested=%s source=%s)", out_fps, fps, src_fps)
+
+    b64 = _encode_frames_mp4(frames, out_fps)
     return {"b64": b64, "frames": len(frames)}
 
 
@@ -299,7 +320,7 @@ def _gemma_stage(enhancer, source_b64, prompt, enhance_prompt, seed):
             else:
                 logger.info("Gemma caption empty — keeping original prompt")
     if enhance_prompt and final.strip():
-        enhanced = enhancer.enhance_text(final, seed)
+        enhanced = enhancer.enhance_restyle(final, seed)
         if enhanced:
             meta["enhanced_prompt"] = enhanced
             meta["enhanced"] = True
@@ -464,15 +485,31 @@ def _segment_foreground(source_path, stylized_path, tmpdir, width, height):
     return _read_video_frames_cv2(cond_video, width, height)
 
 
-def _encode_frames_mp4(frames) -> str:
-    """Encode a list of PIL frames to an MP4 (H.264) and return base64."""
+def _read_source_fps(path):
+    """Read a video's nominal frame rate from its container; None when absent/invalid."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or None
+        cap.release()
+        if fps and 1.0 <= fps <= 240.0:
+            return round(float(fps), 3)
+    except Exception:
+        pass
+    return None
+
+
+def _encode_frames_mp4(frames, fps=24.0) -> str:
+    """Encode a list of PIL frames to an MP4 (H.264) at the given fps, and return
+    base64. fps defaults to 24 for callers that don't care; the restyle path passes
+    the source-matched (or user-selected) rate explicitly."""
     import imageio.v2 as imageio
 
     arr = np.stack([np.asarray(f.convert("RGB")) for f in frames], axis=0)
     fd, path = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     try:
-        imageio.mimwrite(path, arr, format="FFMPEG", fps=24, codec="libx264", quality=8)
+        imageio.mimwrite(path, arr, format="FFMPEG", fps=fps, codec="libx264", quality=8)
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode()
     finally:
