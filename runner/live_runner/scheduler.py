@@ -17,13 +17,12 @@ Eviction is VRAM-safe: ``evict_cb(worker)`` (POST /evict) frees the old model's
 VRAM BEFORE the new one loads, so two models never transiently co-reside.
 
 Device awareness:
-  * ``image-worker`` / ``gemma`` are device-aware — they honor ``device`` in
-    ``/load`` and can live on ANY GPU.
-  * ``ltx-worker`` / ``idv2v-worker`` are hardcoded to their ``GPU_DEVICE``
-    (``/load`` ignores ``device``; engine built once at startup), so they are
-    pinned to ``video_shared_gpu`` (0 by default). The scheduler always routes
-    them there and, when a video task needs the card, evicts whatever else is
-    warm on it (the OOM fix).
+  * ALL workers (image, gemma, ltx, idv2v) are device-aware — they honor
+    ``device`` in ``/load`` (free + relocate onto the given GPU) and can live
+    on ANY GPU. No worker is pinned. Every task goes through the same
+    warm-reuse -> free-GPU -> LRU-evict path, so image AND video spread across
+    all cards: image warms on one GPU while video warms on another, keeping
+    both resident for fast image -> video iteration.
 
 The map is ADVISORY: reconciled from each worker's ``/info`` at heartbeat, so a
 crashed/restarted worker self-heals between heartbeats.
@@ -53,10 +52,6 @@ class GPUSlot:
     last_used: float = 0.0         # monotonic ts of last use (LRU eviction ordering)
 
 
-# Legacy video workers are hardcoded to their GPU_DEVICE and can NOT be moved.
-_VIDEO_PINNED_WORKERS = frozenset({"ltx-worker", "idv2v-worker"})
-
-
 @dataclass
 class GPUScheduler:
     """Warm-resident, all-GPUs, LRU-eviction GPU map (serialized via a lock)."""
@@ -64,8 +59,6 @@ class GPUScheduler:
     gemma_resident_gpu: int | None = None
     gpu_count: int = 3
     queue_timeout_s: float = 600.0
-    # GPU reserved for the legacy video workers (ltx/idv2v) — they are pinned.
-    video_shared_gpu: int | None = None
     # Async hook that EVICTS a worker's model from VRAM before another task
     # takes its GPU. Generalized to any worker; wired in server.py to POST
     # /evict. None = never auto-evict (evictable victim search is skipped).
@@ -82,18 +75,12 @@ class GPUScheduler:
             s = self._slots[self.gemma_resident_gpu]
             s.worker, s.state, s.resident = "gemma-worker", "busy", True
             s.last_used = time.monotonic()
-        if (self.video_shared_gpu is not None
-                and (self.video_shared_gpu < 0 or self.video_shared_gpu >= self.gpu_count
-                     or self.video_shared_gpu == self.gemma_resident_gpu)):
-            self.video_shared_gpu = None
-
     @classmethod
     def from_config(cls) -> "GPUScheduler":
         return cls(
             gemma_resident_gpu=config.GEMMA_RESIDENT_GPU,
             gpu_count=config.GPU_COUNT,
             queue_timeout_s=config.SCHEDULER_QUEUE_TIMEOUT_S,
-            video_shared_gpu=config.VIDEO_GPU,
         )
 
     def _slot(self, gpu_id: int) -> GPUSlot:
@@ -133,24 +120,6 @@ class GPUScheduler:
         slot.resident = True
         slot.last_used = time.monotonic()
 
-    # -- video (pinned) workers ------------------------------------------
-
-    async def _acquire_video(self, worker: str) -> int:
-        """FIFO wait on the shared video GPU; evict anything else warm there."""
-        gpu = self.video_shared_gpu
-        async with self._cond:
-            deadline = time.monotonic() + self.queue_timeout_s
-            while True:
-                s = self._slot(gpu)
-                if s.worker not in (None, worker):
-                    await self._evict_slot(s, worker)
-                    continue
-                self._claim(s, worker)
-                logger.info("GPU schedule: %s -> GPU %d (video shared)", worker, gpu)
-                return gpu
-                # (never time out: video card is always evictable / free)
-            _ = deadline
-
     # -- gemma -----------------------------------------------------------
 
     def gemma_evicted(self) -> bool:
@@ -174,9 +143,6 @@ class GPUScheduler:
 
     async def acquire(self, worker: str) -> int:
         """Reserve a single GPU for ``worker`` (warm-reuse -> idle -> LRU-evict)."""
-        if worker in _VIDEO_PINNED_WORKERS and self.video_shared_gpu is not None:
-            return await self._acquire_video(worker)
-
         if worker == "gemma-worker" and self.gemma_resident_gpu is not None:
             if not self._gemma_evicted:
                 self._slot(self.gemma_resident_gpu).last_used = time.monotonic()
@@ -229,18 +195,12 @@ class GPUScheduler:
                     raise QueueTimeout(f"no GPU free for {worker} within {self.queue_timeout_s:.0f}s")
 
     def _pick_idle_gpu(self) -> GPUSlot | None:
-        """A GPU with no warm model resident (nothing on it at all). Prefers a
-        normal card; falls back to the video card only when no normal card is
-        free (the video worker is pinned there and will evict back when needed)."""
-        normal = [s for s in self._slots
-                  if s.worker is None and not s.resident
-                  and s.gpu_id != self.video_shared_gpu]
-        if normal:
-            normal.sort(key=lambda s: s.gpu_id == self.gemma_resident_gpu)
-            return normal[0]
-        for s in self._slots:
-            if s.worker is None and not s.resident:
-                return s
+        """A GPU with no warm model resident (nothing on it at all)."""
+        idle = [s for s in self._slots if s.worker is None and not s.resident]
+        if idle:
+            idle.sort(key=lambda s: (s.gpu_id == self.gemma_resident_gpu,
+                                     s.gpu_id))
+            return idle[0]
         return None
 
     def _pick_lru_victim(self, exclude: str | None = None) -> int | None:
@@ -254,8 +214,8 @@ class GPUScheduler:
         for s in self._slots:
             if s.worker is None or s.worker == exclude:
                 continue
-            if s.gpu_id == self.video_shared_gpu or s.gpu_id == self.gemma_resident_gpu:
-                continue  # never defensively evict video's card or gemma's
+            if s.gpu_id == self.gemma_resident_gpu:
+                continue  # never defensively evict gemma's card
             if best is None or s.last_used < best.last_used:
                 best = s
         return best.gpu_id if best is not None else None

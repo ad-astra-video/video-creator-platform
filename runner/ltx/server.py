@@ -91,16 +91,35 @@ def _require_token(request: web.Request) -> None:
         raise web.HTTPForbidden(reason="missing/mismatched X-Worker-Token")
 
 
-async def handle_load(_req: web.Request) -> web.Response:
+async def handle_load(req: web.Request) -> web.Response:
     """POST /load — ensure the inference engine is resident (kept warm).
 
-    The model loads lazily on the first generate call; this is a no-op warm-up
-    call from the live-runner's swap policy so a subsequent task doesn't pay
-    the cold-start cost. Returns 200 (loaded or already-loaded).
+    Reads ``device`` (int CUDA index) from the body. If it differs from the GPU
+    the engine currently targets, the engine is freed + relocated onto that GPU
+    (weights stream from host RAM, so re-load is comparatively quick) and kept
+    warm there. This is what lets the scheduler place video workers on ANY free
+    card instead of pinning them to GPU 0. Returns 200 + the active device.
     """
-    _require_token(_req)
+    _require_token(req)
+    global engine
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    device = body.get("device")
+    if device is not None and engine is not None:
+        try:
+            device = int(device)
+        except (TypeError, ValueError):
+            device = None
+        if device is not None and device >= 0 and engine.device_index != device:
+            logger.info("ltx-worker /load: relocating GPU %d -> %d",
+                        engine.device_index, device)
+            engine.set_device(device)
     assert engine is not None
-    return web.json_response({"loaded": True, "ready": ready})
+    return web.json_response({
+        "loaded": True, "ready": ready, "device": engine.device_index})
 
 
 async def handle_evict(_req: web.Request) -> web.Response:
@@ -232,6 +251,7 @@ async def handle_info(_req: web.Request) -> web.Response:
         "capabilities": ["t2v", "i2v", "image", "extend", "retake", "prompt-enhance", "suggest-gap-prompt", "ic-lora-extract", "ic-lora-generate"],
         "ready": ready,
         "gpu": profile_info,
+        "device_in_use": engine.device_index if engine is not None else (GPU_DEVICE or 0),
     })
 
 

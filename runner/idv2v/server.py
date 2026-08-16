@@ -79,15 +79,33 @@ def _get_model() -> ModelManager:
 async def handle_load(request: web.Request) -> web.Response:
     _require_token(request)
     global _model
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    device = body.get("device")
     async with _model_lock:
         model = _get_model()
+        if device is not None:
+            try:
+                device = int(device)
+            except (TypeError, ValueError):
+                device = None
+            cur = model.device
+            cur_idx = int(cur.split(":")[1]) if ":" in str(cur) else 0
+            if device is not None and device >= 0 and cur_idx != device:
+                logger.info("idv2v-worker /load: relocating GPU %d -> %d",
+                            cur_idx, device)
+                model.set_device(str(device))
         if model.is_ready:
-            return web.json_response({"loaded": True, "already_loaded": True})
+            return web.json_response(
+                {"loaded": True, "already_loaded": True, "device": model.device})
         try:
             await asyncio.wait_for(model.load(), timeout=3600)
         except asyncio.TimeoutError:
             return web.json_response({"error": "model load timed out"}, status=504)
-    return web.json_response({"loaded": True})
+    return web.json_response({"loaded": True, "device": model.device})
 
 
 async def handle_evict(request: web.Request) -> web.Response:
@@ -107,6 +125,24 @@ async def handle_health(request: web.Request) -> web.Response:
         "precision": config.IDV2V_QUANT, "offload": config.IDV2V_OFFLOAD,
     }
     return web.json_response({"status": "ok", **info})
+
+
+def _device_index() -> int:
+    """CUDA index this worker currently targets (for the scheduler's reconcile)."""
+    if _model is not None:
+        cur = str(_model.device)
+        if ":" in cur:
+            try:
+                return int(cur.split(":")[1])
+            except ValueError:
+                pass
+    ds = str(config.GPU_DEVICE)
+    if ":" in ds:
+        try:
+            return int(ds.split(":", 1)[1])
+        except ValueError:
+            pass
+    return int(ds) if ds.isdigit() else 0
 
 
 def _gpu_info() -> dict:
@@ -158,6 +194,7 @@ async def handle_info(request: web.Request) -> web.Response:
         "capabilities": ["restyle", "sam3", "prompt-enhance"],
         "ready": model is not None,
         "gpu": _gpu_info(),
+        "device_in_use": _device_index(),
         **base,
     })
 

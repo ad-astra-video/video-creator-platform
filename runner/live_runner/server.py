@@ -51,7 +51,7 @@ _last_activity = 0.0  # monotonic ts of last request (idle-backfill grace)
 # that still share one physical GPU keep the proven evict-before-load swap so two
 # models can never co-reside on the same card. image-worker + gemma each live on
 # their own GPU, so device-aware residency is safe for them.
-_DEVICE_AWARE_WORKERS = frozenset({"image-worker", "gemma-worker"})
+_DEVICE_AWARE_WORKERS = frozenset({"image-worker", "gemma-worker", "ltx-worker", "idv2v-worker"})
 
 
 def _device_for(worker: str, gpu: int) -> int | None:

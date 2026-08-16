@@ -196,6 +196,17 @@ class ModelManager:
             "CPU offload" if config.IDV2V_OFFLOAD else "no offload",
         )
 
+    def set_device(self, device: str = "") -> None:
+        """Relocate this model instance onto another CUDA GPU.
+
+        Evicts the current pipeline (freeing VRAM) and retargets the device.
+        The pipeline reloads on the new card on the next ``load()`` / generate.
+        Lets the scheduler place video workers on any free GPU.
+        """
+        self.evict()
+        self.device = self._normalize_device(device or config.GPU_DEVICE)
+        logger.info("ModelManager relocated -> %s", self.device)
+
     def evict(self) -> None:
         """Drop the pipeline and free GPU/CPU memory. Safe to call when unloaded."""
         if self._pipe is not None:

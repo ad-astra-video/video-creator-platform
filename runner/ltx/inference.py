@@ -379,6 +379,38 @@ class VideoCreatorInferenceEngine:
                 self._zinpaint_pipe = None
                 self._free_vram()
 
+    @property
+    def device_index(self) -> int:
+        """CUDA index of the GPU this engine currently targets."""
+        try:
+            return int(self._device.index) if self._device.type == "cuda" else -1
+        except Exception:
+            return -1
+
+    def set_device(self, gpu_idx: int) -> None:
+        """Relocate the whole engine onto another CUDA GPU.
+
+        Frees every resident pipeline and retargets ``self._device``; the model
+        reloads on the new GPU on the next generation call (lazily, via
+        ``_ensure_pipeline`` / ``_ensure_zimage``). Used when the scheduler hands
+        this worker a different card (warm-resident all-GPUs placement). The GPU
+        profile / offload mode is assumed identical across the box's cards (all
+        5090s), so it is reused as-is — only the CUDA index changes.
+        """
+        with self._model_lock:
+            old = self._device
+            self.free()
+            self._device = torch.device(f"cuda:{int(gpu_idx)}")
+            # If prompt-enhance wasn't pinned to a separate GPU, follow the move.
+            if self._enhance_device is not None and self._enhance_device == old:
+                self._enhance_device = self._device
+            # Audio-conditioner / lora-version caches are device-bound; reset so
+            # the next use rebuilds for the new card.
+            self._audio_cond = _AUDIO_COND_MISSING
+            self._loaded_loras = None
+            self._loaded_loras25 = None
+            logger.info("Engine relocated -> %s", self._device)
+
     def set_loras(self, loras: list[tuple[str, float]] | None) -> None:
         """Set the desired LoRA set for the next generation.
 

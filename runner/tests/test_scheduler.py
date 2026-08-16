@@ -125,7 +125,6 @@ def test_queue_timeout_raises_when_nothing_evictable():
     """If every GPU is warm and evict_cb is NOT wired, the scheduler cannot free
     a card -> waits and times out (no silent co-residency)."""
     s = _mk(gpu_count=3, gemma_gpu=1, timeout=0.05)  # no evict_cb
-    s.video_shared_gpu = None
 
     async def _t():
         g1 = await s.acquire("image-worker")
@@ -162,11 +161,11 @@ def test_reconcile_frees_slot_of_dead_worker():
     asyncio.run(_t())
 
 
-def test_video_worker_evicts_image_from_video_card():
-    """THE regression: a video task arriving while a DIFFERENT model is warm on
-    the video card EVICTS it first — never co-resides -> no OOM. Here "image"
-    is seeded directly on the video card (GPU 0) to model the case where only
-    the video card is left free for image."""
+def test_video_takes_free_gpu_not_evicting_image():
+    """THE regression: a video task arriving while image is warm on GPU 0 takes
+    a FREE card (GPU 1) instead of evicting image — so image stays warm for a
+    fast repeat and no model is dropped. Eviction only happens when NO GPU is
+    free."""
 
     class _Harness:
         def __init__(self):
@@ -177,65 +176,58 @@ def test_video_worker_evicts_image_from_video_card():
 
     h = _Harness()
     s = _mk(gpu_count=3, gemma_gpu=2, timeout=10.0)
-    s.video_shared_gpu = 0
     s.evict_cb = h.evict
 
     async def _t():
-        # seed a foreign warm model on the video card (image was forced there
-        # because no normal card was free)
-        s0 = [g for g in s.status()["gpus"] if g["gpu_id"] == 0][0]
-        # acquire+release ltx to claim the base then evict-seed image on it is
-        # awkward, so directly reconcile image-worker onto GPU 0:
-        await s.reconcile({"image-worker": {"device_in_use": 0}})
+        g_img = await s.acquire("ltx-worker")   # first worker warms a card
         st = {g["gpu_id"]: g for g in s.status()["gpus"]}
-        assert st[0]["worker"] == "image-worker"
-        # now a video task arrives -> ltx pinned to 0; evict image first
-        g_ltx = await s.acquire("ltx-worker")
-        assert g_ltx == 0
-        assert "image-worker" in h.evicted
+        assert st[g_img]["worker"] == "ltx-worker"
+        img_card = g_img
+        free_card = 1  # gemma on 2; the other of {0,1} is free
+        # image gen -> takes the FREE card, NOT evicting the video model
+        g_img2 = await s.acquire("image-worker")
+        assert g_img2 == free_card
+        assert h.evicted == []  # nothing evicted — both stayed warm
         st = {g["gpu_id"]: g for g in s.status()["gpus"]}
-        assert st[0]["worker"] == "ltx-worker"
+        assert st[img_card]["worker"] == "ltx-worker"
+        assert st[free_card]["worker"] == "image-worker"
 
     asyncio.run(_t())
 
 
-def test_image_avoids_video_card_when_another_free():
-    """When a normal GPU is free, image-worker does NOT take the video card —
-    so a later restyle/video gen isn't forced to evict (and image stays warm
-    on its own card for a fast repeat). GPU 0 reserved for video, GPU 1 for
-    image, gemma on 2: all three GPUs utilized, no collision."""
+def test_video_and_image_land_on_distinct_free_gpus():
+    """Video and image each take a DIFFERENT free GPU (all-GPUs placement):
+    no reservation, no eviction, both stay warm."""
     s = _mk(gpu_count=3, gemma_gpu=2, timeout=10.0)
-    s.video_shared_gpu = 0
 
     async def _t():
-        g_img = await s.acquire("ltx-worker")      # video holds GPU 0
-        g2 = await s.acquire("image-worker")       # image takes GPU 1 (free)
-        assert g2 == 1
-        await s.release("ltx-worker", g_img)
-        g3 = await s.acquire("ltx-worker")         # video still on 0
-        assert g3 == 0
-        await s.release("image-worker", g2)
-        await s.release("ltx-worker", g3)
+        g_vid = await s.acquire("ltx-worker")     # first free card
+        g_img = await s.acquire("image-worker")   # next free card
+        assert g_vid != g_img
+        assert {g_vid, g_img} <= {0, 1}  # gemma on 2
+        await s.release("ltx-worker", g_vid)
+        g_vid2 = await s.acquire("ltx-worker")    # warm-reuse same card
+        assert g_vid2 == g_vid
 
     asyncio.run(_t())
 
 
-def test_video_and_image_are_concurrent_on_distinct_gpus():
-    """Image on GPU 1 and video on GPU 0 run at the same time (the fix's goal):
-    no co-residency on the video card -> no video-gen OOM after an image gen."""
+def test_video_and_image_keep_warm_after_release():
+    """After releasing both, image AND video stay resident on their own cards
+    (idle+resident) so a repeat of either is a no-reload warm hit."""
     s = _mk(gpu_count=3, gemma_gpu=2, timeout=10.0)
-    s.video_shared_gpu = 0
 
     async def _t():
         g_vid = await s.acquire("ltx-worker")
         g_img = await s.acquire("image-worker")
-        assert g_vid == 0 and g_img == 1  # distinct cards, both busy
+        assert g_vid != g_img
         await s.release("ltx-worker", g_vid)
         await s.release("image-worker", g_img)
         st = {g["gpu_id"]: g for g in s.status()["gpus"]}
-        # both kept warm (idle+resident) on their own cards
-        assert st[0]["worker"] == "ltx-worker" and st[0]["state"] == "idle"
-        assert st[1]["worker"] == "image-worker" and st[1]["state"] == "idle"
+        assert st[g_vid]["worker"] == "ltx-worker" and st[g_vid]["state"] == "idle"
+        assert st[g_vid]["resident"] is True
+        assert st[g_img]["worker"] == "image-worker" and st[g_img]["state"] == "idle"
+        assert st[g_img]["resident"] is True
 
     asyncio.run(_t())
 
