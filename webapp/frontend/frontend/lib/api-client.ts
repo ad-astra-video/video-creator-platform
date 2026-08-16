@@ -333,6 +333,10 @@ export interface PlatformBalance {
   consumedUsdMicros: number
   lifetimeGrantedUsdMicros: number
   configured: boolean
+  // Optimistic-debit view (see src/balance.ts): balanceUsdMicros is already the
+  // NET (authority minus pending) display value. These expose the breakdown.
+  pendingUsdMicros?: number
+  authorityUsdMicros?: number
 }
 
 export interface PlatformCheckoutResponse {

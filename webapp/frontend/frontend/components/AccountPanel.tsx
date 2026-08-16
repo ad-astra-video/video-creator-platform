@@ -100,6 +100,11 @@ export function AccountPanel({ compact = false }: { compact?: boolean }) {
                 <p className="text-xl font-semibold text-white leading-tight">
                   {balance ? formatMicros(Number(balance.balanceUsdMicros)) : '—'}
                 </p>
+                {balance && Number(balance.pendingUsdMicros ?? 0) > 0 && (
+                  <p className="text-[10px] text-amber-400/80 leading-tight">
+                    {formatMicros(Number(balance.pendingUsdMicros))} in-flight (updating)
+                  </p>
+                )}
               </div>
               <div className="text-right">
                 <p className="text-[10px] text-zinc-500">Remaining</p>
