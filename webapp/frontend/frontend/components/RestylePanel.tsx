@@ -4,8 +4,9 @@ import { validateVideoSource } from '../lib/video-constraints'
 import { webAssetUrl } from '../lib/file-url'
 import { isWebPath, getBlob, removeAsset } from '../lib/runtime/web-store'
 import { ApiClient } from '../lib/api-client'
-import { resolveRunner, segmentSubjectViaRunner, styleFrameViaRunner } from '../lib/direct-transport'
-import { Image, X, Loader2, Check, Film, Wand2, Upload } from 'lucide-react'
+import { resolveRunner, segmentSubjectViaRunner, styleFrameViaRunner, editImageViaRunner, layerImageViaRunner } from '../lib/direct-transport'
+import type { LayerPreview } from '../lib/direct-transport'
+import { Image, X, Loader2, Check, Film, Wand2, Upload, Layers } from 'lucide-react'
 import { logger } from '../lib/logger'
 import type { Asset } from '../types/project-model'
 
@@ -54,6 +55,12 @@ export interface RestyleFrameOptions {
   seed?: number
   /** Run the style prompt through the worker's Gemma LLM (enhance-before-evict). */
   enhance?: boolean
+  /**
+   * First-frame editor engine: 'qwen-edit' (default) styles the frame via the
+   * ltx-worker's /video-creator/v1/edit (Qwen-Image-Edit); 'klein' uses the
+   * existing id-v2v worker /style-frame rail (FLUX.2 klein 4B fast).
+   */
+  engine?: 'qwen-edit' | 'klein'
 }
 
 export interface RestylePanelHandle {
@@ -145,6 +152,16 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   const [isStyling, setIsStyling] = useState(false)
   const [isExtracting, setIsExtracting] = useState(false)
   const [stylingError, setStylingError] = useState<string | null>(null)
+
+  // Layered preprocessing (Qwen-Image-Layered): decompose the current first frame into N
+  // RGBA layers purely as a PREVIEW aid — the layer output lives only in this component's
+  // state and is NEVER serialized into any video-request conditioning field.
+  const [layerEnabled, setLayerEnabled] = useState(false)
+  const [layerCount, setLayerCount] = useState(4)
+  const [layerIsRunning, setLayerIsRunning] = useState(false)
+  const [layerError, setLayerError] = useState<string | null>(null)
+  const [layerPreviews, setLayerPreviews] = useState<LayerPreview[]>([])
+  const [selectedLayers, setSelectedLayers] = useState<number[]>([])
 
   const videoKnownRef = useRef<string | null>(null)
   const stylizedInputRef = useRef<HTMLInputElement>(null)
@@ -313,6 +330,24 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
         if (runner && blob) {
           try {
             const seed = opts.seed ?? Math.floor(Math.random() * 2 ** 31)
+            const engine = opts.engine ?? 'qwen-edit'
+            if (engine === 'qwen-edit') {
+              // Qwen-Image-Edit (default): style the first frame via the ltx-worker's
+              // /video-creator/v1/edit with engine='qwen-edit', then feed the result back
+              // as stylized_first_frame into the restyle (never touches the id-v2v loop).
+              const edited = await editImageViaRunner(
+                runner,
+                await blobToBase64(blob),
+                opts.prompt.trim(),
+                { engine: 'qwen-edit', seed, enhance: opts.enhance ?? false },
+              )
+              setCandidates(prev => prev.some(t => t.path === edited.imageUrl)
+                ? prev
+                : [...prev, { path: edited.imageUrl, prompt: opts.prompt.trim(), seed }])
+              setActiveCandidate(edited.imageUrl)
+              setTab('image')
+              return true
+            }
             const styled = await styleFrameViaRunner(
               runner,
               await blobToBase64(blob),
@@ -393,6 +428,51 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     setTab('video')
   }, [activeCandidate, extractedFramePath, videoPath, onAccept, setTab])
 
+  // Decompose the current first frame into N RGBA layers via the runner's /video-creator/v1/layer
+  // (Qwen-Image-Layered, ltx-worker) with preview_only:true. Purely a panel aid — the result
+  // stays in local state and is never included in any video/restyle request body.
+  const decomposeLayers = useCallback(async () => {
+    const frame = displayFramePath
+    if (!frame || !isWebPath(frame)) {
+      setLayerError('Decompose needs a web:// image (extract or drop a first frame first)')
+      return
+    }
+    const blob = getBlob(frame)
+    if (!blob) return
+    setLayerIsRunning(true)
+    setLayerError(null)
+    try {
+      const runner = await resolveRunner(['image'])
+      if (!runner) {
+        setLayerError('No capable Livepeer runner is currently available for layered preprocessing.')
+        return
+      }
+      const result = await layerImageViaRunner(runner, await blobToBase64(blob), layerCount)
+      setLayerPreviews(result.layers)
+      setSelectedLayers([])
+    } catch (e) {
+      logger.error(`Layered preprocessing failed: ${e}`)
+      setLayerError(e instanceof Error ? e.message : 'Layered preprocessing failed')
+    } finally {
+      setLayerIsRunning(false)
+    }
+  }, [displayFramePath, layerCount])
+
+  // Enabling the toggle kicks off a first decomposition; the button re-runs it at a new count.
+  const handleLayerToggle = useCallback((enabled: boolean) => {
+    setLayerEnabled(enabled)
+    if (enabled && layerPreviews.length === 0) void decomposeLayers()
+  }, [decomposeLayers, layerPreviews.length])
+
+  const toggleLayer = useCallback((index: number) => {
+    setSelectedLayers(prev => prev.includes(index) ? prev.filter(i => i !== index) : [...prev, index])
+  }, [])
+
+  const layerLabel = useCallback((index: number, total: number) => {
+    if (total <= 3) return index === 0 ? 'Foreground' : index === total - 1 ? 'Background' : 'Midground'
+    return index === 0 ? 'Foreground' : index === total - 1 ? 'Background' : `Mid ${index}`
+  }, [])
+
   useImperativeHandle(ref, () => ({ restyleFrame, acceptCurrent }), [restyleFrame, acceptCurrent])
 
   // Report first-frame workflow state to the parent.
@@ -459,8 +539,19 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                       videoPath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
                     }`}
                   >
-                    {a.bigThumbnailPath ? (
-                      <img src={webAssetUrl(a.bigThumbnailPath)} alt="" className="w-full h-full object-cover" />
+                    {/* Poster: paint the first frame with a non-playing muted video. An <img> of
+                        a video blob (bigThumbnailPath for older/stale assets) renders as a broken
+                        image icon — same fix as the GenSpace asset grid, so use the asset's own
+                        path. Only falls back to the film icon if there is no source. */}
+                    {a.path ? (
+                      <video
+                        src={webAssetUrl(a.path)}
+                        muted
+                        playsInline
+                        preload="auto"
+                        disablePictureInPicture
+                        className="w-full h-full object-cover"
+                      />
                     ) : (
                       <div className="w-full h-full bg-zinc-800 flex items-center justify-center">
                         <Film className="h-4 w-4 text-zinc-500" />
@@ -701,6 +792,77 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                   ))}
                 </div>
               )}
+
+              {/* Layered preprocessing: decompose the current first frame into RGBA layers
+                  (Qwen-Image-Layered, preview-only). Purely a panel aid — the layer output
+                  lives in local state and is NOT included in any video/restyle request. */}
+              <div className="mt-1 pt-2 border-t border-zinc-800 flex flex-col gap-2">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={layerEnabled}
+                    onChange={(e) => handleLayerToggle(e.target.checked)}
+                    className="accent-emerald-500"
+                  />
+                  <Layers className="h-3.5 w-3.5 text-zinc-400" />
+                  <span className="text-xs text-zinc-300 font-medium">Layered preprocessing</span>
+                  <span className="text-[10px] text-zinc-600">preview only · not sent to video</span>
+                </label>
+                {layerEnabled && (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-zinc-400">Layers</span>
+                      <button
+                        type="button"
+                        onClick={() => setLayerCount(c => Math.max(2, c - 1))}
+                        className="w-6 h-6 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm leading-none"
+                      >−</button>
+                      <span className="w-5 text-center text-xs text-zinc-200">{layerCount}</span>
+                      <button
+                        type="button"
+                        onClick={() => setLayerCount(c => Math.min(8, c + 1))}
+                        className="w-6 h-6 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm leading-none"
+                      >+</button>
+                      <button
+                        type="button"
+                        onClick={() => void decomposeLayers()}
+                        disabled={layerIsRunning || !displayFramePath}
+                        className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-800 text-zinc-200 text-xs font-medium hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      >
+                        {layerIsRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Layers className="h-3.5 w-3.5" />}
+                        {layerIsRunning ? 'Decomposing...' : 'Decompose layers'}
+                      </button>
+                    </div>
+                    {layerError && <p className="text-[11px] text-red-400">{layerError}</p>}
+                    {layerPreviews.length > 0 && (
+                      <div className="flex items-end gap-1.5 overflow-x-auto pb-0.5">
+                        {layerPreviews.map((lp) => {
+                          const label = layerLabel(lp.index, layerPreviews.length)
+                          const selected = selectedLayers.includes(lp.index)
+                          return (
+                            <div key={lp.index} className="flex flex-col items-center gap-1 w-16 flex-shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => toggleLayer(lp.index)}
+                                title={`${label} — ${selected ? 'selected (click to deselect)' : 'click to select'}`}
+                                className={`w-16 aspect-square rounded-md overflow-hidden border-2 transition-colors ${
+                                  selected ? 'border-emerald-500' : 'border-zinc-700 hover:border-zinc-500'
+                                }`}
+                              >
+                                <img src={webAssetUrl(lp.previewKey)} alt={label} className="w-full h-full object-cover" />
+                              </button>
+                              <span className={`text-[9px] ${selected ? 'text-emerald-400' : 'text-zinc-500'}`}>{label}</span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                    {selectedLayers.length > 0 && (
+                      <p className="text-[10px] text-emerald-400">Target layers selected: {selectedLayers.join(', ')} (preview selection only)</p>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}

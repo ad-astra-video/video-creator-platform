@@ -3,7 +3,7 @@ import type { components } from '../generated/backend-openapi'
 export type VideoGenerationModelSpecsResponse = components['schemas']['GenerateVideoModelsSpecsResponse']
 export type VideoGenerationModelSpecItem = components['schemas']['LTXVideoGenerationModelSpecItem']
 export type VideoGenerationResolutionSpec = components['schemas']['LTXVideoGenerationResolutionSpec']
-export type VideoGenerationPipeline = components['schemas']['GenerateVideoRequest']['model']
+export type VideoGenerationPipeline = components['schemas']['GenerateVideoRequest']['model'] | 'ltx-2.5'
 export type VideoGenerationResolution = components['schemas']['GenerateVideoRequest']['resolution']
 export type VideoGenerationDuration = components['schemas']['GenerateVideoRequest']['duration']
 export type VideoGenerationFps = components['schemas']['GenerateVideoRequest']['fps']

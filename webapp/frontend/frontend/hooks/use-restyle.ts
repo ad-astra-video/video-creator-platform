@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
 import { resolveRunner, postRunnerTaskWithTicketSSE } from '../lib/direct-transport'
-import { getBlob, isWebPath } from '../lib/runtime/web-store'
+import { getBlob, isWebPath, registerBlob } from '../lib/runtime/web-store'
 import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY } from './use-generation'
 
 /** Read a browser Blob (e.g. a web:// image/video) as a base64 payload for a runner. */
@@ -43,6 +43,10 @@ export interface RestyleSubmitParams {
   prompt: string
   // id-v2v model variant: "fast" = FusionX (~8 steps), "regular" = original (30).
   model?: RestyleModel
+  // Output fps: 24 | 25 | 30 | 'auto'. 'auto' (default) = encode the returned
+  // restyle at the source video's own fps so it plays at the same rate/duration
+  // as the input. An explicit 24/25/30 overrides that.
+  fps?: 24 | 25 | 30 | 'auto'
   maxFrames?: number
   inferenceSteps?: number
   cfgScale?: number
@@ -141,7 +145,10 @@ export function useRestyle() {
       const body: Record<string, unknown> = {
         prompt: params.prompt,
         model: params.model ?? 'fast',
-        max_frames: params.maxFrames ?? 81,
+        // Only send fps when the user picked an explicit rate; 'auto' is the
+        // default and lets the worker match the source video's fps.
+        ...(params.fps && params.fps !== 'auto' ? { fps: params.fps } : {}),
+        ...(params.maxFrames != null ? { max_frames: params.maxFrames } : {}),
         // 0 = let the backend resolve steps from the model (fast ~8, regular 30).
         inference_steps: params.inferenceSteps ?? 0,
         cfg_scale: params.cfgScale ?? 5.0,
@@ -176,9 +183,16 @@ export function useRestyle() {
         return
       }
 
-      // The runner streams the generated media back over the WebSocket — store it as a local
-      // object URL for the project asset store.
-      const videoPath = URL.createObjectURL(res.mediaBlob)
+      // Store the restyle video in the browser asset store as a web:// key that
+      // webAssetUrl() can resolve (a raw blob: URL would fall through to a broken
+      // file:///blob%3A... link and the preview shows "Not allowed to load local
+      // resource"). Mirrors styleFrameViaRunner's registerBlob pattern.
+      const videoPath = registerBlob(
+        res.mediaBlob,
+        'restyled.mp4',
+        (res.mediaBlob as Blob).type || 'video/mp4',
+      )
+
       const videoCaption = res.payload?.video_caption ? String(res.payload.video_caption) : null
       const enhancedPrompt = res.payload?.enhanced_prompt ? String(res.payload.enhanced_prompt) : null
       setState({
