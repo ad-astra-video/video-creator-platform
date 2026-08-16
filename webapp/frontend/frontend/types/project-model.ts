@@ -68,6 +68,9 @@ export const generationParamsSchema = z.object({
   // Image-edit engine: Qwen-Image-Edit (default) | Z-Image masked keep-subject.
   imageEditEngine: z.enum(['qwen-edit', 'zimage']).optional(),
   imageModel: z.enum(['zimage', 'klein']).optional(),
+  // Seed used by the runner for this image, echoed back and persisted so the
+  // generation is reproducible / regenerable with the same input.
+  seed: z.number().optional(),
   // Restyle first-frame engine: Qwen-Image-Edit (default) | FLUX.2 klein (fast).
   first_frame_engine: z.enum(['qwen-edit', 'klein']).optional(),
   inputImageUrl: z.string().optional(),

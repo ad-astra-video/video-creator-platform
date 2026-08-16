@@ -600,14 +600,25 @@ export async function postRunnerTaskWithTicketSSE(
   })
 }
 
-/** Livepeer image generation over SSE. Returns the generated image Blob. */
+/** Livepeer image generation over SSE. Returns the generated image Blob + the
+ * seed the runner used (when the runner echoes it back), so callers can persist
+ * it as regeneration metadata. */
+export interface RunnerImageResult {
+  blob: Blob
+  seed?: number
+}
 export async function postImageToRunnerSSE(
   runner: RunnerDto,
   body: unknown,
   opts?: { signal?: AbortSignal; onProgress?: (ev: RunnerProgressEvent) => void },
-): Promise<Blob> {
+): Promise<RunnerImageResult> {
   const res = await postRunnerTaskWithTicketSSE(runner, 'generate-image', body, opts)
-  if (res.mediaBlob) return res.mediaBlob
+  if (res.mediaBlob) {
+    const seed = typeof res.payload?.seed === 'number' ? res.payload.seed
+      : typeof res.payload?.seed === 'string' && res.payload.seed !== ''
+        ? Number(res.payload.seed) : undefined
+    return { blob: res.mediaBlob, seed }
+  }
   throw new Error(res.payload?.error ? String(res.payload.error) : 'Runner returned no image')
 }
 

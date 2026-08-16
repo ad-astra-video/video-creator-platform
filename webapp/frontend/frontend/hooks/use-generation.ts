@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { useState, useCallback, useRef, useEffect, type RefObject } from 'react'
 import type { GenerationSettings } from '../components/SettingsPanel'
 import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
 import {
@@ -66,6 +66,9 @@ interface UseGenerationReturn extends GenerationState {
   cancel: () => void
   reset: () => void
   resumeIfRunning: () => Promise<'running' | 'complete' | 'none'>
+  /** Seed used by the most recent image generation (text-to-image or edit), so
+   *  callers can persist it as regeneration metadata. Null before any image gen. */
+  latestImageSeedRef: RefObject<number | null>
 }
 
 const IMAGE_SHORT_SIDE_BY_RESOLUTION: Record<string, number> = {
@@ -150,6 +153,7 @@ export function useGeneration(): UseGenerationReturn {
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const recoveryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const latestImageSeedRef = useRef<number | null>(null)
 
   const clearRecoveryPolling = () => {
     if (recoveryIntervalRef.current) {
@@ -439,13 +443,14 @@ export function useGeneration(): UseGenerationReturn {
             livepeerRunner = null
           }
           if (livepeerRunner) {
+            const imageSeed = Math.floor(Math.random() * 0x7fffffff)
             const imageBody = {
               prompt: finalPrompt,
               width: dims.width,
               height: dims.height,
               num_inference_steps: numSteps,
               numImages,
-              seed: 42,
+              seed: imageSeed,
               guidanceScale: 0.0,
               strength: isEditing ? (settings.imageEditStrength ?? 0.6) : 0.6,
               keepSubject: false,
@@ -458,7 +463,7 @@ export function useGeneration(): UseGenerationReturn {
                 : (settings.imageModel ?? 'zimage'),
               ...(isEditing ? { imagePath: editSource } : {}),
             }
-            const mediaBlob = await postImageToRunnerSSE(livepeerRunner, imageBody, {
+            const imgRes = await postImageToRunnerSSE(livepeerRunner, imageBody, {
               signal: abortController.signal,
               onProgress: (ev) => {
                 setState(prev => ({
@@ -467,7 +472,10 @@ export function useGeneration(): UseGenerationReturn {
                 }))
               },
             })
-            const objectUrl = URL.createObjectURL(mediaBlob)
+            // Persist the ACTUAL seed the runner used (it echoes it back), falling
+            // back to the one we sent — so metadata always shows a real seed.
+            latestImageSeedRef.current = typeof imgRes.seed === 'number' ? imgRes.seed : imageSeed
+            const objectUrl = URL.createObjectURL(imgRes.blob)
             setState({
               isGenerating: false,
               progress: 100,
@@ -495,7 +503,8 @@ export function useGeneration(): UseGenerationReturn {
             throw new Error('FAL API key required')
           }
           const falKey = keyRes.data.falApiKey
-          const seed = 42
+          const seed = Math.floor(Math.random() * 0x7fffffff)
+          latestImageSeedRef.current = seed
           let blob: Blob
           if (isEditing) {
             if (!editSource) throw new Error('Edit source image required')
@@ -576,5 +585,6 @@ export function useGeneration(): UseGenerationReturn {
     cancel,
     reset,
     resumeIfRunning,
+    latestImageSeedRef,
   }
 }

@@ -1535,6 +1535,7 @@ export function GenSpace() {
   const {
     generate,
     generateImage,
+    latestImageSeedRef,
     isGenerating,
     progress,
     statusMessage,
@@ -2532,6 +2533,7 @@ export function GenSpace() {
               cameraMotion: 'none',
               imageAspectRatio: settings.aspectRatio,
               imageSteps: editContext ? IMAGE_STEPS_EDIT : (settings.imageSteps ?? IMAGE_STEPS_GENERATE),
+              ...(typeof latestImageSeedRef.current === 'number' ? { seed: latestImageSeedRef.current } : {}),
               ...(editContext ? { inputImageUrl: editContext.source, imageEditStrength: editContext.strength } : {}),
             },
             takes: [{
