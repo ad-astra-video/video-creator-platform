@@ -45,6 +45,7 @@ class FakeEngine:
     def edit_image(self, image, prompt, engine="qwen-edit", mask=None,
                    keep_subject=False, strength=0.6, **kw):
         self.edit_engine = engine
+        self.edit_steps = kw.get("num_inference_steps")
         from PIL import Image
         return Image.new("RGB", (8, 8), "red")
 
@@ -249,6 +250,24 @@ async def test_image_missing_prompt_400(client):
     cli, _ = client
     r = await cli.post("/video-creator/v1/image", json={})
     assert r.status == 400
+
+
+async def test_edit_quality_translates_steps(client):
+    """The worker maps a bare quality name to per-engine steps: qwen 25/35/50."""
+    cli, engine = client
+    r = await cli.post("/video-creator/v1/edit",
+                       json={"image": _tiny_png_b64(), "prompt": "make it red",
+                             "engine": "qwen-edit", "quality": "high"})
+    assert r.status == 200
+    assert engine.edit_steps == 50
+    r = await cli.post("/video-creator/v1/edit",
+                       json={"image": _tiny_png_b64(), "prompt": "make it red",
+                             "engine": "qwen-edit", "quality": "fast"})
+    assert engine.edit_steps == 25
+    r = await cli.post("/video-creator/v1/edit",
+                       json={"image": _tiny_png_b64(), "prompt": "make it red",
+                             "engine": "qwen-edit", "quality": "balanced"})
+    assert engine.edit_steps == 35
 
 
 async def test_image_returns_png(client):

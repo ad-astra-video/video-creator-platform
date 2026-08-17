@@ -618,14 +618,16 @@ class ImageInferenceEngine:
             "layers_requested": n,
         }
 
-    def style_frame(self, image, prompt, seed=123, width=None, height=None) -> Image.Image:
+    def style_frame(self, image, prompt, seed=123, width=None, height=None,
+                    num_inference_steps=None) -> Image.Image:
         """Style ``image`` (a restyle first frame) with FLUX.2 klein 4B.
 
         Returns the styled PIL RGB image. Mirrors the id-v2v worker's /style-frame
         contract (single-reference edit: encode the frame through the FLUX.2 AE,
         denoise with ``prompt`` describing the desired styled result). The klein
         editor evicts the Qwen/Z-Image pipelines first; callers are responsible for
-        the prompt/composition-hold suffix.
+        the prompt/composition-hold suffix. ``num_inference_steps`` (Fast 4 /
+        Balanced 8 / High 12) lets quality presets nudge the distilled editor.
         """
         src = _decoded_pil(image)
         self._evict_other("klein")
@@ -633,7 +635,8 @@ class ImageInferenceEngine:
         editor = flux_edit.get_editor()
         editor.ensure_loaded()
         try:
-            styled = editor.edit(src, prompt, int(seed), width=width, height=height)
+            styled = editor.edit(src, prompt, int(seed), width=width, height=height,
+                                 steps=num_inference_steps)
             return styled
         finally:
             # Keep klein resident until the next non-klein build evicts it, so a

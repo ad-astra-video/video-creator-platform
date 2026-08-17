@@ -202,6 +202,14 @@ async def handle_edit(req: web.Request) -> web.Response:
     for k in ("width", "height", "num_inference_steps", "guidance_scale", "seed"):
         if body.get(k) is not None:
             kw[k] = body.get(k)
+    # Bare quality name -> this engine's step count (client threads quality;
+    # worker translates). Explicit num_inference_steps wins over quality.
+    if "num_inference_steps" not in kw:
+        q = str(body.get("quality") or "").strip().lower()
+        if q in ("fast", "balanced", "high"):
+            presets = (QWEN_EDIT_STEP_PRESETS if engine_name == "qwen-edit"
+                       else ZIMAGE_STEP_PRESETS)
+            kw["num_inference_steps"] = presets[q]
 
     from runner.image.inference import _pil_to_b64  # cheap, no torch
     img = await _run_generation(
@@ -348,6 +356,22 @@ async def handle_layer(req: web.Request) -> web.Response:
 # an explicit num_inference_steps override from the client.
 KLEIN_STEP_PRESETS = {"fast": 4, "balanced": 8, "high": 12}
 
+# Quality preset -> denoise steps, PER MODEL. The frontend threads a bare
+# quality name ("fast"|"balanced"|"high") and the worker translates it here so
+# clients don't hardcode engine-specific step counts.
+#   qwen-edit:  Qwen-Image-Edit  (25/35/50)
+#   klein:      FLUX.2 klein 4B  (step-distilled at 4; mild refinement above)
+#   zimage:     Z-Image Turbo    (native distilled 4)
+QWEN_EDIT_STEP_PRESETS = {"fast": 25, "balanced": 35, "high": 50}
+KLEIN_STEP_PRESETS = {"fast": 4, "balanced": 8, "high": 12}
+ZIMAGE_STEP_PRESETS = {"fast": 4, "balanced": 8, "high": 12}
+
+
+def _quality_steps(quality, presets, fallback: int) -> int:
+    """Resolve an explicit quality preset to steps; ``None`` when no preset maps."""
+    q = str(quality or "").strip().lower()
+    return presets.get(q, fallback) if q in presets else fallback
+
 def _image_klein_steps(body) -> int:
     """Resolve the number of klein T2I steps for a request body.
 
@@ -447,6 +471,13 @@ async def handle_style_frame(req: web.Request) -> web.Response:
     seed = int(body.get("seed", 123))
     width = body.get("width")
     height = body.get("height")
+    steps = body.get("num_inference_steps")
+    if steps is not None:
+        steps = int(steps)
+    else:
+        q = str(body.get("quality") or "").strip().lower()
+        if q in ("fast", "balanced", "high"):
+            steps = KLEIN_STEP_PRESETS[q]
 
     # Composition-hold suffix so the styled frame keeps the source's layout.
     composition_hold = (
@@ -462,7 +493,8 @@ async def handle_style_frame(req: web.Request) -> web.Response:
             status=503,
         )
     img = await _run_generation(
-        engine.style_frame, image, prompt + composition_hold, seed, width, height
+        engine.style_frame, image, prompt + composition_hold, seed, width, height,
+        num_inference_steps=steps,
     )
     return web.json_response({
         "styled_image": _pil_to_b64(img),

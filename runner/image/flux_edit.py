@@ -271,6 +271,7 @@ class FluxKleinEditor:
         width: int | None = None,
         height: int | None = None,
         max_side: int | None = None,
+        steps: int | None = None,
     ) -> "Image.Image":
         """Single-reference image edit: style ``image`` according to ``prompt``.
 
@@ -281,6 +282,9 @@ class FluxKleinEditor:
             width/height: output dims (defaults to the source, capped at
                 KLEIN4B_MAX_SIDE). Must be multiples of 16.
             max_side: optional long-edge cap (defaults to config).
+            steps: optional quality-preset step override (Fast 4 / Balanced 8 /
+                High 12). Klein is step-distilled so this is a modest nudge; None
+                keeps the configured default.
 
         Returns:
             PIL RGB styled image.
@@ -341,7 +345,8 @@ class FluxKleinEditor:
         randn = torch.randn(shape, generator=generator,
                             dtype=torch.bfloat16, device=self._device)
         x, x_ids = batched_prc_img(randn)
-        timesteps = get_schedule(self._steps, x.shape[1])
+        n_steps = int(steps) if steps else self._steps
+        timesteps = get_schedule(n_steps, x.shape[1])
 
         with torch.no_grad():
             x = denoise(
