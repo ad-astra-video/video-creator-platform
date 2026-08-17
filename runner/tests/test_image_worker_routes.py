@@ -43,9 +43,12 @@ class FakeEngine:
         self.force_413 = False
 
     def edit_image(self, image, prompt, engine="qwen-edit", mask=None,
-                   keep_subject=False, strength=0.6, **kw):
+                   keep_subject=False, strength=0.6, padding_mask_crop=0, **kw):
         self.edit_engine = engine
         self.edit_steps = kw.get("num_inference_steps")
+        self.edit_strength = strength
+        self.edit_padding = padding_mask_crop
+        self.edit_mask = mask
         from PIL import Image
         return Image.new("RGB", (8, 8), "red")
 
@@ -269,6 +272,21 @@ async def test_edit_quality_translates_steps(client):
                              "engine": "qwen-edit", "quality": "balanced"})
     assert engine.edit_steps == 35
 
+
+async def test_edit_masked_forwards_strength_padding(client):
+    # A masked qwen edit threads strength + padding_mask_crop + quality->steps to
+    # the engine (the QwenImageEditInpaintPipeline path).
+    cli, engine = client
+    r = await cli.post('/video-creator/v1/edit',
+                       json={'image': _tiny_png_b64(), 'prompt': 'make the chair red',
+                             'engine': 'qwen-edit', 'mask_image': _tiny_png_b64(),
+                             'strength': 0.4, 'padding_mask_crop': 24,
+                             'quality': 'fast'})
+    assert r.status == 200
+    assert engine.edit_mask is not None
+    assert engine.edit_strength == 0.4
+    assert engine.edit_padding == 24
+    assert engine.edit_steps == 25
 
 async def test_image_returns_png(client):
     cli, _ = client

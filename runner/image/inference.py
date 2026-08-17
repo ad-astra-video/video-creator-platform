@@ -93,6 +93,22 @@ def _to_pil(out: Any) -> Image.Image:
     raise TypeError(f"cannot convert pipeline output {type(out)!r} to PIL.Image")
 
 
+def _composite_masked(edited: Image.Image, original: Image.Image,
+                       mask: Image.Image) -> Image.Image:
+    """Paste the ORIGINAL pixels back over every image area the mask marks black.
+
+    White mask = the region the model repainted (kept from ``edited``); black =
+    everything to preserve. Resizes the mask to the output size if needed and
+    composites so the untouched frame is pixel-identical to the source.
+    """
+    # Normalize sizes (edited may come back at a padded/cropped resolution).
+    w = edited.size[0]
+    h = edited.size[1]
+    base = original.resize((w, h), Image.LANCZOS).convert("RGB")
+    m = mask.convert("L").resize((w, h), Image.NEAREST)
+    return Image.composite(edited.convert("RGB"), base, m)
+
+
 def _naive_layers(src: Image.Image, n: int) -> list[Image.Image]:
     """Deterministic fallback decomposition: split the (already clamped) image into
     ``n`` horizontal bands, each returned as a full-frame RGBA layer whose own band
@@ -167,6 +183,7 @@ class ImageInferenceEngine:
     def __init__(self, profile: Any = None) -> None:
         self._profile = profile
         self._qwen_edit: Any = None          # QwenImageEditPipeline
+        self._qwen_edit_inpaint: Any = None  # QwenImageEditInpaintPipeline (shares _qwen_edit components)
         self._qwen_layered: Any = None       # QwenImageLayeredPipeline
         self._zimage: Any = None             # ZImagePipeline (+ ZImageImg2Img/Inpaint)
         # Serializes lazy builds and evictions (a load must never race an evict).
@@ -302,6 +319,34 @@ class ImageInferenceEngine:
                 self.ready = True
             return self._qwen_layered
 
+    def _qwen_edit_inpaint_pipe(self):
+        """Return a QwenImageEditInpaintPipeline built AROUND the already-loaded
+        QwenImageEditPipeline's components (vae/text_encoder/tokenizer/processor/
+        transformer) so the masked inpainting path adds NO extra model RAM — the
+        edit model is a ~52 GB bf16 load, so a second from_pretrained() would
+        OOM the host. The scheduler is not shared (inpaint uses its own), but all
+        heavy modules are. Enable CPU offload once on the wrapper (hooks already
+        live on the shared sub-modules from the edit pipe)."""
+        with self._model_lock:
+            if self._qwen_edit_inpaint is None:
+                import torch
+                from diffusers import QwenImageEditInpaintPipeline
+                edit = self._qwen_edit_pipe()
+                self._qwen_edit_inpaint = QwenImageEditInpaintPipeline(
+                    scheduler=edit.scheduler,
+                    vae=edit.vae,
+                    text_encoder=edit.text_encoder,
+                    tokenizer=edit.tokenizer,
+                    processor=edit.processor,
+                    transformer=edit.transformer,
+                )
+                if _cfg.QWEN_OFFLOAD and torch.cuda.is_available():
+                    self._qwen_edit_inpaint.enable_model_cpu_offload(gpu_id=self._active_device())
+                else:
+                    self._qwen_edit_inpaint.to(self._torch_device())
+                logger.info("Built QwenImageEditInpaintPipeline sharing editor components")
+            return self._qwen_edit_inpaint
+
     def _zimage_pipe(self):
         """Build (once) and return the ZImagePipeline (text-to-image)."""
         with self._model_lock:
@@ -418,6 +463,7 @@ class ImageInferenceEngine:
         with self._model_lock:
             if keeper != "edit":
                 self._qwen_edit = None
+                self._qwen_edit_inpaint = None
             if keeper != "layered":
                 self._qwen_layered = None
             if keeper != "zimage":
@@ -439,6 +485,7 @@ class ImageInferenceEngine:
             pass
         with self._model_lock:
             self._qwen_edit = None
+            self._qwen_edit_inpaint = None
             self._qwen_layered = None
             self._zimage = None
             self.ready = False
@@ -454,11 +501,20 @@ class ImageInferenceEngine:
     # Generation methods
     # ------------------------------------------------------------------
     def edit_image(self, image, prompt, engine="qwen-edit", mask=None,
-                   keep_subject=False, strength=0.6, **kw) -> Image.Image:
+                   keep_subject=False, strength=0.6, padding_mask_crop=0,
+                   mask_composite=True, **kw) -> Image.Image:
         """Instruction / img2img image edit -> a single PIL.Image.
 
-        engine='qwen-edit' -> Qwen-Image-Edit (optionally masked, optionally
-        keep_subject). engine='zimage' -> Z-Image whole-frame img2img edit."""
+        engine='qwen-edit' -> Qwen-Image-Edit. When ``mask`` is supplied the
+        edit runs through QwenImageEditInpaintPipeline (white mask = repaint,
+        black = preserve) with ``strength`` controlling how aggressively the
+        masked region is regenerated and ``padding_mask_crop`` giving the model
+        surrounding context around a small masked object. The inpaint result is
+        hard-composited back over ORIGINAL source pixels outside the mask when
+        ``mask_composite`` (default) so untouched regions are pixel-identical.
+
+        engine='zimage' -> Z-Image whole-frame img2img edit (masked edits use
+        Z-Image inpaint)."""
         src = _decoded_pil(image)
         mask_img = _decoded_pil(mask) if mask is not None else None
         engine = str(engine).lower()
@@ -492,16 +548,28 @@ class ImageInferenceEngine:
         # `seed` (passing `seed` TypeErrors at __call__) — reuse the same seed->generator
         # translation the Z-Image paths use. `kw` is a fresh dict, safe to mutate.
         self._zimage_call_kw(kw)
-        # 0.39.0 has NO mask_images / keep_subject support at all (both TypeError at the
-        # __call__ boundary), so region-masked / keep-subject qwen edits can't run on the
-        # pinned pin. Surface a clear error instead of a cryptic TypeError; whole-frame
-        # edits (prompt + steps/guidance + seed) are unaffected.
-        if keep_subject or mask_img is not None:
-            raise ValueError(
-                "region-masked / keep-subject edits are not supported by Qwen-Image-Edit on "
-                "the pinned diffusers 0.39.0 (no mask_images/keep_subject). Use a whole-frame "
-                "Qwen edit, or FLUX.2 klein / Z-Image for region work."
-            )
+        if mask_img is not None:
+            # Region-masked edit via QwenImageEditInpaintPipeline (white = repaint,
+            # black = preserve). The wrapper shares the editor's loaded components so
+            # this adds no extra model RAM. `strength` controls regeneration
+            # aggressiveness; `padding_mask_crop` gives context around a small object.
+            inpaint = self._qwen_edit_inpaint_pipe()
+            in_kw = dict(prompt=prompt, strength=float(strength))
+            if _cfg.QWEN_STEPS and "num_inference_steps" not in kw:
+                in_kw["num_inference_steps"] = _cfg.QWEN_STEPS
+            for k in ("num_inference_steps", "guidance_scale"):
+                if kw.get(k) is not None:
+                    in_kw[k] = kw[k]
+            if int(padding_mask_crop or 0) > 0:
+                in_kw["padding_mask_crop"] = int(padding_mask_crop)
+            out = inpaint(image=src, mask_image=mask_img, **in_kw,
+                          generator=kw.get("generator"))
+            edited = _to_pil(out)
+            if mask_composite:
+                # Hard-composite the ORIGINAL source back over the mask's black
+                # (preserve) region so everything outside the mask is pixel-identical.
+                edited = _composite_masked(edited, src, mask_img)
+            return edited
         call_kw = dict(prompt=prompt)
         out = pipe(image=src, **call_kw, **kw)
         return _to_pil(out)

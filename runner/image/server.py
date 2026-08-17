@@ -198,6 +198,7 @@ async def handle_edit(req: web.Request) -> web.Response:
     mask = body.get("mask_image")
     keep_subject = bool(body.get("keep_subject", False))
     strength = float(body.get("strength", 0.6))
+    padding_mask_crop = int(body.get("padding_mask_crop", 0) or 0)
     kw = {}
     for k in ("width", "height", "num_inference_steps", "guidance_scale", "seed"):
         if body.get(k) is not None:
@@ -219,6 +220,7 @@ async def handle_edit(req: web.Request) -> web.Response:
         mask=mask,
         keep_subject=keep_subject,
         strength=strength,
+        padding_mask_crop=padding_mask_crop,
         **kw,
     )
     return web.json_response({
