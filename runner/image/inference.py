@@ -28,6 +28,17 @@ from runner.image import config as _cfg
 logger = logging.getLogger(__name__)
 
 
+# ── FP8 linear (native Blackwell, no torchao) ────────────────────────────────
+# torchao 0.18.0's prebuilt fp8 kernels fail to load on py3.12 / cu12.8 / sm_120
+# (built for py310 + CUDA 13 + Hopper). torch._scaled_mm works natively on this
+# box, so we wrap the pre-quantized fp8 Linear weights in a small module that
+# quantizes activations per-token and does the scaled matmul against the fp8
+# weight. Weights stay genuinely fp8 (the user requirement); only the activation
+# is quantized dynamically (standard fp8 w8a8).
+
+_FP8_MAX = 448.0
+
+
 # ── Pure-Python image helpers (no torch/diffusers needed) ────────────────────
 
 def _decoded_pil(image: Any) -> Image.Image:
@@ -269,7 +280,14 @@ class ImageInferenceEngine:
                         f"{root}/text_encoder", torch_dtype=torch.bfloat16)
                     _tok = AutoTokenizer.from_pretrained(f"{root}/tokenizer")
                     _proc = AutoProcessor.from_pretrained(f"{root}/processor")
-                    _tr = QwenImageTransformer2DModel.from_pretrained(f"{root}/transformer")
+                    _tr = QwenImageTransformer2DModel.from_pretrained(
+                        f"{root}/transformer", torch_dtype=torch.float8_e4m3fn)
+                    # Keep Linear weights fp8 (the user's requirement); restore
+                    # norms/biases to bf16; swap Linears for _Fp8Linear (native
+                    # torch._scaled_mm) since torchao's fp8 kernels don't load on
+                    # this py312/Blackwell image (libcudart.so.13 vs cu12.8).
+                    ImageInferenceEngine._fix_nonlinear_dtypes(_tr)
+                    ImageInferenceEngine._swap_fp8_linears(_tr)
                     self._qwen_layered = QwenImageLayeredPipeline(
                         scheduler=_sched, vae=_vae, text_encoder=_te,
                         tokenizer=_tok, processor=_proc, transformer=_tr)
@@ -324,6 +342,63 @@ class ImageInferenceEngine:
                 logger.warning("torchao: no quantizable sub-model found; using bf16")
         except Exception as exc:  # pragma: no cover - env-dependent
             logger.warning("torchao weight-only quant unavailable (%s); using bf16 load", exc)
+
+
+    @staticmethod
+    def _fix_nonlinear_dtypes(mod: Any) -> None:
+        """After loading a transformer at torch_dtype=fp8, keep Linear weights fp8
+        but restore every NON-Linear parameter (norms, scales, biases) to bf16.
+        fp8 is only valid inside the matmul; LayerNorm-style multiplies and
+        additions need a normal dtype."""
+        import torch
+        for name, child in mod.named_children():
+            if not isinstance(child, torch.nn.Linear):
+                for pname, p in list(child.named_parameters(recurse=False)):
+                    if p.dtype == torch.float8_e4m3fn:
+                        setattr(child, pname, torch.nn.Parameter(p.to(torch.bfloat16)))
+                ImageInferenceEngine._fix_nonlinear_dtypes(child)
+
+    @staticmethod
+    def _swap_fp8_linears(mod: Any) -> None:
+        """Replace every nn.Linear in the transformer with _Fp8Linear (native
+        torch._scaled_mm); the fp8 weight is kept as-is (still fp8)."""
+        import torch
+
+        class _Fp8Linear(torch.nn.Module):
+            """fp8 dynamic-activation linear via torch._scaled_mm; fp8 weight kept
+            as a buffer so accelerate's CPU-offload hook moves it (+bias) on/off
+            GPU. scale_b=1.0 (weights already fp8 -> literal); activations
+            quantized per-token with scale_a = amax / _FP8_MAX."""
+
+            def __init__(self, weight, bias):
+                super().__init__()
+                if bias is None:
+                    bias = torch.zeros(
+                        weight.shape[0], dtype=torch.bfloat16, device=weight.device)
+                self.register_buffer("weight", weight.detach().contiguous())  # (out,in)
+                self.register_buffer("bias", bias.detach().to(torch.bfloat16))
+
+            def forward(self, x):  # noqa: D401
+                orig = x.shape
+                x2 = x.reshape(-1, x.shape[-1]).float()
+                dev = x.device
+                w = self.weight.to(dev)
+                sx = (x2.abs().amax(dim=1, keepdim=True).clamp_(min=1e-6)
+                      / _FP8_MAX).to(torch.float32)
+                xq = (x2 / sx).to(torch.float8_e4m3fn)
+                sb = torch.ones(1, w.shape[0], device=dev, dtype=torch.float32)
+                y = torch._scaled_mm(
+                    xq, w.t(), scale_a=sx, scale_b=sb,
+                    out_dtype=torch.bfloat16)
+                out = y[0] if isinstance(y, tuple) else y
+                out = out + self.bias.to(dev).unsqueeze(0)
+                return out.reshape(*orig[:-1], -1).to(x.dtype)
+
+        for name, child in list(mod.named_children()):
+            if isinstance(child, torch.nn.Linear):
+                setattr(mod, name, _Fp8Linear(child.weight, child.bias))
+            else:
+                ImageInferenceEngine._swap_fp8_linears(child)
 
     # ------------------------------------------------------------------
     # Intra-container eviction
