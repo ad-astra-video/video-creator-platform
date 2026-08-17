@@ -172,6 +172,27 @@ def test_build_enhance_messages_context_empty_text_fallback():
     assert msgs[1]["content"] == "user prompt: hello"
 
 
+def test_suggest_layers_parse_bounds():
+    """Numeric extraction for suggest-layers must reject out-of-range and keep 2-8."""
+    import re
+    def parse(content):
+        m = re.search(r"\b([2-8])\b", content)
+        return int(m.group(1)) if m else None
+    assert parse("5") == 5
+    assert parse(" 3 \n") == 3
+    assert parse("7. The image has several objects.") == 7
+    assert parse("It is 8") == 8
+    assert parse("10") is None  # out of rubric range
+    assert parse("none") is None
+
+
+def test_suggest_layers_route_registered():
+    from runner.gemma.server import create_app
+    app = create_app()
+    paths = sorted(r.resource.canonical for r in app.router.routes() if r.resource)
+    assert "/video-creator/v1/suggest-layers" in paths
+
+
 def test_create_app_registers_routes():
     from runner.gemma.server import create_app
     app = create_app()

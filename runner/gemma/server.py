@@ -104,6 +104,23 @@ async def handle_health(_request: web.Request) -> web.Response:
     })
 
 
+
+
+# The rubric used to ask Gemma how many semantic layers an image decomposes into.
+LAYER_SUGGEST_RUBRIC = (
+    "Analyze the image and select the appropriate Qwen-Image-Layered layer count.\n\n"
+    "Use this rubric:\n"
+    "- 2 = simple image with one main subject and simple background\n"
+    "- 3 = main subject + background + one distinct secondary element\n"
+    "- 4 = several distinct objects or regions\n"
+    "- 5 = moderately complex scene with multiple overlapping objects\n"
+    "- 6 = complex scene with many independently editable objects\n"
+    "- 7 = very complex scene with many distinct overlapping elements\n"
+    "- 8 = extremely complex scene where separating many objects is useful\n\n"
+    "Choose the smallest number that adequately represents the image.\n"
+    "Output ONLY the number 2-8"
+)
+
 # ── Inference ────────────────────────────────────────────────────────────────
 
 def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
@@ -217,6 +234,49 @@ async def handle_chat(request: web.Request) -> web.Response:
     return web.json_response({"content": content, "model": MODEL_NAME})
 
 
+async def handle_suggest_layers(request: web.Request) -> web.Response:
+    """POST /video-creator/v1/suggest-layers.
+
+    Request:  {image: <b64 png>}
+    Response: {layers: int (2-8) | null, raw: str}
+
+    Feeds the uploaded image + the Qwen-Image-Layered layer-count rubric to the
+    multimodal Gemma chat and returns the parsed integer 2-8 (null when the LLM
+    doesn't produce a parseable number, so the caller falls back to its default).
+    """
+    _require_token(request)
+    body = await request.json()
+    image = body.get("image")
+    if not image:
+        return web.json_response({"error": "missing 'image'"}, status=400)
+    import base64 as _b64
+    head = _b64.b64decode(image[:64])
+    mime = "image/jpeg" if head[:3] == b"\xff\xd8\xff" else "image/png"
+    messages = [
+        {"role": "system", "content": LAYER_SUGGEST_RUBRIC},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image}"}},
+            {"type": "text", "text": "How many layers should this image be decomposed into?"},
+        ]},
+    ]
+    llm = _get_llm()
+    if not llm.is_ready:
+        return web.json_response({"error": "Gemma LLM not loaded"}, status=503)
+    async with _parallel:
+        try:
+            content = await asyncio.to_thread(llm.chat, messages, max_tokens=16,
+                                              temperature=0.0)
+        except Exception as exc:
+            logger.error("suggest-layers failed: %s", exc, exc_info=True)
+            return web.json_response({"error": str(exc)}, status=500)
+    # Parse a lone integer 2-8 out of the response (robust to extra text).
+    m = None
+    import re
+    m = re.search(r"\b([2-8])\b", content)
+    layers = int(m.group(1)) if m else None
+    return web.json_response({"layers": layers, "raw": content})
+
+
 # ── App factory ──────────────────────────────────────────────────────────────
 
 def create_app() -> web.Application:
@@ -230,6 +290,7 @@ def create_app() -> web.Application:
     app.router.add_post("/video-creator/v1/prompt-enhance", handle_prompt_enhance)
     app.router.add_post("/v1/chat", handle_chat)
     app.router.add_post("/video-creator/v1/chat", handle_chat)
+    app.router.add_post("/video-creator/v1/suggest-layers", handle_suggest_layers)
     return app
 
 

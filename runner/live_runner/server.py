@@ -26,7 +26,7 @@ from livepeer_gateway.live_runner import (
 )
 
 from . import config
-from .routing import CAPABILITIES, MODELS, ROUTES, candidate_workers, proxy
+from .routing import CAPABILITIES, MODELS, ROUTES, candidate_workers, proxy, proxy_layer_sse
 from .scheduler import GPUScheduler, QueueTimeout
 from .specs import build_model_specs
 from .swap import HttpWorkerTransport, ResidentWorkerManager
@@ -697,6 +697,25 @@ async def handle_generic(req: web.Request) -> web.Response:
         if endpoint == "restyle":
             async def _prog(ev): await _ev("progress", ev)
             out = await _restyle_chain(wm, session, token, body, progress_cb=_prog)
+        elif endpoint == "layer":
+            # Stream the image-worker's per-step SSE verbatim (accepted ->
+            # progress* (per denoise step) -> complete).
+            gpu = None
+            try:
+                gpu = await _scheduler.acquire("image-worker")
+            except QueueTimeout as exc:
+                await _ev("error", {"error": str(exc)})
+                await resp.write_eof()
+                return resp
+            try:
+                await proxy_layer_sse(wm, session, token, body, resp, device=gpu)
+            except Exception as exc:
+                logger.exception("layer SSE relay failed")
+                await _ev("error", {"error": str(exc)})
+            finally:
+                await _scheduler.release("image-worker", gpu)
+            await resp.write_eof()
+            return resp
         else:
             await _ev("progress", {"stage": "generating", "message": "Generating...", "progress": None})
             try:

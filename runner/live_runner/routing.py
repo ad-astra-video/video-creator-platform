@@ -30,6 +30,7 @@ ROUTES = {
     "prompt-enhance": "gemma-worker",
     "suggest-gap-prompt": "gemma-worker",
     "chat": "gemma-worker",
+    "suggest-layers": "gemma-worker",
     "extract-conditioning": "ltx-worker",
     "ic-lora-generate": "ltx-worker",
     "edit": "image-worker",
@@ -46,7 +47,7 @@ ROUTES = {
 # qwen apart without a per-engine capability entry.
 CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", "layer",
                        "sam3", "extend", "retake", "prompt-enhance",
-                       "suggest-gap-prompt", "chat", "extract-conditioning",
+                       "suggest-gap-prompt", "chat", "suggest-layers", "extract-conditioning",
                        "ic-lora-generate"})
 
 # Image models the image-worker can serve, by id. Consumed by the frontend to
@@ -193,3 +194,43 @@ async def proxy(
             text=last.text, content_type="application/json", charset="utf-8",
         )
     return web.json_response({"error": f"no worker available for {endpoint}"}, status=502)
+
+
+async def proxy_layer_sse(
+    worker_manager, session, token, body: dict,
+    client_resp: "web.StreamResponse", device: int | None = None,
+) -> None:
+    """Relay /layer?sse=1 to the image-worker's own SSE stream verbatim.
+
+    The image-worker emits `accepted` -> `progress`* (per denoise step) ->
+    `complete` as text/event-stream. We stream those events straight through to
+    the browser over the same paid HTTP connection so the client sees live
+    per-step progress without buffering the (large) base64 result.
+    """
+    from . import config as cfg
+    from .swap import HttpWorkerTransport
+    target = "image-worker"
+    await worker_manager.ensure(target, device=device)
+    base = cfg.WORKERS[target]
+    url = f"{base}/video-creator/v1/layer?sse=1"
+    headers = {"X-Worker-Token": token}
+    async with session.post(
+        url, json=body, headers=headers,
+        timeout=ClientTimeout(total=3600.0),
+    ) as resp:
+        if resp.status >= 400:
+            err = (await resp.read())[:500].decode("utf-8", "replace")
+            try:
+                await client_resp.write(
+                    f"event: error\ndata: {err}\n\n".encode("utf-8"))
+            except Exception:
+                pass
+            return
+        # Relay the worker's SSE byte-for-byte.
+        async for chunk in resp.content.iter_any():
+            if not chunk:
+                continue
+            try:
+                await client_resp.write(chunk)
+            except Exception:
+                break
