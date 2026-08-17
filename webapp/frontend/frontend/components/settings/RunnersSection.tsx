@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { AlertTriangle, DollarSign, Info, RefreshCw, Server } from 'lucide-react'
 import { ApiClient } from '../../lib/api-client'
+import { useAppSettings } from '../../contexts/AppSettingsContext'
+import { isWebPlatform, discoverRunners } from '../../lib/livepeer-discovery'
 import { getEthUsd, weiToUsd } from '../../lib/ethPrice'
 import { Button } from '../ui/button'
 
@@ -85,6 +87,7 @@ function formatPrice(
 }
 
 export function RunnersSection() {
+  const { settings: appSettings } = useAppSettings()
   const [providers, setProviders] = useState<ProviderDto[]>([])
   const [excluded, setExcluded] = useState<string[]>(() => loadExcluded())
   const [loading, setLoading] = useState(true)
@@ -116,16 +119,34 @@ export function RunnersSection() {
   const refresh = useCallback(async () => {
     setLoading(true)
     setError(null)
-    const [pr, st] = await Promise.all([ApiClient.getProviders(), ApiClient.getSettings()])
-    if (!pr.ok) {
-      setError(pr.error.message || 'Failed to load runners.')
-      setProviders([])
+    let providers: ProviderDto[] = []
+    let url = ''
+    if (isWebPlatform()) {
+      // Web build: discover straight against the configured Discovery URL (from app settings),
+      // not the Worker's /api/providers.
+      url = appSettings.livepeerDiscoveryUrl ?? ''
+      if (url) {
+        try {
+          providers = (await discoverRunners(url)) as unknown as ProviderDto[]
+        } catch (e) {
+          setError(e instanceof Error ? e.message : 'Could not reach Discovery URL')
+          providers = []
+        }
+      }
     } else {
-      setProviders((pr.data?.providers ?? []) as ProviderDto[])
+      const [pr, st] = await Promise.all([ApiClient.getProviders(), ApiClient.getSettings()])
+      if (!pr.ok) {
+        setError(pr.error.message || 'Failed to load runners.')
+        providers = []
+      } else {
+        providers = (pr.data?.providers ?? []) as ProviderDto[]
+      }
+      if (st.ok) url = st.data.livepeerDiscoveryUrl ?? ''
     }
-    if (st.ok) setDiscoveryUrl(st.data.livepeerDiscoveryUrl ?? '')
+    setProviders(providers)
+    setDiscoveryUrl(url)
     setLoading(false)
-  }, [])
+  }, [appSettings.livepeerDiscoveryUrl])
 
   useEffect(() => {
     void refresh()

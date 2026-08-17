@@ -1,4 +1,5 @@
 ﻿import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Trash2, Download, Image, Video, X,
   Heart, Film, Volume2, VolumeX, Sparkles, Sparkle,
@@ -11,6 +12,7 @@ import { useAppSettings } from '../contexts/AppSettingsContext'
 import { useGeneration, GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
 import { setActiveGenerationOwner, hasValidBaselineId } from '../lib/generation-recovery'
 import { resolveRunner, enhancePromptViaRunner, pathToBase64 } from '../lib/direct-transport'
+import { isWebPlatform } from '../lib/livepeer-discovery'
 import { extractFrame } from '../lib/runtime/web-store'
 import { withGenerationActive } from '../lib/generation-active'
 import { useVideoGenerationModelSpecs } from '../hooks/use-video-generation-model-specs'
@@ -47,6 +49,8 @@ import { RetakePanel } from '../components/RetakePanel'
 import { ExtendPanel } from '../components/ExtendPanel'
 import { RestylePanel } from '../components/RestylePanel'
 import type { RestylePanelHandle } from '../components/RestylePanel'
+import { ImageEditPanel } from '../components/ImageEditPanel'
+import type { ImageEditCompleteMeta, ImageEditPanelHandle } from '../components/ImageEditPanel'
 import { ICLoraPanel, CONDITIONING_TYPES } from '../components/ICLoraPanel'
 import type { OutpaintPads } from '../components/OutpaintCanvasEditor'
 import { LoraLibraryModal } from '../components/LoraLibraryModal'
@@ -354,6 +358,147 @@ function AspectIcon({ className }: { className?: string }) {
   )
 }
 
+// Angled volume-style strength arc: filled wedge = strength (0..1). The larger the
+// value, the more of the wedge fills — a visual "volume" representation.
+function StrengthArc({ value, className }: { value: number; className?: string }) {
+  const v = Math.max(0, Math.min(1, value))
+  const pct = Math.round(v * 100)
+  // An angled arc drawn as a thin SVG ring starting at bottom-left, sweeping
+  // clockwise. The filled portion (emerald) represents the strength.
+  return (
+    <svg viewBox="0 0 20 20" className={className ?? "h-4 w-4"} fill="none" aria-hidden="true">
+      <path d="M10 18 A8 8 0 1 1 18 10" stroke="currentColor" strokeOpacity="0.25" strokeWidth="2.4" strokeLinecap="round" />
+      <path
+        d="M10 18 A8 8 0 1 1 18 10"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeDasharray={`${(pct / 100) * 37.7} 100`}
+      />
+      <circle cx="10" cy="10" r="2" fill="currentColor" />
+    </svg>
+  )
+}
+
+// Options popover for image edits — strength (volume-style) + padding, both sliders.
+function EditOptionsButton({
+  strength,
+  padding,
+  onStrength,
+  onPadding,
+  disabled,
+}: {
+  strength: number
+  padding: number
+  onStrength: (v: number) => void
+  onPadding: (v: number) => void
+  disabled?: boolean
+}) {
+  const [isOpen, setIsOpen] = useState(false)
+  const ref = useRef<HTMLButtonElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+
+  // Auto-close on outside click / Escape. The panel is PORTALED to document.body,
+  // so "inside" must include both the trigger button and the portaled panel — the
+  // mousedown target sits in body, not under the button, otherwise clicking a
+  // slider would look like an outside click and close the popover.
+  useEffect(() => {
+    if (!isOpen) return
+    const onClick = (e: MouseEvent) => {
+      const t = e.target as Node
+      const inside =
+        (ref.current && ref.current.contains(t)) ||
+        (panelRef.current && panelRef.current.contains(t))
+      if (!inside) setIsOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setIsOpen(false) }
+    document.addEventListener('mousedown', onClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [isOpen])
+
+  return (
+    <>
+      <button
+        ref={ref}
+        type="button"
+        onClick={(e) => {
+          const r = e.currentTarget.getBoundingClientRect()
+          // Open upward, above the trigger — the prompt bar sits low on screen.
+          setPos({ top: r.top - 12, left: r.left })
+          setIsOpen(o => !o)
+        }}
+        disabled={disabled}
+        className={`flex shrink-0 items-center gap-1 whitespace-nowrap px-2 py-1.5 rounded-md transition-colors ${isOpen ? 'bg-zinc-700' : 'hover:bg-zinc-800'} ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+        title="Edit options: strength + padding"
+        aria-label="Edit options"
+      >
+        <StrengthArc value={strength} className="h-4 w-4 text-emerald-400" />
+      </button>
+
+      {isOpen && pos && createPortal(
+        <>
+          <div className="fixed inset-0 z-[70]" onClick={() => setIsOpen(false)} />
+          <div
+            ref={panelRef}
+            className="fixed z-[71] rounded-lg border border-zinc-700 bg-zinc-900 p-3 shadow-2xl"
+            style={{ top: pos.top, left: pos.left, transform: 'translateY(-100%)' }}
+          >
+            <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-3">Edit options</div>
+
+            {/* Strength — vertical slider */}
+            <div className="flex items-center gap-3 min-h-[120px]">
+              <div className="flex flex-col items-center gap-1">
+                <StrengthArc value={strength} className="h-6 w-6 text-emerald-400" />
+                <span className="text-[9px] text-zinc-500 uppercase">Strength</span>
+                <input
+                  type="range"
+                  min={0.1}
+                  max={1}
+                  step={0.05}
+                  value={strength}
+                  onChange={e => onStrength(parseFloat(e.target.value))}
+                  className="h-24 accent-emerald-500"
+                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+                  aria-label="Edit strength"
+                />
+                <span className="text-[10px] text-zinc-400 tabular-nums">{strength.toFixed(2)}</span>
+              </div>
+
+              {/* Padding — vertical slider */}
+              <div className="flex flex-col items-center gap-1">
+                <svg viewBox="0 0 20 20" className="h-6 w-6 text-zinc-300" fill="none" aria-hidden="true">
+                  <rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" strokeWidth="1.5" />
+                  <rect x="8" y="8" width="4" height="4" fill="currentColor" />
+                </svg>
+                <span className="text-[9px] text-zinc-500 uppercase">Padding</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={40}
+                  step={1}
+                  value={padding}
+                  onChange={e => onPadding(parseInt(e.target.value, 10))}
+                  className="h-24 accent-emerald-500"
+                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+                  aria-label="Mask padding crop"
+                />
+                <span className="text-[10px] text-zinc-400 tabular-nums">{padding}px</span>
+              </div>
+            </div>
+          </div>
+        </>,
+        document.body,
+      )}
+    </>
+  )
+}
+
+
 // Duration can be a raw float (e.g. extend output: 12.041667s). Show a clean value:
 // integers as-is, otherwise at most 2 decimals with trailing zeros trimmed.
 function formatSeconds(seconds: number): string {
@@ -362,7 +507,7 @@ function formatSeconds(seconds: number): string {
 
 const DEFAULT_LORA_SCALE = 1.0
 const IMAGE_STEPS_GENERATE = 4
-const IMAGE_STEPS_EDIT = 8
+const IMAGE_STEPS_EDIT = 35 // Balanced default for Qwen-Image-Edit (Fast 25 / Balanced 35 / High 50)
 const DEFAULT_RESTYLE_PROMPT = 'restyle this video'
 
 // Multi-select LoRA picker with a per-LoRA strength slider.
@@ -604,6 +749,8 @@ function PromptBar({
   enhanceProviderAvailable,
   enhanceAvailableForMode,
   canEnhancePrompt,
+  imageMaskActive,
+  imageEditProgress,
   isEnhancingPrompt,
   enhancePromptError,
   onEnhancePrompt,
@@ -648,6 +795,9 @@ function PromptBar({
     imageEditStrength?: number
     imageSteps?: number
     imageEditEngine?: 'qwen-edit' | 'zimage'
+    imageEditModel?: 'qwen-edit' | 'klein'
+    imageEditQuality?: 'fast' | 'balanced' | 'high'
+    imageEditPadding?: number
     imageModel?: 'zimage' | 'klein'
     first_frame_engine?: 'qwen-edit' | 'klein'
   }
@@ -672,6 +822,11 @@ function PromptBar({
   // generation) — gates the whole Enhance/Undo/Redo cluster's visibility.
   enhanceAvailableForMode?: boolean
   canEnhancePrompt?: boolean
+  // True while a mask (SAM3 item / layer region) is active in the embedded ImageEditPanel;
+  // masks require the inpaint engine, so the klein edit model is disabled.
+  imageMaskActive?: boolean
+  // Live image-edit denoise progress (over SSE) — drives a thin bar on the prompt bar.
+  imageEditProgress?: { step: number; totalSteps: number } | null
   isEnhancingPrompt?: boolean
   enhancePromptError?: string | null
   onEnhancePrompt?: () => void
@@ -810,7 +965,16 @@ function PromptBar({
   }
 
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-visible">
+    <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-visible relative">
+      {/* Thin image-edit progress bar pinned to the top of the prompt bar. */}
+      {imageEditProgress && imageEditProgress.totalSteps > 0 && (
+        <div className="absolute inset-x-0 -top-px h-0.5 bg-zinc-800 rounded-t-2xl">
+          <div
+            className="h-full bg-emerald-500 transition-[width] duration-150"
+            style={{ width: `${Math.min(100, Math.round((imageEditProgress.step / imageEditProgress.totalSteps) * 100))}%` }}
+          />
+        </div>
+      )}
       {/* Top row: Image ref | Prompt | Generate */}
       <div className="flex items-start">
         {/* Input image drop zone — video mode (I2V) or image mode (edit source) */}
@@ -1073,58 +1237,74 @@ function PromptBar({
         <IcLoraSettingsControls {...icLoraControls} />
         ) : mode === 'image' ? (
           <>
-            {/* Text-to-image model selector: Z-Image Turbo (default) | FLUX.2 Klein 4B */}
-            <SettingsDropdown
-              title="MODEL"
-              value={settings.imageModel ?? 'zimage'}
-              onChange={(v) => onSettingsChange({ ...settings, imageModel: v as 'zimage' | 'klein' })}
-              options={[
-                { value: 'zimage', label: 'Z-Image Turbo' },
-                { value: 'klein', label: 'FLUX.2 Klein 4B' },
-              ]}
-              trigger={
-                <>
-                  <ZitIcon className="h-3.5 w-3.5" />
-                  <span className="text-zinc-300 font-medium">
-                    {settings.imageModel === 'klein' ? 'FLUX.2 Klein' : 'Z-Image Turbo'}{imageUsesFalApi ? ' (API)' : ''}
-                  </span>
-                  <ChevronUp className="h-3 w-3 text-zinc-500" />
-                </>
-              }
-            />
+            {/* Model selector — edit mode (Qwen-Image-Edit | FLUX.2 klein) vs T2I (Z-Image | FLUX.2 Klein) */}
+            {isEditingImage ? (
+              <SettingsDropdown
+                title="MODEL"
+                value={settings.imageEditModel ?? 'qwen-edit'}
+                onChange={(v) => onSettingsChange({ ...settings, imageEditModel: v as 'qwen-edit' | 'klein' })}
+                options={[
+                  { value: 'qwen-edit', label: 'Qwen-Image-Edit' },
+                  { value: 'klein', label: 'FLUX.2 klein', disabled: imageMaskActive, tooltip: imageMaskActive ? 'Masks require the inpaint engine — FLUX.2 klein is disabled while an item/layer is selected.' : undefined },
+                ]}
+                trigger={
+                  <>
+                    <Wand2 className="h-3.5 w-3.5" />
+                    <span className="text-zinc-300 font-medium">
+                      {settings.imageEditModel === 'klein' ? 'FLUX.2 klein' : 'Qwen-Image-Edit'}
+                    </span>
+                    <ChevronUp className="h-3 w-3 text-zinc-500" />
+                  </>
+                }
+              />
+            ) : (
+              <SettingsDropdown
+                title="MODEL"
+                value={settings.imageModel ?? 'zimage'}
+                onChange={(v) => onSettingsChange({ ...settings, imageModel: v as 'zimage' | 'klein' })}
+                options={[
+                  { value: 'zimage', label: 'Z-Image Turbo' },
+                  { value: 'klein', label: 'FLUX.2 Klein 4B' },
+                ]}
+                trigger={
+                  <>
+                    <ZitIcon className="h-3.5 w-3.5" />
+                    <span className="text-zinc-300 font-medium">
+                      {settings.imageModel === 'klein' ? 'FLUX.2 Klein' : 'Z-Image Turbo'}{imageUsesFalApi ? ' (API)' : ''}
+                    </span>
+                    <ChevronUp className="h-3 w-3 text-zinc-500" />
+                  </>
+                }
+              />
+            )}
 
             {isEditingImage ? (
               // Edit runs at the source image's resolution — resolution/ratio don't apply.
+              // We thread a bare quality name (fast/balanced/high) and the WORKER
+              // translates it per engine (Qwen-Image-Edit 25/35/50, FLUX.2 klein 4/8/12).
               <>
                 <SettingsDropdown
-                  title="ENGINE"
-                  value={settings.imageEditEngine ?? 'qwen-edit'}
-                  onChange={(v) => onSettingsChange({ ...settings, imageEditEngine: v })}
+                  title="QUALITY"
+                  value={settings.imageEditQuality ?? 'balanced'}
+                  onChange={(v) => onSettingsChange({ ...settings, imageEditQuality: v as 'fast' | 'balanced' | 'high' })}
                   options={[
-                    { value: 'qwen-edit', label: 'Qwen-Image-Edit' },
-                    { value: 'zimage', label: 'Z-Image (keep-subject)' },
+                    { value: 'fast', label: 'Fast' },
+                    { value: 'balanced', label: 'Balanced' },
+                    { value: 'high', label: 'High' },
                   ]}
                   trigger={
                     <>
                       <Sparkles className="h-3.5 w-3.5" />
-                      <span>{settings.imageEditEngine === 'zimage' ? 'Z-Image' : 'Qwen-Edit'}</span>
-                      <ChevronUp className="h-3 w-3 text-zinc-500" />
+                      <span className="capitalize">{settings.imageEditQuality ?? 'balanced'}</span>
                     </>
                   }
                 />
-                <div className="flex items-center gap-1.5 px-2 text-[10px] text-zinc-400">
-                  <span>Strength</span>
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    value={settings.imageEditStrength ?? 0.6}
-                    onChange={(e) => onSettingsChange({ ...settings, imageEditStrength: parseFloat(e.target.value) })}
-                    className="w-20 accent-white"
-                  />
-                  <span className="w-8 text-right">{(settings.imageEditStrength ?? 0.6).toFixed(2)}</span>
-                </div>
+                <EditOptionsButton
+                  strength={settings.imageEditStrength ?? 0.55}
+                  padding={settings.imageEditPadding ?? 0}
+                  onStrength={(v) => onSettingsChange({ ...settings, imageEditStrength: v })}
+                  onPadding={(v) => onSettingsChange({ ...settings, imageEditPadding: v })}
+                />
               </>
             ) : (
               <>
@@ -1439,10 +1619,14 @@ const DEFAULT_VIDEO_SETTINGS = {
   imageResolution: '1080p',
   variations: 1,
   audio: true,
-  imageEditStrength: 0.6,
+  imageEditStrength: 0.55,
+  imageEditPadding: 0,
   imageSteps: IMAGE_STEPS_GENERATE,
   // Qwen-Image-Edit is the default engine for image edits and restyle first-frames.
   imageEditEngine: 'qwen-edit' as 'qwen-edit' | 'zimage',
+  // Edit models: Qwen-Image-Edit (default) | FLUX.2 klein.
+  imageEditModel: 'qwen-edit' as 'qwen-edit' | 'klein',
+  imageEditQuality: 'balanced' as 'fast' | 'balanced' | 'high',
   imageModel: 'zimage' as 'zimage' | 'klein',
   first_frame_engine: 'qwen-edit' as 'qwen-edit' | 'klein',
 }
@@ -1472,7 +1656,7 @@ export function GenSpace() {
     modelSpecs: videoGenerationModelSpecsResponse,
     isLoading: isLoadingVideoGenerationModelSpecs,
     errorMessage: videoGenerationModelSpecsErrorMessage,
-  } = useVideoGenerationModelSpecs()
+  } = useVideoGenerationModelSpecs(appSettings.livepeerDiscoveryUrl)
   const [mode, setMode] = useState<GenSpaceMode>('video')
   const [prompt, setPrompt] = useState('')
   const [isEnhancingPrompt, setIsEnhancingPrompt] = useState(false)
@@ -1610,7 +1794,9 @@ export function GenSpace() {
     }
   }, [])
   const refreshInstalledModels = useCallback(() => {
-    if (shouldVideoGenerateWithLtxApi) {
+    // Web/direct-transport build has no local on-disk models — the Worker serves neither
+    // /api/models?type=lora nor ?type=ic-lora. Skip the desktop-only enumeration entirely.
+    if (isWebPlatform() || shouldVideoGenerateWithLtxApi) {
       setLocalLoras([])
       setInstalledIcLoras([])
       return
@@ -1630,7 +1816,7 @@ export function GenSpace() {
     modalOpen: libraryModalOpen, setModalOpen: setLibraryModalOpen,
     selectedIcLoraId, selectedIcLoraVariantId, selectIcLora,
   } = useIcLoraLibrary(
-    mode === 'ic-lora' && !shouldVideoGenerateWithLtxApi,
+    mode === 'ic-lora' && !shouldVideoGenerateWithLtxApi && !isWebPlatform(),
     onSelectIcLora,
     installedIcLoras,
     refreshInstalledModels,
@@ -1645,7 +1831,8 @@ export function GenSpace() {
   }, [])
 
   // Plain-LoRA library: catalog browse/download + on-disk merge + "use" → selectedLoras.
-  const loraLibrary = useLoraLibrary(isLocalMode, localLoras, selectedLoras, setSelectedLoras, refreshInstalledModels)
+  // Disabled entirely in web/direct-transport mode (no local disk; Worker doesn't serve /api/loras).
+  const loraLibrary = useLoraLibrary(isLocalMode && !isWebPlatform(), localLoras, selectedLoras, setSelectedLoras, refreshInstalledModels)
   // installed path -> catalog display name (from the catalog↔on-disk merge), so the inline
   // LoRA picker shows a downloaded catalog LoRA's proper name instead of its raw filename.
   const loraDisplayNames = useMemo(() => {
@@ -2564,17 +2751,25 @@ export function GenSpace() {
   // "a stale, unrelated result predates this marker entirely".
   const writeRecoveryContext = async (ctx: Omit<GenerationRecoveryContext, 'projectId' | 'baselineId'>) => {
     if (!currentProjectId) return
-    const before = await ApiClient.getGenerationProgress()
-    if (!before.ok) {
-      // Fail closed: a failed fetch is indistinguishable from a legitimate idle baseline
-      // (both would otherwise write baselineId: null), but if a prior generation is still
-      // sticky-complete with a real id, that null baseline lets the very first recovery tick
-      // mistake the old generation's result for this one's. No marker means this generation
-      // just isn't recoverable if the user navigates away mid-flight — safer than misimporting.
-      logger.error(`Skipping recovery marker: failed to fetch baseline generation id (${before.error})`)
-      return
+    // Web build: the Worker has no generation-job rows here (generations are direct-to-runner and
+    // the media path is fully browser-local), so its progress slot is always id:null — a pointless
+    // round-trip to capture a baseline that can't exist. Save the marker purely locally. The
+    // desktop build (real backend job slot) still captures the baseline id so its recovery watcher
+    // can tell a not-yet-started generation from a stale unrelated one.
+    let baselineId: string | null = null
+    if (!isWebPlatform()) {
+      const before = await ApiClient.getGenerationProgress()
+      if (!before.ok) {
+        // Fail closed: a failed fetch is indistinguishable from a legitimate idle baseline
+        // (both would otherwise write baselineId: null), but if a prior generation is still
+        // sticky-complete with a real id, that null baseline lets the very first recovery tick
+        // mistake the old generation's result for this one's. No marker means this generation
+        // just isn't recoverable if the user navigates away mid-flight — safer than misimporting.
+        logger.error(`Skipping recovery marker: failed to fetch baseline generation id (${before.error})`)
+        return
+      }
+      baselineId = before.data.id ?? null
     }
-    const baselineId = before.data.id ?? null
     logger.info(`Writing recovery marker for ${currentProjectId} (genType=${ctx.genType ?? 'video'}, baselineId=${baselineId})`)
     localStorage.setItem(
       GENERATION_RECOVERY_KEY,
@@ -3031,6 +3226,12 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     setLastPrompt(prompt)
 
     if (mode === 'image') {
+      // Layered / region-selective editing via the ImageEditPanel, driven by the prompt bar.
+      if (inputImage && imageEditPanelRef.current) {
+        const ok = await imageEditPanelRef.current.runEdit(prompt, { engine: settings.imageEditModel ?? 'qwen-edit', quality: settings.imageEditQuality ?? 'balanced', strength: settings.imageEditStrength ?? 0.55, paddingMaskCrop: settings.imageEditPadding ?? 0, onProgress: (p) => setImageEditProgress(p) })
+        if (ok) return
+        // No capable runner / no edit — fall through to the standard image rail.
+      }
       const editSource = inputImage || null
       lastImageEditRef.current = editSource
         ? { source: editSource, strength: settings.imageEditStrength ?? 0.6 }
@@ -3083,6 +3284,60 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     }
   }
   
+  const imageEditPanelRef = useRef<ImageEditPanelHandle>(null)
+  // Live image-edit progress (per denoise step over SSE) -> thin bar above the prompt bar.
+  const [imageEditProgress, setImageEditProgress] = useState<{ step: number; totalSteps: number } | null>(null)
+  // True while an item/layer mask is active in the embedded ImageEditPanel — masks
+  // require the inpaint engine, so the FLUX.2 klein edit model is disabled then.
+  const [imageMaskActive, setImageMaskActive] = useState(false)
+
+  // Persist an ImageEditPanel's edited image into the project and continue editing on it.
+  const handleImageEditComplete = useCallback(async (newKey: string, meta: ImageEditCompleteMeta) => {
+    setImageEditProgress(null)
+    if (!currentProjectId) return
+    try {
+      const copied = await addVisualAssetToProject(newKey, currentProjectId, 'image')
+      if (!copied) return
+      addAsset(currentProjectId, {
+        type: 'image',
+        path: copied.path,
+        bigThumbnailPath: copied.bigThumbnailPath,
+        smallThumbnailPath: copied.smallThumbnailPath,
+        width: copied.width,
+        height: copied.height,
+        prompt: meta.prompt,
+        resolution: settings.imageResolution,
+        generationParams: {
+          mode: 'image-edit' as const,
+          prompt: meta.prompt,
+          model: 'fast',
+          duration: 5,
+          resolution: settings.imageResolution,
+          fps: 24,
+          audio: false,
+          cameraMotion: 'none',
+          imageAspectRatio: settings.aspectRatio,
+          imageSteps: IMAGE_STEPS_EDIT,
+          ...(typeof meta.seed === 'number' ? { seed: meta.seed } : {}),
+          inputImageUrl: inputImage ?? undefined,
+        },
+        takes: [{
+          path: copied.path,
+          bigThumbnailPath: copied.bigThumbnailPath,
+          smallThumbnailPath: copied.smallThumbnailPath,
+          width: copied.width,
+          height: copied.height,
+          createdAt: Date.now(),
+        }],
+        activeTakeIndex: 0,
+      })
+      // Keep editing on the edited image.
+      setInputImage(copied.path)
+    } catch (e) {
+      logger.error(`Failed to persist edited image: ${e}`)
+    }
+  }, [currentProjectId, addAsset, settings.imageResolution, settings.aspectRatio, inputImage, setInputImage])
+
   const handleDelete = (assetId: string) => {
     if (currentProjectId) {
       deleteAsset(currentProjectId, assetId)
@@ -3295,7 +3550,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
 
       {/* Assets area — full width, no background, above the prompt bar */}
       {/* Kept mounted even with no assets so the Browse LoRAs / Favorites / size toolbar survives the empty state. */}
-      {isLibraryMode && (
+      {isLibraryMode && !(mode === 'image' && !!inputImage) && (
         <div className="absolute inset-x-0 top-0 bottom-[160px] flex flex-col px-4 pt-4">
           {/* Top bar */}
           <div className="flex items-center justify-between pb-2 gap-2">
@@ -3411,6 +3666,20 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                 />
               ))}
             </div>
+          </div>
+        </div>
+      )}
+
+      {mode === 'image' && !!inputImage && (
+        <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+          <div className="flex-1 min-h-0 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3 overflow-y-auto">
+            <ImageEditPanel
+              ref={imageEditPanelRef}
+              imageKey={inputImage}
+              defaultEngine="qwen-edit"
+              onEditComplete={handleImageEditComplete}
+              onActiveChange={(info) => setImageMaskActive(info.masked)}
+            />
           </div>
         </div>
       )}
@@ -3625,6 +3894,8 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         <PromptBar
           mode={mode}
           onModeChange={setMode}
+          imageMaskActive={imageMaskActive}
+          imageEditProgress={imageEditProgress}
           canUseIcLora={!forceApiGenerations}
           prompt={prompt}
           onPromptChange={setPrompt}

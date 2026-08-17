@@ -265,11 +265,10 @@ export function useGeneration(): UseGenerationReturn {
           body.loras = lorasArr
         }
 
-        // Direct transport is the ONLY video backend in the webapp (/api/generate is 410 —
-        // the Worker no longer carries the media path). Gate on the Livepeer video toggle, not
-        // on the browser's discovery-URL string: runner resolution happens on the Worker via
-        // /api/providers (using its own D1/env discovery config), so a configured/toggle-on
-        // runner must be attempted even when appSettings.livepeerDiscoveryUrl is empty here.
+        // Direct transport is the ONLY video backend in the webapp (/api/generate is 410 — the
+        // Worker no longer carries the media path). Gate on the Livepeer video toggle. On the
+        // web build resolveRunner() discovers straight against the configured Discovery URL
+        // (client-side, from appSettings.livepeerDiscoveryUrl) — no Worker /api/providers call.
         const useDirectTransport = appSettings.livepeerVideoEnabled !== false
 
         // DIRECT transport: resolve a capable runner (Worker discovery) and do the Livepeer

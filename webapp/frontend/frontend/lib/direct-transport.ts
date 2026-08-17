@@ -18,6 +18,7 @@ import { ApiClient } from './api-client'
 import { getBlob, getBlobUrl, registerBlob, setDimensions } from './runtime/web-store'
 import { decodeMediaPayload } from './media-decode'
 import { logger } from './logger'
+import { isWebPlatform, discoverRunners, getRunnerDiscoveryConfig, loadExcludedRunnerUrls } from './livepeer-discovery'
 
 /** Fetch with an AbortSignal.timeout guard so a hung hop surfaces as an error instead of a silent await. */
 function fetchWithTimeout(ms: number): RequestInit['signal'] {
@@ -161,7 +162,7 @@ export async function styleFrameViaRunner(
   runner: RunnerDto,
   imageBase64: string,
   prompt: string,
-  opts?: { seed?: number; enhance?: boolean; signal?: AbortSignal },
+  opts?: { seed?: number; enhance?: boolean; quality?: 'fast' | 'balanced' | 'high'; signal?: AbortSignal },
 ): Promise<{ styledImageUrl: string; width?: number; height?: number; enhancedPrompt?: string }> {
   const res = await postToRunnerWithTicket(
     runner,
@@ -171,6 +172,7 @@ export async function styleFrameViaRunner(
       prompt,
       seed: opts?.seed,
       enhance_prompt: opts?.enhance ?? false,
+      quality: opts?.quality,
     },
     opts,
   )
@@ -216,11 +218,30 @@ export interface EditMediaResult {
   width?: number
   height?: number
 }
+function parseEditMediaResult(payload: { image?: unknown; image_b64?: unknown; edited_image?: unknown; width?: unknown; height?: unknown } | null): EditMediaResult {
+  const data = (payload ?? {}) as { image?: unknown; image_b64?: unknown; edited_image?: unknown; width?: unknown; height?: unknown }
+  const b64 = (typeof data.image_b64 === 'string' ? data.image_b64
+    : typeof data.image === 'string' ? data.image
+    : typeof data.edited_image === 'string' ? data.edited_image : null)
+  if (!b64) throw new Error('Image edit completed without an image')
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  const key = registerBlob(new Blob([bytes], { type: 'image/png' }), 'edit.png', 'image/png')
+  if (data.width != null && data.height != null) {
+    try { setDimensions(key, Number(data.width), Number(data.height)) } catch { /* non-fatal */ }
+  }
+  return {
+    imageUrl: key,
+    width: typeof data.width === 'number' ? data.width : undefined,
+    height: typeof data.height === 'number' ? data.height : undefined,
+  }
+}
 export async function editImageViaRunner(
   runner: RunnerDto,
   imageBase64: string,
   prompt: string,
-  opts?: { engine?: string; seed?: number; strength?: number; enhance?: boolean; signal?: AbortSignal },
+  opts?: { engine?: string; seed?: number; strength?: number; paddingMaskCrop?: number; enhance?: boolean; maskImage?: string; quality?: 'fast' | 'balanced' | 'high'; signal?: AbortSignal; onProgress?: (p: LayerRunProgress) => void },
 ): Promise<EditMediaResult> {
   const res = await postToRunnerWithTicket(
     runner,
@@ -231,9 +252,14 @@ export async function editImageViaRunner(
       engine: opts?.engine ?? 'qwen-edit',
       seed: opts?.seed,
       strength: opts?.strength,
+      quality: opts?.quality,
       enhance_prompt: opts?.enhance ?? false,
+      padding_mask_crop: opts?.paddingMaskCrop,
+      // A base64 alpha/RGB mask limits the edit to only the masked regions
+      // (Qwen-Image-Edit forwards it as mask_images; Z-Image uses inpaint).
+      mask_image: opts?.maskImage,
     },
-    opts,
+    { ...opts, sse: opts?.onProgress ? true : false },
   )
   if (!res.ok) {
     let detail = `Image edit failed (${res.status})`
@@ -243,23 +269,91 @@ export async function editImageViaRunner(
     } catch { /* keep status message */ }
     throw new Error(detail)
   }
+  const ct = res.headers.get('content-type') ?? ''
+  if (opts?.onProgress && ct.includes('text/event-stream') && res.body) {
+    // SSE: accepted -> progress* (per denoise step) -> single complete with the
+    // edited image. Mirrors the /layer SSE consumption.
+    return await new Promise<EditMediaResult>((resolve, reject) => {
+      let settled = false
+      readSSEStream(res.body!.getReader(), opts.signal, (event, data) => {
+        if (settled) return
+        if (event === 'progress') {
+          let p: Record<string, unknown>
+          try { p = JSON.parse(data) as Record<string, unknown> } catch { return }
+          const step = typeof p.step === 'number' ? p.step : null
+          const total = typeof p.total_steps === 'number' ? p.total_steps : null
+          if (step != null) opts?.onProgress?.({ step, totalSteps: total != null ? total : 50 })
+        } else if (event === 'complete') {
+          settled = true
+          try {
+            const payload = JSON.parse(data) as { image?: unknown; width?: unknown; height?: unknown }
+            resolve(parseEditMediaResult(payload))
+          } catch (e) {
+            reject(e instanceof Error ? e : new Error(String(e)))
+          }
+        } else if (event === 'error') {
+          settled = true
+          let msg = 'Image edit SSE error'
+          try { msg = String((JSON.parse(data) as { error?: unknown }).error ?? msg) } catch { /* keep default */ }
+          reject(new Error(msg))
+        }
+      }).catch((e) => {
+        if (!settled) { settled = true; reject(e instanceof Error ? e : new Error(String(e))) }
+      })
+    })
+  }
   const data = (await res.json().catch(() => null)) as
     | { image?: unknown; image_b64?: unknown; edited_image?: unknown; width?: unknown; height?: unknown } | null
-  const b64 = (typeof data?.image_b64 === 'string' ? data.image_b64
-    : typeof data?.image === 'string' ? data.image
-    : typeof data?.edited_image === 'string' ? data.edited_image : null)
-  if (!b64) throw new Error('Image edit completed without an image')
+  return parseEditMediaResult(data)
+}
+
+export interface Sam3MaskResult {
+  /** web:// key of the returned mask (white = selected item, black = rest). */
+  maskKey: string
+  /** raw base64 mask PNG (white-on-black, original resolution). */
+  maskB64: string
+  width?: number
+  height?: number
+  prompt: string
+}
+
+export async function sam3SelectViaRunner(
+  runner: RunnerDto,
+  imageBase64: string,
+  prompt: string,
+  opts?: { signal?: AbortSignal },
+): Promise<Sam3MaskResult> {
+  const res = await postToRunnerWithTicket(
+    runner,
+    'sam3',
+    { image: imageBase64, mode: 'text', prompt },
+    opts,
+  )
+  if (!res.ok) {
+    let detail = `SAM3 selection failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown; detail?: unknown } | null
+      if (j && typeof j.error === 'string') detail = j.error
+    } catch { /* keep status */ }
+    throw new Error(detail)
+  }
+  const data = (await res.json().catch(() => null)) as
+    | { mask_b64?: unknown; width?: unknown; height?: unknown; prompt?: unknown } | null
+  const b64 = typeof data?.mask_b64 === 'string' ? data.mask_b64 : null
+  if (!b64) throw new Error('SAM3 selection returned no mask')
   const bin = atob(b64)
   const bytes = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-  const key = registerBlob(new Blob([bytes], { type: 'image/png' }), 'edit.png', 'image/png')
+  const key = registerBlob(new Blob([bytes], { type: 'image/png' }), 'sam3-mask.png', 'image/png')
   if (data?.width != null && data?.height != null) {
     try { setDimensions(key, Number(data.width), Number(data.height)) } catch { /* non-fatal */ }
   }
   return {
-    imageUrl: key,
+    maskKey: key,
+    maskB64: b64,
     width: typeof data?.width === 'number' ? data.width : undefined,
     height: typeof data?.height === 'number' ? data.height : undefined,
+    prompt: typeof data?.prompt === 'string' ? data.prompt : prompt,
   }
 }
 
@@ -273,7 +367,14 @@ export async function editImageViaRunner(
  */
 export interface LayerPreview {
   index: number
+  /** web:// key of the composited-on-black preview thumbnail. */
   previewKey: string
+  /** base64 RGBA layer image (undefined in preview-only mode). */
+  rgbaB64?: string
+  /** base64 alpha (mask) of the layer — undefined in preview-only mode. */
+  alphaB64?: string
+  /** Semantic label from the runner (e.g. foreground / midground / background). */
+  label?: string
 }
 export interface LayerResult {
   layers: LayerPreview[]
@@ -281,18 +382,55 @@ export interface LayerResult {
   width?: number
   height?: number
 }
+export interface LayerRunProgress {
+  step: number
+  totalSteps: number
+}
+function parseLayerResult(payload: Record<string, unknown> | null): LayerResult {
+  const data = (payload ?? {}) as {
+    layers?: Array<{ index?: unknown; preview_b64?: unknown; image_b64?: unknown; rgba_b64?: unknown; alpha_b64?: unknown; label?: unknown }>
+    composite?: unknown
+    width?: unknown
+    height?: unknown
+  }
+  const decodeToWebKey = (b64: string, name: string): string => {
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    return registerBlob(new Blob([bytes], { type: 'image/png' }), name, 'image/png')
+  }
+  const rawLayers = data.layers ?? []
+  const layers: LayerPreview[] = rawLayers
+    .filter((l) => typeof l.preview_b64 === 'string' && (l.preview_b64 as string))
+    .map((l, i) => ({
+      index: typeof l.index === 'number' ? l.index : i,
+      previewKey: decodeToWebKey(l.preview_b64 as string, `layer-${Date.now()}-${i}.png`),
+      rgbaB64: typeof l.rgba_b64 === 'string' && (l.rgba_b64 as string) ? (l.rgba_b64 as string) : undefined,
+      alphaB64: typeof l.alpha_b64 === 'string' && (l.alpha_b64 as string) ? (l.alpha_b64 as string) : undefined,
+      label: typeof l.label === 'string' && (l.label as string) ? (l.label as string) : undefined,
+    }))
+  if (layers.length === 0) throw new Error('Layered preprocessing returned no readable layers')
+  return {
+    layers,
+    compositeKey: typeof data.composite === 'string' ? decodeToWebKey(data.composite, 'layer-composite.png') : undefined,
+    width: typeof data.width === 'number' ? data.width : undefined,
+    height: typeof data.height === 'number' ? data.height : undefined,
+  }
+}
 export async function layerImageViaRunner(
   runner: RunnerDto,
   imageBase64: string,
   layersCount: number,
-  opts?: { signal?: AbortSignal },
+  opts?: { previewOnly?: boolean; numSteps?: number; signal?: AbortSignal; onProgress?: (p: LayerRunProgress) => void },
 ): Promise<LayerResult> {
-  const res = await postToRunnerWithTicket(
-    runner,
-    'layer',
-    { image: imageBase64, layers: layersCount, preview_only: true },
-    opts,
-  )
+  const previewOnly = opts?.previewOnly ?? true
+  const body = {
+    image: imageBase64,
+    layers: layersCount,
+    preview_only: previewOnly,
+    num_inference_steps: opts?.numSteps,
+  }
+  const res = await postToRunnerWithTicket(runner, 'layer', body, { ...opts, sse: true })
   if (!res.ok) {
     let detail = `Layered preprocessing failed (${res.status})`
     try {
@@ -301,39 +439,93 @@ export async function layerImageViaRunner(
     } catch { /* keep status message */ }
     throw new Error(detail)
   }
-  const data = (await res.json().catch(() => null)) as
-    | {
-        layers?: Array<{ index?: unknown; preview_b64?: unknown; image_b64?: unknown }>
-        composite?: unknown
-        width?: unknown
-        height?: unknown
-      } | null
-  const decodeToWebKey = (b64: string, name: string): string => {
-    const bin = atob(b64)
-    const bytes = new Uint8Array(bin.length)
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-    return registerBlob(new Blob([bytes], { type: 'image/png' }), name, 'image/png')
+  const ct = res.headers.get('content-type') ?? ''
+  if (!ct.includes('text/event-stream') || !res.body) {
+    // Runner hasn't been switched to SSE yet — fall back to plain JSON.
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null
+    if (!payload) throw new Error('Layered preprocessing returned no readable payload')
+    return parseLayerResult(payload)
   }
-  const rawLayers = data?.layers ?? []
-  const layers: LayerPreview[] = rawLayers
-    .filter((l) => typeof l.preview_b64 === 'string' && (l.preview_b64 as string))
-    .map((l, i) => ({
-      index: typeof l.index === 'number' ? l.index : i,
-      previewKey: decodeToWebKey(l.preview_b64 as string, `layer-${Date.now()}-${i}.png`),
-    }))
-  if (layers.length === 0) throw new Error('Layered preprocessing returned no readable layers')
+  // SSE: accepted -> progress* (per denoise step) -> single complete carrying the full contract.
+  return new Promise((resolve, reject) => {
+    let settled = false
+    readSSEStream(res.body!.getReader(), opts?.signal, (event, data) => {
+      if (settled) return
+      if (event === 'progress') {
+        let p: Record<string, unknown>
+        try { p = JSON.parse(data) as Record<string, unknown> } catch { return }
+        const step = typeof p.step === 'number' ? p.step : null
+        const total = typeof p.total_steps === 'number' ? p.total_steps : null
+        if (step != null) opts?.onProgress?.({ step, totalSteps: total != null ? total : opts?.numSteps ?? 30 })
+      } else if (event === 'complete') {
+        settled = true
+        try {
+          const payload = JSON.parse(data) as Record<string, unknown>
+          resolve(parseLayerResult(payload))
+        } catch (e) {
+          reject(e instanceof Error ? e : new Error(String(e)))
+        }
+      } else if (event === 'error') {
+        settled = true
+        let msg = 'Layered preprocessing SSE error'
+        try { msg = String((JSON.parse(data) as { error?: unknown }).error ?? msg) } catch { /* keep default */ }
+        reject(new Error(msg))
+      }
+    }).catch((e) => {
+      if (!settled) { settled = true; reject(e instanceof Error ? e : new Error(String(e))) }
+    })
+  })
+}
+
+/**
+ * Ask the multimodal Gemma agent (gemma-worker /video-creator/v1/suggest-layers)
+ * how many semantic layers an image should decompose into (2-8 per the rubric).
+ * Sends the image bytes + the rubric; returns the suggested count (null when the
+ * agent doesn't produce a parseable number, so the caller keeps its default).
+ */
+export async function suggestLayersViaRunner(
+  runner: RunnerDto,
+  imageBase64: string,
+  opts?: { signal?: AbortSignal },
+): Promise<{ layers: number | null; raw: string }> {
+  const res = await postToRunnerWithTicket(runner, 'suggest-layers', { image: imageBase64 }, opts)
+  if (!res.ok) {
+    let detail = `Layer-count suggestion failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (j && typeof j.error === 'string') detail = j.error
+    } catch { /* keep status message */ }
+    throw new Error(detail)
+  }
+  const data = (await res.json().catch(() => null)) as { layers?: unknown; raw?: unknown } | null
   return {
-    layers,
-    compositeKey: typeof data?.composite === 'string' ? decodeToWebKey(data.composite, 'layer-composite.png') : undefined,
-    width: typeof data?.width === 'number' ? data.width : undefined,
-    height: typeof data?.height === 'number' ? data.height : undefined,
+    layers: typeof data?.layers === 'number' ? data.layers : null,
+    raw: typeof data?.raw === 'string' ? data.raw : '',
   }
 }
 
 export async function resolveRunner(requiredCaps: string[]): Promise<RunnerDto | null> {
-  const res = await ApiClient.getProviders()
-  if (!res.ok) throw new Error('Failed to load providers (runner discovery)')
-  const providers: RunnerDto[] = res.data.providers ?? []
+  // Web build: discover straight against the user's configured Discovery URL. The Worker has no
+  // runner/job knowledge here (its /api/providers is control-plane discovery for the desktop
+  // backend), so the browser re-hits the orchestrator directly — the same CORS-proven host as the
+  // paying ticket rail. The persisted runner preference comes from settings; the browser-local
+  // excluded set mirrors what RunnersSection shows.
+  let providers: RunnerDto[]
+  if (isWebPlatform()) {
+    const cfg = getRunnerDiscoveryConfig()
+    if (!cfg.discoveryUrl) return null
+    const list = await discoverRunners(cfg.discoveryUrl)
+    const excludedUrls = new Set(loadExcludedRunnerUrls())
+    providers = list.map((p) => ({
+      ...p,
+      selected: p.runner_id === cfg.selectedRunnerId,
+      excluded: p.excluded || excludedUrls.has(p.url),
+    }))
+  } else {
+    const res = await ApiClient.getProviders()
+    if (!res.ok) throw new Error('Failed to load providers (runner discovery)')
+    providers = res.data.providers ?? []
+  }
   const capable = providers.filter((p) => {
     if (p.status !== 'ready') return false
     if (p.excluded) return false

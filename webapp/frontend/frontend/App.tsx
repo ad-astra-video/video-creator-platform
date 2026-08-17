@@ -11,6 +11,7 @@ import { DevPanel } from './components/DevPanel'
 import { useBackend } from './hooks/use-backend'
 import { useGenerationRecoveryWatcher } from './hooks/use-generation-recovery-watcher'
 import { logger } from './lib/logger'
+import { isWebPlatform } from './lib/livepeer-discovery'
 import { Home } from './views/Home'
 import { Project } from './views/Project'
 import { LaunchGate } from './components/FirstRunSetup'
@@ -320,6 +321,9 @@ function AppContent() {
   ])
 
   const refreshLtxUpgradeRecommendation = useCallback(async () => {
+    // Web/direct-transport build has no local LTX checkpoint — the Worker doesn't serve
+    // ltx-recommendation. Skip the desktop-only upgrade probe entirely.
+    if (isWebPlatform()) { setLtxUpgradeRecommendation(null); return }
     const result = await ApiClient.getLtxRecommendation()
     if (!result.ok) {
       logger.warn(`Failed to fetch LTX upgrade recommendation: ${result.error.message}`)
@@ -345,6 +349,7 @@ function AppContent() {
       || setupState.needsLicense
       || setupState.needsSetup
       || requiredModelsGate !== 'ready'
+      || isWebPlatform()
     ) {
       setLtxUpgradeRecommendation(null)
       return

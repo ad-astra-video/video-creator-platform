@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ApiClient } from '../lib/api-client'
 import { resolveRunner } from '../lib/direct-transport'
+import { isWebPlatform } from '../lib/livepeer-discovery'
 import { useAppSettings } from '../contexts/AppSettingsContext'
 
 export type EnhanceProvider = 'local' | 'api' | 'runner'
@@ -48,7 +49,10 @@ export function usePromptEnhancerProvider(enabled: boolean): UsePromptEnhancerPr
   const [isTextEncoderDownloaded, setIsTextEncoderDownloaded] = useState(false)
   const [hasEnhanceRunner, setHasEnhanceRunner] = useState(false)
   useEffect(() => {
-    if (!enabled) return
+    // Web/direct-transport build has no local Gemma text-encoder checkpoint — the Worker
+    // doesn't serve text-encoder-recommendation and there's nothing on disk to probe for.
+    // Skip the desktop-only local-checkpoint probe so it never 404s against the platform.
+    if (!enabled || isWebPlatform()) return
     let cancelled = false
     void ApiClient.getTextEncoderRecommendation().then((result) => {
       if (!cancelled) setIsTextEncoderDownloaded(result.ok && result.data.cp_to_download === null)

@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { resetBackendCredentials } from '../lib/backend'
 import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
+import { isWebPlatform, setRunnerDiscoveryConfig } from '../lib/livepeer-discovery'
 
 export interface AppSettings {
   useTorchCompile: boolean
@@ -193,6 +194,10 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (backendProcessStatus !== 'alive') return
+    // Local GPU info is served by the desktop backend (under /api/local/gpu-info), not the
+    // Cloudflare Worker (serverless has no CUDA). The web build never has local inference, so
+    // skip the call entirely — its only consumer (CUDA-only settings toggles) can't render here.
+    if (isWebPlatform()) return
 
     let cancelled = false
 
@@ -296,6 +301,15 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
     }, 150)
     return () => clearTimeout(syncTimer)
   }, [backendProcessStatus, isLoaded, settings])
+
+  // Push the runner-discovery inputs into the shared lib so resolveRunner() can do client-side
+  // discovery against the user's Discovery URL without threading them through every call site.
+  useEffect(() => {
+    setRunnerDiscoveryConfig({
+      discoveryUrl: settings.livepeerDiscoveryUrl,
+      selectedRunnerId: settings.livepeerSelectedRunnerId,
+    })
+  }, [settings.livepeerDiscoveryUrl, settings.livepeerSelectedRunnerId])
 
   const updateSettings = useCallback((patch: Partial<AppSettings> | ((prev: AppSettings) => AppSettings)) => {
     if (typeof patch === 'function') {

@@ -180,12 +180,12 @@ export function VideoEditorTimelineEditingPanel(props: VideoEditorTimelineEditin
     regenProgress,
   } = props
   const actions = useEditorActions()
-  const { shouldVideoGenerateWithLtxApi } = useAppSettings()
+  const { shouldVideoGenerateWithLtxApi, settings } = useAppSettings()
   const {
     modelSpecs: videoGenerationModelSpecsResponse,
     isLoading: isLoadingVideoGenerationModelSpecs,
     errorMessage: videoGenerationModelSpecsErrorMessage,
-  } = useVideoGenerationModelSpecs()
+  } = useVideoGenerationModelSpecs(settings.livepeerDiscoveryUrl)
 
   const assets = useEditorStore(selectAssets)
   const timelines = useEditorStore(selectTimelines)
