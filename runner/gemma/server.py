@@ -107,8 +107,11 @@ async def handle_health(_request: web.Request) -> web.Response:
 
 
 # The rubric used to ask Gemma how many semantic layers an image decomposes into.
+# The model is asked to THINK through the scene before committing to a count, then
+# output only the number on the final line so the server's regex can extract it.
 LAYER_SUGGEST_RUBRIC = (
-    "Analyze the image and select the appropriate Qwen-Image-Layered layer count.\n\n"
+    "You are a meticulous image-decomposition analyst. Analyze the image and "
+    "select the appropriate Qwen-Image-Layered layer count.\n\n"
     "Use this rubric:\n"
     "- 2 = simple image with one main subject and simple background\n"
     "- 3 = main subject + background + one distinct secondary element\n"
@@ -117,8 +120,15 @@ LAYER_SUGGEST_RUBRIC = (
     "- 6 = complex scene with many independently editable objects\n"
     "- 7 = very complex scene with many distinct overlapping elements\n"
     "- 8 = extremely complex scene where separating many objects is useful\n\n"
-    "Choose the smallest number that adequately represents the image.\n"
-    "Output ONLY the number 2-8"
+    "Think step by step before answering:\n"
+    "1. Identify every semantically distinct element or region in the image.\n"
+    "2. Consider background, foreground subjects, and any independent objects.\n"
+    "3. Estimate whether each element is cleanly separable for editing.\n"
+    "4. Choose the SMALLEST number that adequately represents the image.\n"
+    "5. Show your reasoning in <think>...</think> tags, then answer with ONLY "
+    "the final integer 2-8 on the very last line, inside a single pair of "
+    "angle brackets, e.g. <5>.\n"
+    "Put no other text after the bracketed number."
 )
 
 # ── Inference ────────────────────────────────────────────────────────────────
@@ -264,15 +274,15 @@ async def handle_suggest_layers(request: web.Request) -> web.Response:
         return web.json_response({"error": "Gemma LLM not loaded"}, status=503)
     async with _parallel:
         try:
-            content = await asyncio.to_thread(llm.chat, messages, max_tokens=16,
-                                              temperature=0.0)
+            content = await asyncio.to_thread(llm.chat, messages, max_tokens=512,
+                                              temperature=0.6)
         except Exception as exc:
             logger.error("suggest-layers failed: %s", exc, exc_info=True)
             return web.json_response({"error": str(exc)}, status=500)
-    # Parse a lone integer 2-8 out of the response (robust to extra text).
-    m = None
+    # Parse the bracketed <N> (2-8) out of the response; fall back to the first
+    # lone integer 2-8 if the model didn't bracket it.
     import re
-    m = re.search(r"\b([2-8])\b", content)
+    m = re.search(r"<([2-8])>", content) or re.search(r"\b([2-8])\b", content)
     layers = int(m.group(1)) if m else None
     return web.json_response({"layers": layers, "raw": content})
 

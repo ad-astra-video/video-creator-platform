@@ -176,12 +176,15 @@ def test_suggest_layers_parse_bounds():
     """Numeric extraction for suggest-layers must reject out-of-range and keep 2-8."""
     import re
     def parse(content):
-        m = re.search(r"\b([2-8])\b", content)
+        m = re.search(r"<([2-8])>", content) or re.search(r"\b([2-8])\b", content)
         return int(m.group(1)) if m else None
     assert parse("5") == 5
     assert parse(" 3 \n") == 3
     assert parse("7. The image has several objects.") == 7
     assert parse("It is 8") == 8
+    # Thinking-style output: reasoning then a bracketed final answer.
+    assert parse("I see a cat and a tree in the background... <4>") == 4
+    assert parse("<2>") == 2
     assert parse("10") is None  # out of rubric range
     assert parse("none") is None
 
