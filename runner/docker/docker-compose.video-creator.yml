@@ -210,11 +210,22 @@ services:
       # GPU is visible inside this container, it remaps to device index 0, so
       # GEMMA_GPU_DEVICE must be "0" (not the physical index) here.
       - CUDA_VISIBLE_DEVICES=${GEMMA_RESIDENT_GPU:-0}
+      # PyAV Vulkan hw decode: mount host Vulkan ICD + video codec libs. Must be
+      # 'all' (not a compute+graphics+video subset): the NVIDIA Vulkan ICD
+      # (libGLX_nvidia, a GLX lib) needs the DISPLAY-capability libs to initialize
+      # its backend, else vk_icdGetInstanceProcAddr returns NULL for vkCreateInstance
+      # -> loader "Found no drivers!" -> VK_ERROR_INCOMPATIBLE_DRIVER. A container
+      # Vulkan reference that works uses NVIDIA_DRIVER_CAPABILITIES=all. (CUDA works
+      # regardless; this only gates the Vulkan ICD path.)
+      - NVIDIA_DRIVER_CAPABILITIES=all
       - GEMMA_GPU_DEVICE=0
       - GEMMA_MODEL=${GEMMA_MODEL:-/models/gemma/gemma-4-12b-it-qat-q4_0.gguf}
       - GEMMA_MMPROJ=${GEMMA_MMPROJ:-}
       # -1 = all layers offloaded (dedicated GPU). 0 = CPU-only. Set per box.
       - GEMMA_N_GPU_LAYERS=${GEMMA_N_GPU_LAYERS:--1}
+      # Context = 64K (max that fits a 32 GB card w/ flash-attn; 128K needs CPU-KV
+      # offload). Flash-attn is mandatory for large context on this Gemma arch.
+      - GEMMA_N_CTX=${GEMMA_N_CTX:-131072}
       # Max parallel prompt executions (Gemma 4 Q4; GPU eval serialized).
       - GEMMA_MAX_PARALLEL=${GEMMA_MAX_PARALLEL:-3}
       - PORT=8993
