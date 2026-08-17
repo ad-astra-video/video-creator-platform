@@ -43,12 +43,16 @@ class FakeEngine:
         self.force_413 = False
 
     def edit_image(self, image, prompt, engine="qwen-edit", mask=None,
-                   keep_subject=False, strength=0.6, padding_mask_crop=0, **kw):
+                   keep_subject=False, strength=0.6, padding_mask_crop=0,
+                   progress_cb=None, **kw):
         self.edit_engine = engine
         self.edit_steps = kw.get("num_inference_steps")
         self.edit_strength = strength
         self.edit_padding = padding_mask_crop
         self.edit_mask = mask
+        self.edit_progress_cb = progress_cb
+        if progress_cb:
+            progress_cb(1, self.edit_steps or 35)  # emit one progress tick
         from PIL import Image
         return Image.new("RGB", (8, 8), "red")
 
@@ -287,6 +291,22 @@ async def test_edit_masked_forwards_strength_padding(client):
     assert engine.edit_strength == 0.4
     assert engine.edit_padding == 24
     assert engine.edit_steps == 25
+
+async def test_edit_sse_streams_progress(client):
+    cli, engine = client
+    r = await cli.post('/video-creator/v1/edit?sse=1',
+                       json={'image': _tiny_png_b64(), 'prompt': 'make it red',
+                             'engine': 'qwen-edit', 'quality': 'high'})
+    assert r.status == 200
+    assert 'text/event-stream' in r.headers.get('Content-Type', '')
+    text = await r.text()
+    assert 'event: accepted' in text
+    assert 'event: progress' in text
+    assert '"step": 1' in text
+    assert '"total_steps": 50' in text
+    assert 'event: complete' in text
+    assert '"engine": "qwen-edit"' in text
+    assert engine.edit_progress_cb is not None
 
 async def test_image_returns_png(client):
     cli, _ = client

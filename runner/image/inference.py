@@ -73,6 +73,21 @@ def _fit(img: Image.Image, side: int) -> Image.Image:
     return img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
 
 
+def _edit_step_cb(progress_cb, total: int):
+    """Build a diffusers ``callback_on_step_end`` callable for the Qwen edit pipes.
+
+    diffusers calls it with (pipe, step, timestep, callback_kwargs); we forward a
+    human 1-based step + total to ``progress_cb`` and pass kwargs through so
+    sampling runs normally."""
+    def _cb(pipe, step, timestep, cb_kwargs):
+        try:
+            progress_cb(min(step + 1, total), total)
+        except Exception:
+            logger.debug("edit progress_cb raised", exc_info=True)
+        return cb_kwargs
+    return _cb
+
+
 def _to_pil(out: Any) -> Image.Image:
     """Convert a diffusers pipeline return value to a single PIL.Image.
 
@@ -502,7 +517,7 @@ class ImageInferenceEngine:
     # ------------------------------------------------------------------
     def edit_image(self, image, prompt, engine="qwen-edit", mask=None,
                    keep_subject=False, strength=0.6, padding_mask_crop=0,
-                   mask_composite=True, **kw) -> Image.Image:
+                   mask_composite=True, progress_cb=None, **kw) -> Image.Image:
         """Instruction / img2img image edit -> a single PIL.Image.
 
         engine='qwen-edit' -> Qwen-Image-Edit. When ``mask`` is supplied the
@@ -562,6 +577,9 @@ class ImageInferenceEngine:
                     in_kw[k] = kw[k]
             if int(padding_mask_crop or 0) > 0:
                 in_kw["padding_mask_crop"] = int(padding_mask_crop)
+            if progress_cb is not None:
+                in_kw["callback_on_step_end"] = _edit_step_cb(
+                    progress_cb, int(in_kw.get("num_inference_steps", _cfg.QWEN_STEPS)))
             out = inpaint(image=src, mask_image=mask_img, **in_kw,
                           generator=kw.get("generator"))
             edited = _to_pil(out)
@@ -571,6 +589,9 @@ class ImageInferenceEngine:
                 edited = _composite_masked(edited, src, mask_img)
             return edited
         call_kw = dict(prompt=prompt)
+        if progress_cb is not None:
+            call_kw["callback_on_step_end"] = _edit_step_cb(
+                progress_cb, int(kw.get("num_inference_steps", _cfg.QWEN_STEPS)))
         out = pipe(image=src, **call_kw, **kw)
         return _to_pil(out)
 

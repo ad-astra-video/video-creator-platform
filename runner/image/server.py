@@ -175,6 +175,85 @@ async def handle_info(_req: web.Request) -> web.Response:
 
 # ── Generation routes ──────────────────────────────────────
 
+async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
+    """Serve /video-creator/v1/edit as text/event-stream when ``?sse=1``.
+
+    Events: accepted -> progress* (per denoise step) -> complete ({image b64}),
+    or error. Mirrors ``_run_layer_sse`` so the frontend can show a thin progress
+    bar while a Qwen-Image-Edit (whole-frame or masked inpaint) runs."""
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await resp.prepare(req)
+    assert engine
+    prompt = str(body.get("prompt", ""))
+    engine_name = str(body.get("engine", "qwen-edit")).lower()
+
+    async def _ev(event: str, data: dict) -> None:
+        try:
+            await resp.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+        except Exception:
+            pass
+
+    kw = {}
+    for k in ("width", "height", "num_inference_steps", "guidance_scale", "seed"):
+        if body.get(k) is not None:
+            kw[k] = body.get(k)
+    if "num_inference_steps" not in kw:
+        q = str(body.get("quality") or "").strip().lower()
+        if q in ("fast", "balanced", "high"):
+            presets = (QWEN_EDIT_STEP_PRESETS if engine_name == "qwen-edit"
+                       else ZIMAGE_STEP_PRESETS)
+            kw["num_inference_steps"] = presets[q]
+    steps = kw.get("num_inference_steps") or QWEN_EDIT_STEP_PRESETS["balanced"]
+
+    await _ev("accepted", {
+        "engine": engine_name,
+        "num_inference_steps": steps,
+        "strength": body.get("strength", 0.6),
+        "masked": bool(body.get("mask_image")),
+    })
+    loop = asyncio.get_running_loop()
+    total = int(steps)
+
+    def _progress(step: int, t: int):
+        loop.call_soon_threadsafe(
+            asyncio.create_task, _ev("progress", {"step": step, "total_steps": t})
+        )
+
+    async with _generation_lock:
+        try:
+            img = await loop.run_in_executor(
+                None, functools.partial(
+                    engine.edit_image,
+                    body["image"], prompt,
+                    engine=engine_name,
+                    mask=body.get("mask_image"),
+                    keep_subject=bool(body.get("keep_subject", False)),
+                    strength=float(body.get("strength", 0.6)),
+                    padding_mask_crop=int(body.get("padding_mask_crop", 0) or 0),
+                    progress_cb=_progress,
+                    **kw,
+                )
+            )
+        except Exception as exc:
+            logger.exception("edit SSE failed")
+            await _ev("error", {"error": str(exc)})
+            await resp.write_eof()
+            return resp
+
+    from runner.image.inference import _pil_to_b64  # cheap
+    await _ev("complete", {
+        "image": _pil_to_b64(img),
+        "content_type": "image/png",
+        "engine": engine_name,
+    })
+    await resp.write_eof()
+    return resp
+
+
 async def handle_edit(req: web.Request) -> web.Response:
     """POST /video-creator/v1/edit.
 
@@ -184,10 +263,12 @@ async def handle_edit(req: web.Request) -> web.Response:
     Response: {image: <base64 png>, content_type: "image/png", engine}
     """
     body = await req.json()
+    if not body.get("image"):
+        return web.json_response({"error": "missing 'image' (base64)"}, status=400)
+    if req.query.get("sse") in ("1", "true", "yes"):
+        return await _run_edit_sse(req, body)
     assert engine
     image = body.get("image")
-    if not image:
-        return web.json_response({"error": "missing 'image' (base64)"}, status=400)
     prompt = str(body.get("prompt", ""))
     engine_name = str(body.get("engine", "qwen-edit")).lower()
     if engine_name not in ("qwen-edit", "zimage"):
