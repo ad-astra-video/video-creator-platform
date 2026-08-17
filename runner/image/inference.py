@@ -488,13 +488,21 @@ class ImageInferenceEngine:
         # default: Qwen-Image-Edit
         self._evict_other("edit")
         pipe = self._qwen_edit_pipe()
-        # Forward mask_images as a list when a mask is supplied; keep_subject is a
-        # native Qwen-Image-Edit knob.
+        # diffusers 0.39.0 QwenImageEditPipeline takes a seeded `generator`, not a bare
+        # `seed` (passing `seed` TypeErrors at __call__) — reuse the same seed->generator
+        # translation the Z-Image paths use. `kw` is a fresh dict, safe to mutate.
+        self._zimage_call_kw(kw)
+        # 0.39.0 has NO mask_images / keep_subject support at all (both TypeError at the
+        # __call__ boundary), so region-masked / keep-subject qwen edits can't run on the
+        # pinned pin. Surface a clear error instead of a cryptic TypeError; whole-frame
+        # edits (prompt + steps/guidance + seed) are unaffected.
+        if keep_subject or mask_img is not None:
+            raise ValueError(
+                "region-masked / keep-subject edits are not supported by Qwen-Image-Edit on "
+                "the pinned diffusers 0.39.0 (no mask_images/keep_subject). Use a whole-frame "
+                "Qwen edit, or FLUX.2 klein / Z-Image for region work."
+            )
         call_kw = dict(prompt=prompt)
-        if keep_subject:
-            call_kw["keep_subject"] = True
-        if mask_img is not None:
-            call_kw["mask_images"] = [mask_img]
         out = pipe(image=src, **call_kw, **kw)
         return _to_pil(out)
 
