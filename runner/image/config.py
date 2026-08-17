@@ -38,7 +38,7 @@ QWEN_LAYERED_DTYPE = os.environ.get("QWEN_LAYERED_DTYPE", "fp8").strip().lower()
 # Default / requested number of decomposition layers (clamped to
 # [2, QWEN_MAX_LAYERS] in the server /layer handler).
 QWEN_LAYERS = int(os.environ.get("QWEN_LAYERS", "4"))
-QWEN_MAX_LAYERS = int(os.environ.get("QWEN_MAX_LAYERS", "8"))
+QWEN_MAX_LAYERS = int(os.environ.get("QWEN_MAX_LAYERS", "16"))
 
 # Longest input-image side the /layer endpoint will try to decompose (px).
 QWEN_LAYER_MAX_INPUT_SIDE = int(os.environ.get("QWEN_LAYER_MAX_INPUT_SIDE", "2048"))
