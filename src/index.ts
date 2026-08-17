@@ -4,7 +4,6 @@ import {
   consumeRecoveryCode,
   getAccountByEmail,
   upsertAccount,
-  verifyAccountEmail,
   alreadyApplied,
   markApplied,
   storeRecoveryCode,
@@ -17,8 +16,6 @@ import {
   revokeApiKey,
   listApiKeys,
   setPendingEmail,
-  getPendingEmail,
-  clearPendingEmail,
   setBackupCode,
   useBackupCode,
   recordOptimisticDebit,
@@ -44,39 +41,8 @@ import {
   cryptoRandomHex,
 } from "./utils";
 import { getHealth } from "./routes/health";
-import { handleWebSocket } from "./ws";
-import {
-  postGenerate,
-  postGenerateImage,
-  postEnhancePrompt,
-  postExtend,
-  postRetake,
-  postRestyle,
-  postRestyleExtractFirstFrame,
-  postRestyleSegmentSubject,
-  postRestyleStyleFrame,
-  postIcLoraGenerate,
-  postIcLoraExtractConditioning,
-  postCancel,
-  getGenerationProgress,
-  getDownloadProgress,
-} from "./routes/generation";
-import {
-  getModels,
-  getModelSpecs,
-  getLtxVersions,
-  getLtxRecommendation,
-  getIcLoraRecommendation,
-  getImgGenRecommendation,
-  getTextEncoderRecommendation,
-  getLoras,
-  getIcLoras,
-  getLocalCatalog,
-} from "./routes/catalog";
-import { getProviders, postDiscoverProviders, postSelectProvider, postExcludeProvider } from "./routes/providers";
 import { getSettingsRoute, postSettingsRoute, getSettingsFalKey } from "./routes/settings";
 import { getPlatformStatus } from "./routes/platform";
-import { postHfLogin, getHfCallback, getHfStatus, postHfLogout } from "./routes/hf-auth";
 
 async function handle(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -87,9 +53,6 @@ async function handle(request: Request, env: Env): Promise<Response> {
 
     // Liveness (keep-remote).
     if (method === "GET" && path === "/health") return await getHealth();
-
-    // WebSocket relay (authenticates itself via ?token= or Authorization).
-    if (path === "/ws") return await handleWebSocket(request, env);
 
     // Stripe webhook (signature-verified, no API key)
     if (method === "POST" && path === "/webhook/stripe") {
@@ -136,9 +99,6 @@ async function handle(request: Request, env: Env): Promise<Response> {
     // Platform-credits contract — public recovery (no current key required).
     if (method === "POST" && path === "/api/platform/recover/request") return await postPlatformRecoverRequest(request, env);
     if (method === "POST" && path === "/api/platform/recover/confirm") return await postPlatformRecoverConfirm(request, env);
-    // HF OAuth callback is a redirect target (no per-user key header present).
-    if (method === "GET" && path === "/api/auth/huggingface/callback") return await getHfCallback(request, env);
-
     // ---- User-key authenticated routes (user resolved FROM the key) ----
     const user = await authUser(request, env);
     if (!user) return err("Unauthorized", 401);
@@ -146,55 +106,15 @@ async function handle(request: Request, env: Env): Promise<Response> {
     try {
       const uid = user.externalUserId;
 
-      // Runtime policy + GPU info (web app: no local GPU; generation is Worker-dispatched).
+      // Local-inference namespace is served by the desktop/local backend, NOT this Worker.
+      // Signal it explicitly so a browser/dev hitting /api/local/* knows the Worker does NOT
+      // provide local GPU / model management (serverless has no local weights or CUDA).
+      if (path.startsWith("/api/local/"))
+        return err("Local inference is not provided by the Cloudflare Worker (serverless). Use the local/desktop backend under /api/local/*.", 501);
+
+      // Runtime policy (web app: no local GPU; generation is Worker-dispatched).
       if (method === "GET" && path === "/api/runtime-policy")
         return ok({ force_api_generations: false, wait_for_model_download: false, allow_cuda_backend: true });
-      if (method === "GET" && path === "/api/gpu-info")
-        return ok({ pretty_name: "none", vram_bytes: 0, torch_backend: "none", cuda_available: false });
-
-      // Worker-reimplemented API surface (api-contract.md).
-      // Catalog:
-      if (method === "GET" && path === "/api/models") return await getModels();
-      if (method === "GET" && path === "/api/generate/models-specs") return await getModelSpecs(request, env);
-      if (method === "GET" && path === "/api/models/ltx-versions") return await getLtxVersions();
-      if (method === "GET" && path === "/api/models/ltx-recommendation") return await getLtxRecommendation();
-      if (method === "GET" && path === "/api/models/ltx-ic-lora-recommendation") return await getIcLoraRecommendation();
-      if (method === "GET" && path === "/api/models/img-gen-recommendation") return await getImgGenRecommendation();
-      if (method === "GET" && path === "/api/models/text-encoder-recommendation") return await getTextEncoderRecommendation();
-      if (method === "GET" && path === "/api/loras") return await getLoras();
-      if (method === "GET" && path === "/api/ic-loras") return await getIcLoras();
-      if (method === "GET" && path === "/api/catalog") return await getLocalCatalog();
-
-      // Dispatch (worker-dispatch):
-      if (method === "POST" && path === "/api/generate") return await postGenerate(request, env);
-      if (method === "POST" && path === "/api/generate/cancel") return await postCancel(request, env);
-      if (method === "POST" && path === "/api/generate-image") return await postGenerateImage(request, env);
-      if (method === "POST" && path === "/api/enhance-prompt") return await postEnhancePrompt(request, env);
-      if (method === "POST" && path === "/api/extend") return await postExtend(request, env);
-      if (method === "POST" && path === "/api/retake") return await postRetake(request, env);
-      if (method === "POST" && path === "/api/restyle") return await postRestyle(request, env);
-      if (method === "POST" && path === "/api/restyle/extract-first-frame") return await postRestyleExtractFirstFrame(request, env);
-      if (method === "POST" && path === "/api/restyle/segment-subject") return await postRestyleSegmentSubject(request, env);
-      if (method === "POST" && path === "/api/restyle/style-frame") return await postRestyleStyleFrame(request, env);
-      if (method === "POST" && path === "/api/ic-lora/generate") return await postIcLoraGenerate(request, env);
-      if (method === "POST" && path === "/api/ic-lora/extract-conditioning") return await postIcLoraExtractConditioning(request, env);
-
-      // REST progress fallbacks (WS supersedes):
-      if (method === "GET" && path === "/api/generation/progress") return await getGenerationProgress(request, env);
-      if (
-        method === "GET" &&
-        (path === "/api/loras/download/progress" ||
-          path === "/api/ic-loras/download/progress" ||
-          path === "/api/models/download/progress")
-      ) {
-        return await getDownloadProgress(request, env);
-      }
-
-      // Providers (orchestrator discovery):
-      if (method === "GET" && path === "/api/providers") return await getProviders(request, env);
-      if (method === "POST" && path === "/api/providers/discover") return await postDiscoverProviders(request, env);
-      if (method === "POST" && path === "/api/providers/select") return await postSelectProvider(request, env);
-      if (method === "POST" && path === "/api/providers/exclude") return await postExcludeProvider(request, env);
 
       // Settings:
       if (method === "GET" && path === "/api/settings") return await getSettingsRoute(request, env);
@@ -208,19 +128,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
       if (method === "POST" && path === "/api/platform/checkout") return await postPlatformCheckout(request, env, uid);
       if (method === "POST" && path === "/api/platform/link-email") return await postPlatformLinkEmail(request, env, uid);
 
-      // Hugging Face auth (authed endpoints; callback handled above):
-      if (method === "POST" && path === "/api/auth/huggingface/login") return await postHfLogin(request, env);
-      if (method === "GET" && path === "/api/auth/huggingface/status") return await getHfStatus(request, env);
-      if (method === "POST" && path === "/api/auth/huggingface/logout") return await postHfLogout(request, env);
-
-      // Existing money/auth routes (unchanged):
-      if (method === "POST" && path === "/checkout") return await postCheckout(request, env, uid);
-      if (method === "GET" && path === "/balance") return await getBalance(env, uid);
-      if (method === "GET" && path === "/usage") return await getUsage(env, uid);
+      // Payment rail + identity:
       if (method === "POST" && path === "/sign-ticket") return await handleSignTicket(request, env, uid);
       if (method === "GET" && path === "/signer/address") return await getPayerAddress(env, uid);
       if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env, uid);
-      if (method === "POST" && path === "/link-email/verify") return await verifyLinkEmail(request, env, uid);
 
       return err("Not found", 404);
     } catch (e) {
@@ -301,28 +212,6 @@ async function postProvision(request: Request, env: Env): Promise<Response> {
 // User handlers
 // ---------------------------------------------------------------------------
 
-type CheckoutBody = { tier?: number; micros?: string; successUrl?: string; cancelUrl?: string };
-async function postCheckout(request: Request, env: Env, externalUserId: string): Promise<Response> {
-  const body = await readJson<CheckoutBody>(request);
-  const tier = body.micros ? findTier(env, Math.round(Number(body.micros) / 10000)) : findTier(env, body.tier ?? NaN);
-  if (!tier) return err("Unknown top-up tier", 400);
-
-  await upsertAccount(env.DB, externalUserId);
-  const { url } = await createCheckoutSession(env, externalUserId, tier, {
-    successUrl: body.successUrl || `${new URL(request.url).origin}/success`,
-    cancelUrl: body.cancelUrl || `${new URL(request.url).origin}/cancel`,
-  });
-  return ok({ url });
-}
-
-async function getBalance(env: Env, externalUserId: string): Promise<Response> {
-  return ok(await resolveUserBalance(env, externalUserId));
-}
-
-async function getUsage(env: Env, externalUserId: string): Promise<Response> {
-  return ok({ externalUserId, balance: await resolveUserBalance(env, externalUserId) });
-}
-
 type LinkEmailBody = { email: string };
 async function postLinkEmail(request: Request, env: Env, externalUserId: string): Promise<Response> {
   const body = await readJson<LinkEmailBody>(request);
@@ -334,19 +223,6 @@ async function postLinkEmail(request: Request, env: Env, externalUserId: string)
   await storeRecoveryCode(env.DB, email, await hashSecret(code), "link");
   await sendCodeEmail(env, email, "link", code);
   return ok({ ok: true });
-}
-
-type VerifyLinkBody = { code: string };
-async function verifyLinkEmail(request: Request, env: Env, externalUserId: string): Promise<Response> {
-  const body = await readJson<VerifyLinkBody>(request);
-  const pending = await getPendingEmail(env.DB, externalUserId);
-  if (!body?.code || !pending) return err("Invalid or expired code", 400);
-
-  const { ok: valid } = await consumeRecoveryCode(env.DB, pending, body.code, "link");
-  if (!valid) return err("Invalid or expired code", 400);
-  await verifyAccountEmail(env.DB, externalUserId, pending);
-  await clearPendingEmail(env.DB, externalUserId);
-  return ok({ ok: true, email: pending });
 }
 
 type RecoverRequestBody = { email: string };
