@@ -24,6 +24,7 @@ class InMemoryTransport(WorkerTransport):
         self.order = []       # ["load:ltx", "evict:ltx", ...]
         self.payloads = []    # request bodies sent with post()
         self.resident = None
+        self.model_loaded = None   # when set, /health reports this value
 
     def _name(self, base):
         # The injected worker->base mapping points names at a base that encodes
@@ -42,6 +43,8 @@ class InMemoryTransport(WorkerTransport):
         return {}
 
     async def health(self, base):
+        if self.model_loaded is not None:
+            return {"status": "ok", "model_loaded": self.model_loaded}
         return {"status": "ok"}
 
 
@@ -530,4 +533,71 @@ def test_coopt_release_does_not_free_resident_gemma():
         st = s.status()
         assert st["gpus"][2]["resident"] is True
         assert st["gpus"][2]["state"] == "busy"
+    asyncio.run(_t())
+
+
+def test_reconcile_drops_stale_residency_and_reloads_pinned():
+    """After a pinned worker's CONTAINER restarts (/health no longer reports
+    model_loaded), check_health() must drop its residency so the next ensure()
+    re-issues /load instead of routing to an unloaded worker (the 503
+    'Gemma LLM not loaded' bug)."""
+    async def _t():
+        t = InMemoryTransport()
+        w = ResidentWorkerManager(transport=t, workers={"gemma": "gemma"},
+                                  pinned=frozenset({"gemma"}))
+        # Real runtime loads pinned gemma via ensure(device=...) (on_startup),
+        # which records BOTH _resident and _pinned_loaded.
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma"]
+        assert w._resident == {"gemma": 0}
+        assert "gemma" in w._pinned_loaded
+        # idle-backfill ensure is a no-op while residency is believed fresh
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma"]
+        # container restarts -> fresh process has no model
+        t.model_loaded = False
+        await w.check_health()
+        assert w._resident == {}
+        assert "gemma" not in w._pinned_loaded
+        # next ensure re-loads
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma", "load:gemma"]
+    asyncio.run(_t())
+
+
+def test_reconcile_drops_stale_residency_and_reloads_device():
+    """Same fix for a non-pinned worker on the per-device residency path
+    (_resident): a restarted worker's residency is dropped so ensure() reloads."""
+    async def _t():
+        t = InMemoryTransport()
+        w = ResidentWorkerManager(transport=t, workers={"gemma": "gemma"})
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma"]
+        assert w._resident == {"gemma": 0}
+        # idle-backfill ensure is a no-op (resident on that device)
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma"]
+        t.model_loaded = False
+        await w.check_health()
+        assert w._resident == {}
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma", "load:gemma"]
+    asyncio.run(_t())
+
+
+def test_reconcile_keeps_residency_when_healthy():
+    """A worker that /health reports as still loaded keeps its residency (no
+    spurious reload churn)."""
+    async def _t():
+        t = InMemoryTransport()
+        t.model_loaded = True
+        w = ResidentWorkerManager(transport=t, workers={"gemma": "gemma"},
+                                  pinned=frozenset({"gemma"}))
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma"]
+        await w.check_health()
+        assert "gemma" in w._pinned_loaded
+        assert w._resident == {"gemma": 0}   # still resident -> no reload
+        await w.ensure("gemma", device=0)
+        assert t.order == ["load:gemma"]
     asyncio.run(_t())

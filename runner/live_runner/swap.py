@@ -125,20 +125,23 @@ class ResidentWorkerManager:
             if device is not None:
                 if self._resident.get(name) == device:
                     return  # already resident on that GPU
-                if name in self.pinned:
-                    self._resident[name] = device
-                    self._pinned_loaded.add(name)
-                    await self.transport.post(self._base(name), "/load",
-                                              {"device": device})
-                    return
-                # Load (or relocate) this worker on the given device. Per-worker
-                # residency: no cross-worker eviction (different GPUs).
-                self._resident[name] = device
+                # Load FIRST, then record residency ONLY after /load succeeds. The
+                # prior code set _resident[name]=device BEFORE the POST, so a failed
+                # first load (e.g. the worker not yet resolvable at startup) left the
+                # entry set and every later ensure() short-circuited above — the
+                # worker's model was NEVER (re)loaded ("warm but unloaded"; gemma
+                # routes 503'd). Assigning after success lets the idle backfill keep
+                # retrying until the load actually lands.
                 await self.transport.post(self._base(name), "/load",
                                           {"device": device})
-                if self._current == name:
-                    self._current = None
-                logger.info("GPU pin: %s resident on GPU %d", name, device)
+                self._resident[name] = device
+                if name in self.pinned:
+                    self._pinned_loaded.add(name)
+                    logger.info("GPU pin: %s resident (dedicated)", name)
+                else:
+                    if self._current == name:
+                        self._current = None
+                    logger.info("GPU pin: %s resident on GPU %d", name, device)
                 return
             # Legacy shared-GPU path (no device): evict-before-load.
             if name in self.pinned:
@@ -185,6 +188,35 @@ class ResidentWorkerManager:
                 logger.info("GPU swap: evicted %s", self._current)
                 self._current = None
 
+    async def _reconcile_loaded(self, health: dict[str, dict]) -> None:
+        """Drop residency for any worker we believe is loaded but whose /health
+        reports ``model_loaded`` is False (e.g. its container was restarted and
+        the fresh process has no model). The next ``ensure()``/idle backfill will
+        re-issue /load. Safe because every worker's load() is idempotent.
+
+        Only workers whose /health exposes a ``model_loaded`` key are affected
+        (today: gemma-worker) — others are ignored. Missing/error health is
+        treated as "unknown" and never drops residency (avoid churn).
+        """
+        async with self._lock:
+            for name, h in health.items():
+                if h.get("model_loaded") is not False:
+                    continue  # loaded, or worker doesn't report it -> leave alone
+                dropped = False
+                if name in self._pinned_loaded:
+                    self._pinned_loaded.discard(name)
+                    dropped = True
+                if name in self._resident:
+                    del self._resident[name]
+                    dropped = True
+                if self._current == name:
+                    self._current = None
+                    dropped = True
+                if dropped:
+                    logger.warning(
+                        "worker %s reports model NOT loaded; dropped residency "
+                        "(auto-reload on next ensure/backfill)", name)
+
     async def check_health(self) -> dict:
         """Live /health probe of every worker for heartbeat metadata.
 
@@ -196,12 +228,17 @@ class ResidentWorkerManager:
         (the actual contract) are added in server.py, not here.
         """
         up = {name: False for name in self.workers}
+        health: dict[str, dict] = {}
         for name in up:
             try:
-                await self.transport.health(self._base(name))
+                health[name] = await self.transport.health(self._base(name))
                 up[name] = True
             except Exception:
                 pass
+        # A worker we believe is loaded that /health now reports as NOT loaded
+        # (container restarted) has its residency dropped here so the next
+        # ensure()/backfill re-loads it instead of routing to an unloaded worker.
+        await self._reconcile_loaded(health)
         gemma = "gemma-worker"
         gemma_loaded = (gemma in self._pinned_loaded) or (self._current == gemma)
         return {
