@@ -68,7 +68,7 @@ def _get_llm() -> GemmaLLM:
                     n_gpu_layers=config.GEMMA_N_GPU_LAYERS,
                     main_gpu=config.gemma_device_index(),
                     n_ctx=config.N_CTX,
-                )
+                )  # flash_attn is always on (GemmaLLM default True; required)
     return _llm
 
 

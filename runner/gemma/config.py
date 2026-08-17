@@ -49,7 +49,7 @@ GEMMA_MAX_PARALLEL = int(os.environ.get("GEMMA_MAX_PARALLEL", "3"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8993"))  # distinct from ltx 8991 / idv2v 8992
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "3000000000"))
-N_CTX = int(os.environ.get("GEMMA_N_CTX", "8192"))
+N_CTX = int(os.environ.get("GEMMA_N_CTX", "131072"))
 
 
 def gemma_device_index() -> int:
