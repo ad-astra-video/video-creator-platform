@@ -48,7 +48,12 @@ class FakeEngine:
         from PIL import Image
         return Image.new("RGB", (8, 8), "red")
 
-    def layered_decompose(self, image, layers, resolution, preview_only):
+    def layered_decompose(self, image, layers, resolution, preview_only,
+                          num_inference_steps=None, progress_cb=None):
+        self.last_layers = layers
+        self.last_steps = num_inference_steps
+        if progress_cb:
+            progress_cb(1, 4)  # emit one progress tick like a real first step
         from PIL import Image
         img = Image.new("RGBA", (8, 8), (0, 0, 0, 255))
         b64 = _pil_to_b64(img)
@@ -201,6 +206,33 @@ async def test_layer_contract(client):
     assert body["layers_requested"] == 2
     # preview_only strips full rgba/alpha (FakeEngine shortcuts; keep simple)
     assert isinstance(body["layers"][0].get("rgba_b64"), str)
+
+
+async def test_layer_passes_steps(client):
+    cli, engine = client
+    r = await cli.post("/video-creator/v1/layer",
+                       json={"image": _tiny_png_b64(), "layers": 2,
+                             "num_inference_steps": 50})
+    assert r.status == 200
+    assert engine.last_steps == 50
+
+
+async def test_layer_sse_streams_progress(client):
+    cli, engine = client
+    r = await cli.post("/video-creator/v1/layer?sse=1",
+                       json={"image": _tiny_png_b64(), "layers": 3,
+                             "num_inference_steps": 25})
+    assert r.status == 200
+    assert "text/event-stream" in r.headers.get("Content-Type", "")
+    # First event is `accepted`, then a `progress` (FakeEngine emits one tick),
+    # then `complete` with the full contract.
+    text = await r.text()
+    assert "event: accepted" in text
+    assert '"engine": "layer"' in text
+    assert "event: progress" in text
+    assert '"step": 1' in text
+    assert "event: complete" in text
+    assert '"layers_requested"' in text
 
 
 async def test_layer_413_on_oversize(client, monkeypatch):

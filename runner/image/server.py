@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import os
 import random
@@ -219,41 +220,117 @@ async def handle_edit(req: web.Request) -> web.Response:
     })
 
 
+def _parse_layer_body(body: dict):
+    """Validate + coerce the /layer request body -> (layers, resolution, steps, preview_only).
+
+    Raises ValueError on an invalid ``layers`` / ``num_inference_steps`` value so the
+    caller can respond 400; returns defaults when fields are absent."""
+    image = body.get("image")
+    layers = body.get("layers")
+    if layers is not None:
+        try:
+            layers = int(layers)
+        except (TypeError, ValueError):
+            raise ValueError("'layers' must be an integer")
+        if layers < 2 or layers > QWEN_MAX_LAYERS:
+            raise ValueError(f"'layers' must be in [2, {QWEN_MAX_LAYERS}]")
+    steps = body.get("num_inference_steps")
+    if steps is not None:
+        try:
+            steps = int(steps)
+        except (TypeError, ValueError):
+            raise ValueError("'num_inference_steps' must be an integer")
+        if steps < 1:
+            raise ValueError("'num_inference_steps' must be >= 1")
+    resolution = body.get("resolution")
+    preview_only = bool(body.get("preview_only", False))
+    return layers, resolution, steps, preview_only
+
+
+async def _run_layer_sse(req: web.Request, body: dict) -> web.StreamResponse:
+    """Serve /layer as text/event-stream: accepted -> progress* (per denoise step)
+    -> complete (full /layer contract JSON), or error."""
+    layers, resolution, steps, preview_only = _parse_layer_body(body)
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await resp.prepare(req)
+
+    async def _ev(event: str, data: dict) -> None:
+        try:
+            await resp.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+        except Exception:
+            pass
+
+    await _ev("accepted", {
+        "engine": "layer",
+        "layers": layers,
+        "num_inference_steps": steps,
+        "resolution": resolution,
+    })
+    loop = asyncio.get_running_loop()
+    total = steps or 30
+
+    def _progress(step: int, t: int):
+        loop.call_soon_threadsafe(
+            asyncio.create_task, _ev("progress", {"step": step, "total_steps": t})
+        )
+
+    assert engine
+    async with _generation_lock:
+        try:
+            result = await loop.run_in_executor(
+                None, functools.partial(
+                    engine.layered_decompose, body["image"], layers, resolution,
+                    preview_only, steps, _progress,
+                )
+            )
+        except Exception as exc:
+            logger.exception("layer SSE failed")
+            await _ev("error", {"error": str(exc)})
+            await resp.write_eof()
+            return resp
+
+    if _estimate_bytes(result) > QWEN_LAYER_RESPONSE_CAP_BYTES:
+        await _ev("error", {"error": "layer response exceeds QWEN_LAYER_RESPONSE_CAP_BYTES"})
+    else:
+        await _ev("complete", result)
+    await resp.write_eof()
+    return resp
+
+
 async def handle_layer(req: web.Request) -> web.Response:
     """POST /video-creator/v1/layer.
 
     Request: {image: <b64 png>, layers?: int (clamped to [2, QWEN_MAX_LAYERS]),
-              resolution?: str/int, preview_only?: bool}
+              resolution?: str/int, num_inference_steps?: int, preview_only?: bool}
     Response: the /layer contract
               {layers: [{index, rgba_b64, preview_b64, alpha_b64, label}],
                composite: <b64>, width, height, layers_requested}
+    When the query has ``?sse=1`` the response is a text/event-stream:
+    accepted -> progress* (per denoise step) -> complete, or error.
 
     Validation: `layers` outside [2, QWEN_MAX_LAYERS] -> 400; a projected response
     larger than QWEN_LAYER_RESPONSE_CAP_BYTES -> 413. Input is clamped to
     QWEN_LAYER_MAX_INPUT_SIDE by the engine.
     """
     body = await req.json()
-    assert engine
-    image = body.get("image")
-    if not image:
+    if not body.get("image"):
         return web.json_response({"error": "missing 'image' (base64)"}, status=400)
 
-    layers = body.get("layers")
-    if layers is not None:
-        try:
-            layers = int(layers)
-        except (TypeError, ValueError):
-            return web.json_response({"error": "'layers' must be an integer"}, status=400)
-        if layers < 2 or layers > QWEN_MAX_LAYERS:
-            return web.json_response(
-                {"error": f"'layers' must be in [2, {QWEN_MAX_LAYERS}]"}, status=400
-            )
+    want_sse = req.query.get("sse") in ("1", "true", "yes")
+    if want_sse:
+        return await _run_layer_sse(req, body)
 
-    resolution = body.get("resolution")
-    preview_only = bool(body.get("preview_only", False))
+    try:
+        layers, resolution, steps, preview_only = _parse_layer_body(body)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
     result = await _run_generation(
-        engine.layered_decompose, image, layers, resolution, preview_only
+        engine.layered_decompose, body["image"], layers, resolution, preview_only, steps
     )
 
     # Reject an oversized projected response (base64 payload dominates bytes).

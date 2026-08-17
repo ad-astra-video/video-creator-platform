@@ -535,7 +535,8 @@ class ImageInferenceEngine:
         )
 
     def layered_decompose(self, image, layers=None, resolution=None,
-                          preview_only=False) -> dict:
+                          preview_only=False, num_inference_steps=None,
+                          progress_cb=None) -> dict:
         """Decompose an image into semantically-ordered layers.
 
         Returns the /layer contract::
@@ -567,13 +568,25 @@ class ImageInferenceEngine:
         layered_src = src.convert("RGBA")
 
         layer_imgs: list[Image.Image] | None = None
+        steps = int(num_inference_steps) if num_inference_steps else _cfg.QWEN_STEPS
         if not preview_only:
+            def _on_step(step: int, total: int, **_: Any) -> None:
+                if progress_cb:
+                    try:
+                        progress_cb(step, total)
+                    except Exception:
+                        logger.debug("progress_cb raised", exc_info=True)
             try:
                 self._evict_other("layered")
                 pipe = self._qwen_layered_pipe()
-                call_kw = dict(image=layered_src, layers=n)
+                call_kw = dict(image=layered_src, layers=n, num_inference_steps=steps)
                 if resolution:
                     call_kw["resolution"] = resolution
+                if progress_cb:
+                    def _step_cb(pglob, step, timestep, cb_kw):
+                        _on_step(step + 1, steps)
+                        return cb_kw
+                    call_kw["callback_on_step_end"] = _step_cb
                 out = pipe(**call_kw)
                 layer_imgs = _extract_layers(out, n)
                 if layer_imgs is None:

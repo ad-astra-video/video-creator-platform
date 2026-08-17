@@ -40,6 +40,11 @@ QWEN_LAYERED_DTYPE = os.environ.get("QWEN_LAYERED_DTYPE", "fp8").strip().lower()
 QWEN_LAYERS = int(os.environ.get("QWEN_LAYERS", "4"))
 QWEN_MAX_LAYERS = int(os.environ.get("QWEN_MAX_LAYERS", "16"))
 
+# Default number of Qwen-Image-Layered denoise steps when the request doesn't
+# specify num_inference_steps. Quality presets map to: Fast=25, Balanced=30,
+# Detailed=50 (the client sends the chosen count; this is the fallback).
+QWEN_STEPS = int(os.environ.get("QWEN_STEPS", "30"))
+
 # Longest input-image side the /layer endpoint will try to decompose (px).
 QWEN_LAYER_MAX_INPUT_SIDE = int(os.environ.get("QWEN_LAYER_MAX_INPUT_SIDE", "2048"))
 
