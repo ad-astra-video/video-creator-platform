@@ -51,6 +51,7 @@ LTX25_MODEL_DIR = os.environ.get("LTX25_MODEL_DIR", "/models/ltx-2.5")
 LTX25_VARIANT = os.environ.get("LTX25_VARIANT", "")  # "" = auto (NVFP4 if Blackwell)
 LTX25_TRANSFORMER_NVFP4 = "ltx-2.5-22b-distilled-transformer-nvfp4.safetensors"
 LTX25_TRANSFORMER_INT8 = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
+LTX25_TRANSFORMER_BF16 = "ltx-2.5-22b-distilled-transformer-bf16.safetensors"
 LTX25_TEXT_ENCODER = "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
 LTX25_VIDEO_VAE = "ltx-2.5-video-vae-bf16.safetensors"
 LTX25_AUDIO_VAE = "ltx-2.5-audio-vae-bf16.safetensors"
@@ -60,13 +61,16 @@ LTX25_DURATION_HEAD = "ltx-2.5-duration-head-bf16.safetensors"
 def ltx25_transformer_filename() -> str:
     """Return the 2.5 distilled-transformer filename for the configured/auto
     variant. Mirrors the downloader's GPU selection: NVFP4 needs Blackwell
-    (sm100/sm103/sm120, compute capability >= 10.0); everything else uses
-    INT8+ConvRot. An explicit LTX25_VARIANT always wins."""
+    (sm100/sm103/sm120, compute capability >= 10.0). The BF16 variant is loaded
+    with the fp8-cast CUDA policy (works on Ada + Blackwell with no ltx-kernels).
+    An explicit LTX25_VARIANT always wins; supported: nvfp4|int8|bf16."""
     v = (LTX25_VARIANT or "auto").strip().lower()
     if v == "nvfp4":
         return LTX25_TRANSFORMER_NVFP4
     if v == "int8":
         return LTX25_TRANSFORMER_INT8
+    if v == "bf16":
+        return LTX25_TRANSFORMER_BF16
     # auto: ask nvidia-smi for the first GPU's compute capability (digits only)
     cc = None
     try:
@@ -82,7 +86,21 @@ def ltx25_transformer_filename() -> str:
         cc = None
     if cc is not None and cc >= 100:
         return LTX25_TRANSFORMER_NVFP4
-    return LTX25_TRANSFORMER_INT8
+    return LTX25_TRANSFORMER_BF16
+
+
+def ltx25_fp8cast() -> bool:
+    """Whether to load the 2.5 transformer with the CUDA fp8-cast policy.
+
+    The NVFP4 / comfy-int8-convrot files carry their own quant headers and are
+    NOT consumable by the ltx-pipelines loader directly (it has fp8-cast,
+    fp8-scaled-mm and nvfp4 prequant/cast policies only). The BF16 file is the
+    one loadable here; fp8-cast shrinks its 22B weights to fit a 32 GB card
+    without needing the ltx-kernels nvfp4 extension. An explicit
+    LTX25_FP8CAST=0 forces plain (bf16) loading."""
+    if os.environ.get("LTX25_FP8CAST", "").strip().lower() in ("0", "false", "no"):
+        return False
+    return (LTX25_VARIANT or "auto").strip().lower() == "bf16"
 
 
 # The latent spatial upscaler is a 2.5-specific artifact under

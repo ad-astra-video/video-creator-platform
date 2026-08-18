@@ -6,10 +6,10 @@
 #   * NVFP4  (ltx-2.5-22b-distilled-transformer-nvfp4.safetensors) — Blackwell
 #             (sm_100/sm_103/sm_120, i.e. compute capability >= 10.0 — e.g.
 #             RTX 50-series like the RTX 5090, or the RTX PRO 6000 Blackwell).
-#   * INT8+ConvRot (ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors)
-#             — Ada (sm_89) and everything else / older.
+#   * BF16 (ltx-2.5-22b-distilled-transformer-bf16.safetensors) — portable fallback,
+#             loaded in-process with the CUDA fp8-cast policy (no ltx-kernels).
 #
-# Override the auto-detect with LTX25_VARIANT=int8|nvfp4.
+# Override the auto-detect with LTX25_VARIANT=int8|nvfp4|bf16.
 #
 # Produces (mirrors the ComfyUI repo layout, all under <MODEL_DIR>/ltx-2.5):
 #   diffusion_models/ltx-2.5-22b-distilled-transformer-<variant>.safetensors
@@ -67,8 +67,10 @@ select_variant() {
         # Blackwell -> native NVFP4
         echo "nvfp4"
     else
-        # Ada / Volta / Turing / Ampere / anything not Blackwell -> INT8+ConvRot
-        echo "int8"
+        # Non-Blackwell -> BF16 (loaded with the CUDA fp8-cast policy, no ltx-kernels).
+        # The comfy-int8-convrot / nvfp4 files are ComfyUI formats the ltx-pipelines
+        # loader cannot consume, so bf16 is the portable default.
+        echo "bf16"
     fi
 }
 
@@ -76,7 +78,8 @@ VARIANT="$(select_variant)"
 case "$VARIANT" in
     nvfp4) TRANSFORMER="ltx-2.5-22b-distilled-transformer-nvfp4.safetensors" ;;
     int8)  TRANSFORMER="ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors" ;;
-    *) echo "ERROR: LTX25_VARIANT must be int8|nvfp4 (got: $VARIANT)" >&2; exit 1 ;;
+    bf16)  TRANSFORMER="ltx-2.5-22b-distilled-transformer-bf16.safetensors" ;;
+    *) echo "ERROR: LTX25_VARIANT must be int8|nvfp4|bf16 (got: $VARIANT)" >&2; exit 1 ;;
 esac
 
 echo ">>> LTX 2.5 variant selected: $VARIANT ($TRANSFORMER)"

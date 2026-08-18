@@ -308,10 +308,21 @@ class VideoCreatorInferenceEngine:
             "Loading LTX-2.5 DistilledPipeline (api=new, transformer=%s, upscaler=%r, offload=%s)",
             transformer, upscaler25, offload_mode,
         )
-        # The NVFP4 (Blackwell) vs INT8+ConvRot transformer variant is selected by filename via
-        # ltx25_transformer_filename(); ltx-core detects the quantization from the safetensors
-        # header. No fp8 cast policy is applied here (that policy is 2.3-specific and keyed to
-        # the 2.3 checkpoint path) — matching the upstream distilled CLI default for 2.5.
+        # The 2.5 transformer variant/load policy is driven by LTX25_VARIANT via
+        # ltx25_transformer_filename()/ltx25_fp8cast(). For the BF16 variant we apply
+        # the CUDA fp8-cast policy (bf16 -> fp8 on load) so the 22B weights fit a 32 GB
+        # card without the ltx-kernels nvfp4 extension. NVFP4/comfy-int8-convrot files
+        # are NOT loadable by this loader (no matching quantization policy), so they are
+        # only usable with explicit downstream scripts; we default to none for them.
+        quantization = None
+        if _cfg.ltx25_fp8cast():
+            try:
+                from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+                quantization = build_fp8_cast_policy(transformer)
+                logger.info("LTX-2.5: applying CUDA fp8-cast quantization policy for %s",
+                            _cfg.ltx25_transformer_filename())
+            except Exception:
+                logger.warning("LTX-2.5: fp8-cast policy unavailable, loading BF16 without it")
         self._pipeline25 = DistilledPipeline(
             model_paths=ModelPaths.from_split(
                 transformer_path=transformer,
@@ -323,10 +334,11 @@ class VideoCreatorInferenceEngine:
             spatial_upsampler_path=upscaler25,
             loras=lora_entries,
             device=self._device,
-            quantization=None,
+            quantization=quantization,
             offload_mode=offload_mode,
         )
-        logger.info("LTX-2.5 DistilledPipeline loaded")
+        logger.info("LTX-2.5 DistilledPipeline loaded (fp8cast=%s)",
+                    quantization is not None)
 
     # ------------------------------------------------------------------
     # Helpers
