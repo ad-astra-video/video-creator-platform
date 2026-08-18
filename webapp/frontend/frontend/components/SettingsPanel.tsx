@@ -35,7 +35,7 @@ export interface GenerationSettings {
   variations?: number  // Number of image variations to generate
   imageEditStrength?: number  // Denoising strength when editing an existing image
   imageEditEngine?: 'qwen-edit' | 'zimage'  // Image-edit engine: Qwen-Image-Edit (default) | Z-Image keep-subject
-  imageModel?: 'zimage' | 'klein'  // Text-to-image model: Z-Image Turbo (default) | FLUX.2 Klein 4B
+  imageModel?: 'zimage' | 'klein' | 'hidream'  // T2I: Z-Image Turbo | FLUX.2 Klein 4B | HiDream-O1
 }
 
 interface SettingsPanelProps {

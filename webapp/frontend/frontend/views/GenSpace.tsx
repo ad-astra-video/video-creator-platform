@@ -795,10 +795,10 @@ function PromptBar({
     imageEditStrength?: number
     imageSteps?: number
     imageEditEngine?: 'qwen-edit' | 'zimage'
-    imageEditModel?: 'qwen-edit' | 'klein'
+    imageEditModel?: 'qwen-edit' | 'klein' | 'hidream'
     imageEditQuality?: 'fast' | 'balanced' | 'high'
     imageEditPadding?: number
-    imageModel?: 'zimage' | 'klein'
+    imageModel?: 'zimage' | 'klein' | 'hidream'
     first_frame_engine?: 'qwen-edit' | 'klein'
   }
   onSettingsChange: (settings: any) => void
@@ -1242,16 +1242,17 @@ function PromptBar({
               <SettingsDropdown
                 title="MODEL"
                 value={settings.imageEditModel ?? 'qwen-edit'}
-                onChange={(v) => onSettingsChange({ ...settings, imageEditModel: v as 'qwen-edit' | 'klein' })}
+                onChange={(v) => onSettingsChange({ ...settings, imageEditModel: v as 'qwen-edit' | 'klein' | 'hidream' })}
                 options={[
                   { value: 'qwen-edit', label: 'Qwen-Image-Edit' },
                   { value: 'klein', label: 'FLUX.2 klein', disabled: imageMaskActive, tooltip: imageMaskActive ? 'Masks require the inpaint engine — FLUX.2 klein is disabled while an item/layer is selected.' : undefined },
+                  { value: 'hidream', label: 'HiDream-O1', disabled: imageMaskActive, tooltip: imageMaskActive ? 'HiDream-O1 is a whole-frame edit (no mask) — disabled while an item/layer is selected.' : undefined },
                 ]}
                 trigger={
                   <>
                     <Wand2 className="h-3.5 w-3.5" />
                     <span className="text-zinc-300 font-medium">
-                      {settings.imageEditModel === 'klein' ? 'FLUX.2 klein' : 'Qwen-Image-Edit'}
+                      {settings.imageEditModel === 'klein' ? 'FLUX.2 klein' : settings.imageEditModel === 'hidream' ? 'HiDream-O1' : 'Qwen-Image-Edit'}
                     </span>
                     <ChevronUp className="h-3 w-3 text-zinc-500" />
                   </>
@@ -1261,16 +1262,17 @@ function PromptBar({
               <SettingsDropdown
                 title="MODEL"
                 value={settings.imageModel ?? 'zimage'}
-                onChange={(v) => onSettingsChange({ ...settings, imageModel: v as 'zimage' | 'klein' })}
+                onChange={(v) => onSettingsChange({ ...settings, imageModel: v as 'zimage' | 'klein' | 'hidream' })}
                 options={[
                   { value: 'zimage', label: 'Z-Image Turbo' },
                   { value: 'klein', label: 'FLUX.2 Klein 4B' },
+                  { value: 'hidream', label: 'HiDream-O1' },
                 ]}
                 trigger={
                   <>
                     <ZitIcon className="h-3.5 w-3.5" />
                     <span className="text-zinc-300 font-medium">
-                      {settings.imageModel === 'klein' ? 'FLUX.2 Klein' : 'Z-Image Turbo'}{imageUsesFalApi ? ' (API)' : ''}
+                      {settings.imageModel === 'klein' ? 'FLUX.2 Klein' : settings.imageModel === 'hidream' ? 'HiDream-O1' : 'Z-Image Turbo'}{imageUsesFalApi ? ' (API)' : ''}
                     </span>
                     <ChevronUp className="h-3 w-3 text-zinc-500" />
                   </>
@@ -1625,9 +1627,9 @@ const DEFAULT_VIDEO_SETTINGS = {
   // Qwen-Image-Edit is the default engine for image edits and restyle first-frames.
   imageEditEngine: 'qwen-edit' as 'qwen-edit' | 'zimage',
   // Edit models: Qwen-Image-Edit (default) | FLUX.2 klein.
-  imageEditModel: 'qwen-edit' as 'qwen-edit' | 'klein',
+  imageEditModel: 'qwen-edit' as 'qwen-edit' | 'klein' | 'hidream',
   imageEditQuality: 'balanced' as 'fast' | 'balanced' | 'high',
-  imageModel: 'zimage' as 'zimage' | 'klein',
+  imageModel: 'zimage' as 'zimage' | 'klein' | 'hidream',
   first_frame_engine: 'qwen-edit' as 'qwen-edit' | 'klein',
 }
 

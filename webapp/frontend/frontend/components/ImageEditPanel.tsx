@@ -24,7 +24,7 @@ import { logger } from '../lib/logger'
  * step, or GenSpace's main prompt bar).
  */
 
-export type ImageEditEngine = 'qwen-edit' | 'klein' | 'zimage'
+export type ImageEditEngine = 'qwen-edit' | 'klein' | 'zimage' | 'hidream'
 
 export interface ImageEditCompleteMeta {
   prompt: string
@@ -346,6 +346,17 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
         // FLUX.2 klein is a whole-frame single-reference style edit (no mask).
         const r = await styleFrameViaRunner(runner, b64, p.trim(), { seed, enhance: opts?.enhance ?? false, quality: opts?.quality })
         newKey = r.styledImageUrl
+      } else if (eng === 'hidream') {
+        // HiDream-O1-Image is a whole-frame instruction edit (no mask): it takes
+        // a single reference image + an edit instruction and regenerates pixels
+        // directly (no VAE). Runs through the image-worker /edit with engine=hidream.
+        const r = await editImageViaRunner(
+          runner,
+          b64,
+          p.trim(),
+          { engine: 'hidream', seed, enhance: opts?.enhance ?? false, maskImage: undefined, quality: opts?.quality, onProgress: opts?.onProgress },
+        )
+        newKey = r.imageUrl
       } else {
         const r = await editImageViaRunner(
           runner,

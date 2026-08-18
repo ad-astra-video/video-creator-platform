@@ -67,7 +67,10 @@ export const generationParamsSchema = z.object({
   imageEditStrength: z.number().optional(),
   // Image-edit engine: Qwen-Image-Edit (default) | Z-Image masked keep-subject.
   imageEditEngine: z.enum(['qwen-edit', 'zimage']).optional(),
-  imageModel: z.enum(['zimage', 'klein']).optional(),
+  imageModel: z.enum(['zimage', 'klein', 'hidream']).optional(),
+  // HiDream-O1-Image is also selectable as an image-edit model (whole-frame
+  // instruction edit, no mask) alongside Qwen-Image-Edit / FLUX.2 klein.
+  imageEditModel: z.enum(['qwen-edit', 'klein', 'hidream']).optional(),
   // Seed used by the runner for this image, echoed back and persisted so the
   // generation is reproducible / regenerable with the same input.
   seed: z.number().optional(),
