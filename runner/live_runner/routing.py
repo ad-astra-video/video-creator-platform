@@ -51,8 +51,9 @@ CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", 
                        "ic-lora-generate"})
 
 # Image models the image-worker can serve, by id. Consumed by the frontend to
-# label models (z-image = Z-Image, flux = FLUX.2 klein 4B, qwen = Qwen-Image-Edit).
-MODELS = ["z-image", "flux", "qwen"]
+# label models (z-image = Z-Image, flux = FLUX.2 klein 4B, qwen = Qwen-Image-Edit,
+# hidream = HiDream-O1-Image 8B UiT).
+MODELS = ["z-image", "flux", "qwen", "hidream"]
 
 # Endpoints served at the idv2v-worker that do NOT need the 20 GB video model
 # resident: SAM3 is image-only (subprocess) and its own internal lifecycle

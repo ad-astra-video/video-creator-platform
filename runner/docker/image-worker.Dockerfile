@@ -60,6 +60,10 @@ RUN pip install --no-cache-dir --no-deps "git+${FLUX2_REPO}@${FLUX2_COMMIT}"
 # extra deps the flux2/klein path needs that aren't in the base requirements.
 RUN pip install --no-cache-dir "einops"
 
+# scipy is required by the HiDream-O1-Image unipc flow solver
+# (hidream_models/fm_solvers_unipc.py) used by the default 'full' model recipe.
+RUN pip install --no-cache-dir "scipy"
+
 RUN useradd -m runneruser
 
 WORKDIR /app

@@ -165,7 +165,7 @@ async def handle_info(_req: web.Request) -> web.Response:
     return web.json_response({
         "app": APP_ID,
         "capabilities": ["image", "edit", "layer", "style-frame"],
-        "models": ["z-image", "flux", "qwen"],
+        "models": ["z-image", "flux", "qwen", "hidream"],
         "ready": ready,
         "gpu": profile_info,
         "devices_visible": _devices_visible(),
@@ -204,8 +204,12 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
     if "num_inference_steps" not in kw:
         q = str(body.get("quality") or "").strip().lower()
         if q in ("fast", "balanced", "high"):
-            presets = (QWEN_EDIT_STEP_PRESETS if engine_name == "qwen-edit"
-                       else ZIMAGE_STEP_PRESETS)
+            if engine_name == "hidream":
+                from runner.image.inference import HIDREAM_STEP_PRESETS
+                presets = HIDREAM_STEP_PRESETS
+            else:
+                presets = (QWEN_EDIT_STEP_PRESETS if engine_name == "qwen-edit"
+                           else ZIMAGE_STEP_PRESETS)
             kw["num_inference_steps"] = presets[q]
     steps = kw.get("num_inference_steps") or QWEN_EDIT_STEP_PRESETS["balanced"]
 
@@ -225,19 +229,29 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
 
     async with _generation_lock:
         try:
-            img = await loop.run_in_executor(
-                None, functools.partial(
-                    engine.edit_image,
-                    body["image"], prompt,
-                    engine=engine_name,
-                    mask=body.get("mask_image"),
-                    keep_subject=bool(body.get("keep_subject", False)),
-                    strength=float(body.get("strength", 0.6)),
-                    padding_mask_crop=int(body.get("padding_mask_crop", 0) or 0),
-                    progress_cb=_progress,
-                    **kw,
+            if engine_name == "hidream":
+                img = await loop.run_in_executor(
+                    None, functools.partial(
+                        engine.hidream_edit, body["image"], prompt,
+                        seed=kw.get("seed"),
+                        num_inference_steps=kw.get("num_inference_steps"),
+                        quality=body.get("quality"), progress_cb=_progress,
+                    )
                 )
-            )
+            else:
+                img = await loop.run_in_executor(
+                    None, functools.partial(
+                        engine.edit_image,
+                        body["image"], prompt,
+                        engine=engine_name,
+                        mask=body.get("mask_image"),
+                        keep_subject=bool(body.get("keep_subject", False)),
+                        strength=float(body.get("strength", 0.6)),
+                        padding_mask_crop=int(body.get("padding_mask_crop", 0) or 0),
+                        progress_cb=_progress,
+                        **kw,
+                    )
+                )
         except Exception as exc:
             logger.exception("edit SSE failed")
             await _ev("error", {"error": str(exc)})
@@ -271,9 +285,9 @@ async def handle_edit(req: web.Request) -> web.Response:
     image = body.get("image")
     prompt = str(body.get("prompt", ""))
     engine_name = str(body.get("engine", "qwen-edit")).lower()
-    if engine_name not in ("qwen-edit", "zimage"):
+    if engine_name not in ("qwen-edit", "zimage", "hidream"):
         return web.json_response(
-            {"error": f"unknown edit engine '{engine_name}' (expected qwen-edit|zimage)"},
+            {"error": f"unknown edit engine '{engine_name}' (expected qwen-edit|zimage|hidream)"},
             status=400,
         )
     mask = body.get("mask_image")
@@ -294,16 +308,24 @@ async def handle_edit(req: web.Request) -> web.Response:
             kw["num_inference_steps"] = presets[q]
 
     from runner.image.inference import _pil_to_b64  # cheap, no torch
-    img = await _run_generation(
-        engine.edit_image,
-        image, prompt,
-        engine=engine_name,
-        mask=mask,
-        keep_subject=keep_subject,
-        strength=strength,
-        padding_mask_crop=padding_mask_crop,
-        **kw,
-    )
+    if engine_name == "hidream":
+        img = await _run_generation(
+            engine.hidream_edit, image, prompt,
+            seed=kw.pop("seed", None),
+            num_inference_steps=kw.pop("num_inference_steps", None),
+            quality=body.get("quality"),
+        )
+    else:
+        img = await _run_generation(
+            engine.edit_image,
+            image, prompt,
+            engine=engine_name,
+            mask=mask,
+            keep_subject=keep_subject,
+            strength=strength,
+            padding_mask_crop=padding_mask_crop,
+            **kw,
+        )
     return web.json_response({
         "image": _pil_to_b64(img),
         "content_type": "image/png",
@@ -484,9 +506,9 @@ async def handle_image(req: web.Request) -> web.Response:
     if not prompt:
         return web.json_response({"error": "missing 'prompt'"}, status=400)
     engine_name = str(body.get("engine", "zimage")).lower()
-    if engine_name not in ("zimage", "klein"):
+    if engine_name not in ("zimage", "klein", "hidream"):
         return web.json_response(
-            {"error": f"unknown image engine '{engine_name}' (expected zimage|klein)"},
+            {"error": f"unknown image engine '{engine_name}' (expected zimage|klein|hidream)"},
             status=400,
         )
     from runner.image import config as _cfg
@@ -512,7 +534,25 @@ async def handle_image(req: web.Request) -> web.Response:
         kw["guidance_scale"] = float(body["guidance_scale"])
 
     from runner.image.inference import _pil_to_b64  # cheap, no torch
-    if engine_name == "klein":
+    if engine_name == "hidream":
+        kw.pop("num_inference_steps", None)
+        kw.pop("guidance_scale", None)
+        img = await _run_generation(
+            engine.hidream_image, prompt,
+            num_inference_steps=body.get("num_inference_steps"),
+            guidance_scale=body.get("guidance_scale"),
+            quality=body.get("quality"), progress_cb=None, **kw,
+        )
+        resp = {
+            "image": _pil_to_b64(img),
+            "content_type": "image/png",
+            "engine": engine_name,
+            "seed": seed,
+        }
+        if body.get("num_inference_steps") is not None:
+            resp["num_inference_steps"] = int(body["num_inference_steps"])
+        return web.json_response(resp)
+    elif engine_name == "klein":
         steps = _image_klein_steps(body)
         # `steps` already consumes the body's num_inference_steps; don't also let
         # it ride in **kw or klein_image gets it twice (TypeError: multiple values).

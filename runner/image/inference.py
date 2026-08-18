@@ -186,6 +186,39 @@ def _composite(layer_imgs: list[Image.Image]) -> Image.Image:
     return base
 
 
+# Quality preset -> HiDream-O1-Image denoise steps. The 'full' recipe is
+# autorad 50 steps; 'dev' is 28. The client threads a bare quality name and the
+# worker translates (/image /edit), mirroring the other engines.
+HIDREAM_STEP_PRESETS = {"fast": 20, "balanced": 28, "high": 50}
+
+
+def _resolve_steps(num_inference_steps, quality, engine: str) -> int:
+    """Resolve denoise steps: explicit num_inference_steps > quality preset."""
+    if num_inference_steps is not None:
+        try:
+            return max(1, int(num_inference_steps))
+        except (TypeError, ValueError):
+            pass
+    q = str(quality or "").strip().lower()
+    presets = HIDREAM_STEP_PRESETS if engine == "hidream" else {}
+    if q in presets:
+        return presets[q]
+    return _cfg.HIDREAM_STEPS
+
+
+def _hidream_dims(width, height) -> tuple[int, int]:
+    """Clamp HiDream-O1-Image output dims to the model's max, preserving any
+    aspect ratio the caller requested (0/None width/height -> default 1024)."""
+    try:
+        w = int(width or 1024)
+        h = int(height or 1024)
+    except (TypeError, ValueError):
+        w = h = 1024
+    w = max(256, min(w, _cfg.HIDREAM_MAX_SIDE))
+    h = max(256, min(h, _cfg.HIDREAM_MAX_SIDE))
+    return w, h
+
+
 class ImageInferenceEngine:
     """Wraps Qwen-Image-Edit, Qwen-Image-Layered and Z-Image pipelines.
 
@@ -201,6 +234,7 @@ class ImageInferenceEngine:
         self._qwen_edit_inpaint: Any = None  # QwenImageEditInpaintPipeline (shares _qwen_edit components)
         self._qwen_layered: Any = None       # QwenImageLayeredPipeline
         self._zimage: Any = None             # ZImagePipeline (+ ZImageImg2Img/Inpaint)
+        self._hidream: Any = None            # HiDream-O1-Image UiT (model, processor)
         # Serializes lazy builds and evictions (a load must never race an evict).
         self._model_lock = threading.RLock()
         # The active CUDA device index, set by the server from the /load body.
@@ -378,6 +412,117 @@ class ImageInferenceEngine:
                 self.ready = True
             return self._zimage
 
+    def _hidream_pipe(self):
+        """Build (once) and return the HiDream-O1-Image UiT (model, processor).
+
+        HiDream-O1-Image is an 8B pixel-level Unified Transformer run through the
+        vendored `hidream_models/` pipeline (custom Qwen3VL UiT + repo schedulers).
+        Unlike the Qwen/Z-Image pipelines it is a plain transformers model, NOT a
+        diffusers pipeline: load AutoProcessor + Qwen3VLForConditionalGeneration
+        (bf16) and cache the (model, processor) pair. Rendered pixels are returned
+        directly by generate_image() — there is no VAE/decoder. Uses the eager
+        4D-mask attention path by default (HIDREAM_USE_FLASH_ATTN defaults off)."""
+        with self._model_lock:
+            if self._hidream is None:
+                import torch
+                from .hidream_models.qwen3_vl_transformers import (
+                    Qwen3VLForConditionalGeneration,
+                )
+                from transformers import AutoProcessor
+                root = _cfg.HIDREAM_ROOT
+                logger.info("Loading HiDream-O1-Image from %s (dtype=%s, flash=%s)",
+                            root, _cfg.HIDREAM_DTYPE, "on")
+                dtype = torch.float32 if _cfg.HIDREAM_DTYPE == "fp32" else torch.bfloat16
+                processor = AutoProcessor.from_pretrained(root)
+                # Load on CPU then move to the target GPU: device_map triggers
+                # accelerate's meta-device lazy path in transformers 5.15,
+                # which leaves non-persistent buffers (e.g. rope inv_freq) on
+                # meta -> "Cannot copy out of meta tensor". A plain load + .to()
+                # materializes everything.
+                model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    root, torch_dtype=dtype,
+                ).to(f"cuda:{self._active_device()}").eval()
+                self._hidream = {"model": model, "processor": processor,
+                                 "device": f"cuda:{self._active_device()}"}
+                self.ready = True
+            return self._hidream
+
+    def hidream_image(self, prompt, width=1024, height=1024, seed=None,
+                      num_inference_steps=None, guidance_scale=None, quality=None,
+                      progress_cb=None, **kw) -> Image.Image:
+        """Text-to-image via HiDream-O1-Image -> a single PIL.Image.
+
+        ``quality`` (fast/balanced/high) maps to step counts when
+        num_inference_steps isn't given. ``num_inference_steps``/guidance
+        default to the 'full' recipe (50 / 5.0) unless overridden. Produces
+        native-resolution output up to HIDREAM_MAX_SIDE."""
+        self._evict_other("hidream")
+        hid = self._hidream_pipe()
+        model, processor = hid["model"], hid["processor"]
+        from .hidream_models import pipeline as _hp
+
+        steps = _resolve_steps(num_inference_steps, quality, "hidream")
+        guid = float(guidance_scale) if guidance_scale else _cfg.HIDREAM_GUIDANCE
+        width, height = _hidream_dims(width, height)
+
+        def _cb(step, total, decode=None):
+            if progress_cb:
+                try:
+                    progress_cb(step + 1, total)
+                except Exception:
+                    pass
+
+        return _hp.generate_image(
+            model=model, processor=processor, prompt=prompt,
+            ref_image_paths=None, height=height, width=width,
+            num_inference_steps=int(steps), guidance_scale=guid,
+            shift=3.0, timesteps_list=None, scheduler_name="default",
+            seed=int(seed) if seed is not None else 32,
+            callback=_cb if progress_cb else None,
+        )
+
+    def hidream_edit(self, image, prompt, seed=None, keep_original_aspect=True,
+                     num_inference_steps=None, quality=None, progress_cb=None,
+                     **kw) -> Image.Image:
+        """Instruction-based image editing via HiDream-O1-Image (single ref image).
+
+        ``image`` is the source (base64 str, bytes, or PIL). The edit runs the
+        repo pipeline with exactly one reference image; ``keep_original_aspect``
+        (default True) preserves the source's aspect ratio at the model's native
+        resolution. The full (undistilled) model is recommended for editing."""
+        self._evict_other("hidream")
+        hid = self._hidream_pipe()
+        model, processor = hid["model"], hid["processor"]
+        from .hidream_models import pipeline as _hp
+
+        src = _decoded_pil(image)
+        import tempfile, os
+        fd, path = tempfile.mkstemp(suffix=".png")
+        try:
+            os.close(fd)
+            src.save(path, format="PNG")
+            steps = _resolve_steps(num_inference_steps, quality, "hidream")
+            def _cb(step, total, decode=None):
+                if progress_cb:
+                    try:
+                        progress_cb(step + 1, total)
+                    except Exception:
+                        pass
+            return _hp.generate_image(
+                model=model, processor=processor, prompt=prompt,
+                ref_image_paths=[path], height=2048, width=2048,
+                num_inference_steps=int(steps), guidance_scale=_cfg.HIDREAM_GUIDANCE,
+                shift=3.0, timesteps_list=None, scheduler_name="default",
+                seed=int(seed) if seed is not None else 32,
+                keep_original_aspect=bool(keep_original_aspect),
+                callback=_cb if progress_cb else None,
+            )
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     @staticmethod
     def _apply_int8(pipe: Any) -> None:
         """Best-effort torchao int8 weight-only quantization when QWEN_DTYPE=int8.
@@ -483,6 +628,8 @@ class ImageInferenceEngine:
                 self._qwen_layered = None
             if keeper != "zimage":
                 self._zimage = None
+            if keeper != "hidream":
+                self._hidream = None
             if torch.cuda.is_available():
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -503,6 +650,7 @@ class ImageInferenceEngine:
             self._qwen_edit_inpaint = None
             self._qwen_layered = None
             self._zimage = None
+            self._hidream = None
             self.ready = False
             if torch.cuda.is_available():
                 gc.collect()

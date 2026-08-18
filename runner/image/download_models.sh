@@ -10,6 +10,7 @@
 #   <MODELS_DIR>/image/edit/Qwen/qwen-image-edit/            -> Qwen-Image-Edit
 #   <MODELS_DIR>/image/layered/Qwen/qwen-image-layered/      -> Qwen-Image-Layered (fp8 shards)
 #   <MODELS_DIR>/image/zimage/                                -> Z-Image (Turbo)
+#   <MODELS_DIR>/image/hidream/                               -> HiDream-O1-Image (8B UiT)
 #
 # Usage (run on the GPU box HOST before docker compose up):
 #   export HUGGING_FACE_HUB_TOKEN=hf_...
@@ -88,6 +89,17 @@ hf download --token "$HF_TOKEN" "black-forest-labs/FLUX.2-klein-4B" \
 hf download --token "$HF_TOKEN" "black-forest-labs/FLUX.2-dev" \
     ae.safetensors --local-dir "$MODELS_DIR/flux2" || true
 hf download --token "$HF_TOKEN" "Qwen/Qwen3-4B" || true
+
+# [5/5] HiDream-O1-Image — the /image (text-to-image) + /edit (instruction
+# editing) engine. An 8B pixel-level Unified Transformer run through the
+# vendored runner/image/hidream_models/ pipeline (custom Qwen3VL UiT + repo
+# flow-matching schedulers). NOT gated on HF (no token needed), so it downloads
+# via plain `hf download`. Layout matches HIDREAM_ROOT=/models/image/hidream
+# (volume-mounted into the image-worker from /srv/video-creator/models/image/hidream).
+echo ">>> [5/5] HiDream-O1-Image (8B UiT)"
+mkdir -p "$IMAGE_BASE/hidream"
+hf download --token "$HF_TOKEN" "HiDream-ai/HiDream-O1-Image" \
+    --local-dir "$IMAGE_BASE/hidream"
 
 echo ">>> Done. Image models at $IMAGE_BASE"
 du -sh "$IMAGE_BASE" 2>/dev/null || true

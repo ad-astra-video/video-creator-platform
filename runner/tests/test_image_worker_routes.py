@@ -151,7 +151,7 @@ async def test_info_advertises_capabilities_and_device(client):
     body = await r.json()
     for cap in ("image", "edit", "layer", "style-frame"):
         assert cap in body["capabilities"]
-    assert body["models"] == ["z-image", "flux", "qwen"]
+    assert body["models"] == ["z-image", "flux", "qwen", "hidream"]
     assert body["device_in_use"] == 1
     assert "devices_visible" in body
 
