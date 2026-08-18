@@ -205,3 +205,51 @@ def test_create_app_registers_routes():
     assert "/health" in paths
     assert "/video-creator/v1/prompt-enhance" in paths
     assert "/video-creator/v1/chat" in paths
+    assert "/video-creator/v1/info" in paths
+
+
+def test_info_reports_physical_device(monkeypatch):
+    """/info must report the PHYSICAL pinned GPU (GEMMA_RESIDENT_GPU), not the
+    in-container remapped cuda:0 — and None when gemma is a shared/evictable slot."""
+    import asyncio
+    from aiohttp import web
+    from runner.gemma.server import create_app, _get_llm
+
+    # stub _get_llm so no llama.cpp/GPU is needed
+    class _FakeLLM:
+        is_ready = True
+    monkeypatch.setattr("runner.gemma.server._get_llm", lambda: _FakeLLM())
+
+    async def _call():
+        app = create_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        import aiohttp as _aio
+        try:
+            async with _aio.ClientSession() as s:
+                async with s.get(f"http://127.0.0.1:{port}/video-creator/v1/info") as r:
+                    body = await r.json()
+        finally:
+            await runner.cleanup()
+        return body
+
+    # dedicated case: physical GPU 2
+    old_dev = config.GEMMA_GPU_DEVICE
+    old_phys = config.GEMMA_PHYSICAL_GPU
+    try:
+        config.GEMMA_GPU_DEVICE = "cuda:2"
+        config.GEMMA_PHYSICAL_GPU = 2
+        assert config.is_dedicated_gpu() is True
+        body = asyncio.run(_call())
+        assert body["device_in_use"] == 2
+        assert body["ready"] is True
+        # shared/evictable case: blank device -> None
+        config.GEMMA_GPU_DEVICE = ""
+        body = asyncio.run(_call())
+        assert body["device_in_use"] is None
+    finally:
+        config.GEMMA_GPU_DEVICE = old_dev
+        config.GEMMA_PHYSICAL_GPU = old_phys
