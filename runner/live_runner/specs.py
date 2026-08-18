@@ -134,11 +134,15 @@ def build_model_specs(vram_mb: int) -> list[dict]:
     ordered = list(RESOLUTION_DIMS)
     resolutions = ordered[: ordered.index(max_res) + 1]
 
+    # 24fps is the ONLY advertised fps band. 48fps is an output-rate nicety, not a
+    # generation change (the worker treats it as output-rate, not a doubling of latent
+    # frames), and every extra fps key costs precious bytes in the go-livepeer 1024-byte
+    # heartbeat metadata cap -- which is already ~961 bytes with 2.3 alone. Dropping the
+    # 48fps band keeps the picker useful while leaving room for the ltx-2.5 marker below.
     supported = {
         res: {
             "fps_to_durations": {
-                fps: _durations_for(vram_mb, res)
-                for fps in ("24", "48")
+                "24": _durations_for(vram_mb, res),
             }
         }
         for res in resolutions
