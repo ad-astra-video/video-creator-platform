@@ -125,6 +125,7 @@ services:
       - TEXT_ENCODER_ROOT=${TEXT_ENCODER_ROOT:-/models/gemma}
       - UPSCALER_PATH=${UPSCALER_PATH:-/models/upsampler/ltx-2.3-spatial-upscaler-x2-1.1.safetensors}
       - GPU_DEVICE=${GPU_DEVICE:-0}
+      - LTX25_VARIANT=${LTX25_VARIANT:-}
       - WORKER_TOKEN=${WORKER_TOKEN:-}
       - PORT=8991
       - LORA_CACHE_DIR=${LORA_CACHE_DIR:-/models/loras}
