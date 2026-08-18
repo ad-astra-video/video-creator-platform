@@ -46,7 +46,7 @@ async function fetchWebModelSpecs(discoveryUrl?: string): Promise<VideoGeneratio
   const runners = await discoverRunners(url)
   const advertised = runners
     .filter((r) => r.status === 'ready' && Array.isArray(r.modelSpecs))
-    .map((r) => r.modelSpecs as unknown[])
+    .flatMap((r) => r.modelSpecs as unknown[])
   return { api_models: [], local_models: mergeLocalModels(advertised) }
 }
 
