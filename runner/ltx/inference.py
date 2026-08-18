@@ -498,6 +498,15 @@ class VideoCreatorInferenceEngine:
 
     @staticmethod
     def default_tiling_config():
+        # New rev of ltx-pipelines turned TilingConfig into a Union
+        # (TileSizeConfig | TileCountConfig) and moved .default() onto TileSizeConfig;
+        # the old rev had TilingConfig.default(). Detect by which object exposes .default().
+        try:
+            from ltx_core.model.video_vae import TileSizeConfig
+            if hasattr(TileSizeConfig, "default"):
+                return TileSizeConfig.default()
+        except Exception:
+            pass
         from ltx_core.model.video_vae import TilingConfig
         return TilingConfig.default()
 
@@ -923,9 +932,8 @@ class VideoCreatorInferenceEngine:
         from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
         from ltx_core.components.noisers import GaussianNoiser
         from ltx_core.model.video_vae import (
-            SpatialTilingConfig,
-            TemporalTilingConfig,
-            TilingConfig,
+            DimensionSizeConfig,
+            TileSizeConfig,
             get_video_chunks_number,
         )
         from ltx_core.types import AudioLatentShape, VideoLatentShape
@@ -935,10 +943,11 @@ class VideoCreatorInferenceEngine:
         from ltx_pipelines.utils.media_io import encode_video, get_videostream_metadata
         from ltx_pipelines.utils.types import ModalitySpec
 
-        tiling = TilingConfig.default()
-        encoding_tiling = TilingConfig(
-            spatial_config=SpatialTilingConfig(tile_size_in_pixels=256, tile_overlap_in_pixels=64),
-            temporal_config=TemporalTilingConfig(tile_size_in_frames=24, tile_overlap_in_frames=16),
+        tiling = TileSizeConfig.default()
+        encoding_tiling = TileSizeConfig(
+            frames=DimensionSizeConfig(tile_size=24, overlap=16),
+            height=DimensionSizeConfig(tile_size=256, overlap=64),
+            width=DimensionSizeConfig(tile_size=256, overlap=64),
         )
 
         # --- Encode the whole window (video + audio) to latents (tiled) ---
@@ -1109,7 +1118,8 @@ class VideoCreatorInferenceEngine:
                 tiling_config = self.default_tiling_config()
                 chunks = self.video_chunks_number(segment_frames, tiling_config)
 
-                video, audio = self._pipeline(
+                video, audio, _out_frames, _out_tiling = self._call_pipeline(
+                    self._pipeline,
                     prompt=prompt,
                     seed=seed,
                     height=h,
@@ -1618,7 +1628,8 @@ class VideoCreatorInferenceEngine:
         chunks = self.video_chunks_number(9, tiling_config)
 
         try:
-            video, audio = self._pipeline(
+            video, audio, _out_frames, _out_tiling = self._call_pipeline(
+                self._pipeline,
                 prompt="warmup test",
                 seed=42,
                 height=256,
