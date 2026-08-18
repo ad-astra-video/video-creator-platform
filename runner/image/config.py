@@ -44,16 +44,19 @@ QWEN_MAX_LAYERS = int(os.environ.get("QWEN_MAX_LAYERS", "16"))
 # HiDream-O1-Image runs in-place on the image-worker alongside
 # Qwen/Z-Image/FLUX.2 klein via the vendored `hidream_models/` package. Model
 # root is the full checkpoint dir (AutoProcessor + model safetensors).
-HIDREAM_ROOT = os.environ.get("HIDREAM_ROOT", "/models/image/hidream")
-# Model type: 'full' (undistilled, 50 steps / guidance 5.0 / shift 3.0 —
-# recommended for editing) or 'dev' (distilled 28 steps). Per-request
-# body["model_type"] overrides.
-HIDREAM_DTYPE = os.environ.get("HIDREAM_DTYPE", "bf16").strip().lower()  # bf16|fp32
-# Max output long-edge (px); clamp request/ref dims to this.
-HIDREAM_MAX_SIDE = int(os.environ.get("HIDREAM_MAX_SIDE", "2048"))
-# Default steps / guidance for T2I when the request doesn't provide them.
-HIDREAM_STEPS = int(os.environ.get("HIDREAM_STEPS", "50"))
-HIDREAM_GUIDANCE = float(os.environ.get("HIDREAM_GUIDANCE", "5.0"))
+#
+# These are intentionally HARDCODED, not env-driven — the worker always runs
+# the expected recipe. Workers should not be able to change steps/guidance at a
+# fleet level; a per-request body override is the only knob (see _resolve_steps
+# / the /image & /edit handlers).
+HIDREAM_ROOT = "/models/image/hidream"
+HIDREAM_DTYPE = "bf16"  # bf16|fp32
+HIDREAM_MAX_SIDE = 2048  # Max output long-edge (px); clamp request/ref dims.
+# Default steps / guidance for T2I when the request provides neither explicit
+# steps nor a quality name (fast=20 / balanced=28 / high=50 live in
+# HIDREAM_STEP_PRESETS in inference.py).
+HIDREAM_STEPS = 50
+HIDREAM_GUIDANCE = 5.0
 
 # Default number of Qwen-Image-Layered denoise steps when the request doesn't
 # specify num_inference_steps. Quality presets map to: Fast=25, Balanced=30,
