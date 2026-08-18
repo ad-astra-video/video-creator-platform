@@ -129,7 +129,11 @@ services:
       # explicit index to pin it.
       - GPU_DEVICE=${GPU_DEVICE:-}
       - LIVE_RUNNER_URL=${LIVE_RUNNER_URL:-http://live-runner:8991}
-      - LTX25_VARIANT=${LTX25_VARIANT:-}
+      # Default =bf16 so LTX-2.5 loads the bf16 transformer via fp8-cast. Empty
+      # auto-selects NVFP4 on Blackwell, which ltx-pipelines CANNOT load (dims are
+      # half the model's -> safetensors size-mismatch). bf16+fp8-cast is the only
+      # loadable path at this ltx-pipelines rev.
+      - LTX25_VARIANT=${LTX25_VARIANT:-bf16}
       - WORKER_TOKEN=${WORKER_TOKEN:-}
       - PORT=8991
       - LORA_CACHE_DIR=${LORA_CACHE_DIR:-/models/loras}
