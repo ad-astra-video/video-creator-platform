@@ -104,6 +104,33 @@ async def handle_health(_request: web.Request) -> web.Response:
     })
 
 
+async def handle_info(_request: web.Request) -> web.Response:
+    """GET /video-creator/v1/info — worker liveness + GPU ownership.
+
+    Uniform with the image/ltx/idv2v workers so the live-runner's scheduler can
+    reconcile the advisory GPU map from every worker. ``device_in_use`` is the
+    PHYSICAL GPU index this container is pinned to (from GEMMA_RESIDENT_GPU):
+    because CUDA_VISIBLE_DEVICES pins the container to one card, the in-container
+    index is always 0, so the LOCAL index would be wrong for the scheduler. When
+    gemma is a shared/evictable idle slot (GEMMA_GPU_DEVICE blank, no dedicated
+    card), it owns no single GPU -> device_in_use is None so the scheduler never
+    pins a card to it.
+    """
+    llm = _get_llm()
+    return web.json_response({
+        "app": "video-creator",
+        "model": MODEL_NAME,
+        "ready": llm.is_ready,
+        "model_loaded": llm.is_ready,
+        "device": config.GEMMA_GPU_DEVICE or "shared",
+        "main_gpu": config.gemma_device_index(),
+        "dedicated": config.is_dedicated_gpu(),
+        "devices_visible": 1,
+        # Physical card owned (dedicated pin) or None (shared/evictable).
+        "device_in_use": config.GEMMA_PHYSICAL_GPU if config.is_dedicated_gpu() else None,
+    })
+
+
 
 
 # The rubric used to ask Gemma how many semantic layers an image decomposes into.
@@ -295,6 +322,9 @@ def create_app() -> web.Application:
     app.router.add_get("/health", handle_health)
     app.router.add_post("/load", handle_load)
     app.router.add_post("/evict", handle_evict)
+    # Uniform /info for the live-runner's scheduler reconcile (reports the
+    # physical pinned GPU as device_in_use; root + namespaced aliases).
+    app.router.add_get("/video-creator/v1/info", handle_info)
     # Inference under the uniform /video-creator/v1/{endpoint} + legacy /v1.
     app.router.add_post("/v1/prompt-enhance", handle_prompt_enhance)
     app.router.add_post("/video-creator/v1/prompt-enhance", handle_prompt_enhance)

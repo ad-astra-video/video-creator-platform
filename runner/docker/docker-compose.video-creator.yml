@@ -215,6 +215,10 @@ services:
       # GPU is visible inside this container, it remaps to device index 0, so
       # GEMMA_GPU_DEVICE must be "0" (not the physical index) here.
       - CUDA_VISIBLE_DEVICES=${GEMMA_RESIDENT_GPU:-0}
+      # Physical host GPU index this container is pinned to (reported as
+      # device_in_use via /info so the live-runner scheduler knows which card it
+      # owns; CUDA_VISIBLE_DEVICES remaps it to cuda:0 inside the container).
+      - GEMMA_RESIDENT_GPU=${GEMMA_RESIDENT_GPU:-0}
       # PyAV Vulkan hw decode: mount host Vulkan ICD + video codec libs. Must be
       # 'all' (not a compute+graphics+video subset): the NVIDIA Vulkan ICD
       # (libGLX_nvidia, a GLX lib) needs the DISPLAY-capability libs to initialize

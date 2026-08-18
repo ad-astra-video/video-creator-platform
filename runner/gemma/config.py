@@ -35,6 +35,12 @@ GEMMA_MMPROJ = os.environ.get("GEMMA_MMPROJ", "")
 # ── GPU ──────────────────────────────────────────────────────────────────────
 # BLANK = shared video GPU (evictable idle slot); SET = dedicated (never evict).
 GEMMA_GPU_DEVICE = os.environ.get("GEMMA_GPU_DEVICE", "")
+# PHYSICAL GPU index this container is pinned to (host-visible index, NOT the
+# remapped cuda:0). The live-runner threads this in from GEMMA_RESIDENT_GPU; it
+# is the value gemma-worker reports as device_in_use so the scheduler knows which
+# physical card it owns. (Because CUDA_VISIBLE_DEVICES pins the container to one
+# card, the in-container index is always 0 regardless of host index.)
+GEMMA_PHYSICAL_GPU = int(os.environ.get("GEMMA_RESIDENT_GPU", "0") or 0)
 # llama.cpp layers to offload to the GPU. -1 = all (dedicated GPU, fastest);
 # 0 = CPU-only (safe on a contended shared GPU). Overridable per deployment.
 GEMMA_N_GPU_LAYERS = int(os.environ.get("GEMMA_N_GPU_LAYERS", "-1"))
