@@ -30,10 +30,11 @@ RUN pip install --no-cache-dir -r /tmp/runner-requirements.txt
 RUN pip install --no-cache-dir \
     torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# LTX core + pipelines from the LTX-2 repo (same rev the desktop backend pins).
+# LTX core + pipelines from the LTX-2 repo (pinned to the ModelPaths-era rev that
+# adds LTX-2.5 support; earlier rev 93777581 has no ModelPaths API and cannot load 2.5).
 RUN pip install --no-cache-dir \
-    "git+https://github.com/Lightricks/LTX-2.git@9377758131b1ffde4b7f766804590a6617bf2ab9#subdirectory=packages/ltx-core" \
-    "git+https://github.com/Lightricks/LTX-2.git@9377758131b1ffde4b7f766804590a6617bf2ab9#subdirectory=packages/ltx-pipelines"
+    "git+https://github.com/Lightricks/LTX-2.git@fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca#subdirectory=packages/ltx-core" \
+    "git+https://github.com/Lightricks/LTX-2.git@fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca#subdirectory=packages/ltx-pipelines"
 
 # Diffusers for image generation (Z-Image-Turbo)
 RUN pip install --no-cache-dir diffusers accelerate
