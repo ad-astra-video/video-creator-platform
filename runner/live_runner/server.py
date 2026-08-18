@@ -691,6 +691,25 @@ async def handle_generic(req: web.Request) -> web.Response:
 
     await _ev("accepted", {"endpoint": endpoint})
 
+    # Keep-alive heartbeat: proxies (Cloudflare / go-livepeer) tear down an idle
+    # SSE stream after ~30-60s with no bytes, and a cold model load (wm.ensure ->
+    # /load) or any quiet leg produces NO progress frames. Emit an SSE comment
+    # every 10s so the connection always has regular flow until the terminal event.
+    stop_beat = asyncio.Event()
+    async def _heartbeat() -> None:
+        while not stop_beat.is_set():
+            try:
+                await asyncio.wait_for(stop_beat.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+            if stop_beat.is_set():
+                break
+            try:
+                await resp.write(b": keepalive\n\n")
+            except Exception:
+                return
+    beat = asyncio.create_task(_heartbeat())
+
     _in_flight += 1
     _last_activity = time.monotonic()
     try:
@@ -732,6 +751,8 @@ async def handle_generic(req: web.Request) -> web.Response:
         return resp
     finally:
         _in_flight -= 1
+        stop_beat.set()
+        beat.cancel()
 
     if out.status >= 400:
         await _ev("error", {"error": out.text or f"worker error {out.status}"})
