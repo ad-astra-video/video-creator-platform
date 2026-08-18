@@ -38,7 +38,7 @@ from runner.ltx.config import (
     WARMUP,
     worker_token,
 )
-from runner.ltx.gpu_profile import build_profile
+from runner.ltx.gpu_profile import build_profile, STREAMING_MIN_GB
 from runner.ltx.inference import VideoCreatorInferenceEngine
 from runner.ltx.loracache import LoraCache
 
@@ -63,6 +63,60 @@ engine: VideoCreatorInferenceEngine | None = None
 gpu_profile = None
 registration = None
 ready = False
+
+
+def _pick_video_device(preferred: int) -> int:
+    """Choose the CUDA device the video pipeline warms up on.
+
+    An explicit ``GPU_DEVICE`` env always wins (operator-pinned). Otherwise,
+    auto-select the card with the most free VRAM so a video worker lands on an
+    *unused* GPU instead of always GPU 0 (which the image worker may be holding
+    warm). This is the device-aware fallback for the video workers, which the
+    scheduler does not steer the way it does the image/gemma workers.
+
+    Only reads ``nvidia-smi --query-gpu=memory.free`` — no CUDA context is
+    allocated — so it works even while another worker has a model resident on a
+    card. Cards too small to host the video model (< 15 GiB total) are skipped.
+    """
+    env = os.environ.get("GPU_DEVICE", "").strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            logger.warning("GPU_DEVICE=%r not an int; will auto-select", env)
+
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            best_idx, best_free = None, -1
+            for line in r.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                try:
+                    idx = int(parts[0])
+                    free_mib = int(parts[1])
+                    total_mib = int(parts[2])
+                except ValueError:
+                    continue
+                if total_mib < (STREAMING_MIN_GB * 1024):
+                    logger.info("GPU %d: total %.1f GiB < %.0f GiB minimum -- skipping",
+                                idx, total_mib / 1024, STREAMING_MIN_GB)
+                    continue
+                if free_mib > best_free:
+                    best_idx, best_free = idx, free_mib
+            if best_idx is not None:
+                logger.info("Auto-selected GPU %d (%.0f MiB free) as the idlest video card",
+                            best_idx, best_free)
+                return best_idx
+        logger.warning("nvidia-smi unusable for auto-select; falling back to GPU %d", preferred)
+    except Exception as exc:
+        logger.warning("Auto GPU selection failed (%s); falling back to GPU %d", exc, preferred)
+    return preferred
+
 
 # Serializes generation: the single GPU can only run one generation at a time,
 # and with handlers now dispatching to a thread pool, concurrent requests must
@@ -863,21 +917,26 @@ async def on_startup(_app: web.Application) -> None:
     global engine, ready, gpu_profile
     _warn_if_low_host_ram()
 
+    # Pick the CUDA device this worker warms up on. An explicit GPU_DEVICE env
+    # always wins; otherwise auto-select the idlest (most-free-VRAM) card so a
+    # video worker doesn't collide with the image worker's warm model on GPU 0.
+    video_device = _pick_video_device(GPU_DEVICE)
+
     # Detect GPU and build the VRAM-aware profile (4090 = streaming/24GB,
     # 5090 = full-resident/32GB, RTX PRO 6000 = full-resident/96GB).
-    gpu_profile = build_profile(GPU_DEVICE, GPU_VRAM_GB, GPU_NAME)
+    gpu_profile = build_profile(video_device, GPU_VRAM_GB, GPU_NAME)
     if not gpu_profile.supports_generation:
         logger.error(
             "GPU[%d] %.1f GiB below the %d GiB minimum — generation will fail. "
             "Set GPU_VRAM_GB to bypass.",
-            GPU_DEVICE, gpu_profile.vram_gb, 15,
+            video_device, gpu_profile.vram_gb, 15,
         )
     logger.info("GPU: %s (%.1f GB VRAM, mode=%s)",
                 gpu_profile.gpu_name, gpu_profile.vram_gb, gpu_profile.mode)
 
     # Load inference engine. Prompt enhancement may run on a separate GPU
     # (ENHANCE_GPU_DEVICE); default to the video pipeline's GPU when unset.
-    device = torch.device(f"cuda:{GPU_DEVICE}")
+    device = torch.device(f"cuda:{video_device}")
     enhance_device = torch.device(f"cuda:{ENHANCE_GPU_DEVICE}") if ENHANCE_GPU_DEVICE else device
     engine = VideoCreatorInferenceEngine(MODEL_CHECKPOINT, TEXT_ENCODER_ROOT, UPSCALER_PATH, device,
                                 profile=gpu_profile, enhance_device=enhance_device)

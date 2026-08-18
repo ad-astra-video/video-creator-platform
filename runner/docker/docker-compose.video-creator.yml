@@ -124,7 +124,10 @@ services:
       - MODEL_CHECKPOINT=${MODEL_CHECKPOINT:-/models/fp8/ltx-2.3-22b-distilled-fp8.safetensors}
       - TEXT_ENCODER_ROOT=${TEXT_ENCODER_ROOT:-/models/gemma}
       - UPSCALER_PATH=${UPSCALER_PATH:-/models/upsampler/ltx-2.3-spatial-upscaler-x2-1.1.safetensors}
-      - GPU_DEVICE=${GPU_DEVICE:-0}
+      # Leave GPU_DEVICE unset by default so the worker auto-selects the idlest
+      # (most-free-VRAM) card at warmup (see server._pick_video_device). Set an
+      # explicit index to pin it.
+      - GPU_DEVICE=${GPU_DEVICE:-}
       - LTX25_VARIANT=${LTX25_VARIANT:-}
       - WORKER_TOKEN=${WORKER_TOKEN:-}
       - PORT=8991
