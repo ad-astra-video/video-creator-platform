@@ -130,7 +130,29 @@ export function getVideoGenerationModelSpecs(
 ): VideoGenerationModelSpecItem[] {
   const { useApiSpecs } = options
   if (!specs) return []
-  return useApiSpecs ? specs.api_models : specs.local_models
+  const list = useApiSpecs ? specs.api_models : specs.local_models
+  return inheritLimitsFromFast(list)
+}
+
+/**
+ * Materialize model specs that omit their own resolution/fps/duration matrix by
+ * ALIASING the "fast" (LTX-2.3) limits -- same 22B fp8-cast footprint, same VRAM
+ * budget. The runner advertises LTX-2.5 as a minimal marker (display_name only, no
+ * matrix) to keep the orchestrator heartbeat metadata under its 1024-byte cap; here
+ * we give it the full 2.3 matrix client-side so the options picker works identically.
+ * Models that do carry their own matrix pass through untouched.
+ */
+function inheritLimitsFromFast(
+  modelSpecs: VideoGenerationModelSpecItem[],
+): VideoGenerationModelSpecItem[] {
+  const fast = modelSpecs.find((item) => item.pipeline === 'fast')
+  if (!fast) return modelSpecs
+  const fastLimits = fast.spec.supported_resolutions_durations
+  return modelSpecs.map((item) => {
+    if (item.pipeline === 'fast') return item
+    if (item.spec.supported_resolutions_durations) return item
+    return { ...item, spec: { ...item.spec, supported_resolutions_durations: fastLimits } }
+  })
 }
 
 export function resolveVideoGenerationOptions<T extends VideoGenerationSettingsShape>({

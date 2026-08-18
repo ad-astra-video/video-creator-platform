@@ -143,6 +143,15 @@ def build_model_specs(vram_mb: int) -> list[dict]:
         }
         for res in resolutions
     }
+    # LTX-2.5 companion entry. The 2.5 transformer rides the SAME 22B fp8-cast weights as
+    # 2.3 and the SAME VRAM/activation budget, so it uses the IDENTICAL resolution / fps /
+    # duration limits -- but we do NOT duplicate the matrix here: the whole model_specs blob
+    # rides the orchestrator heartbeat metadata, which go-livepeer caps at 1024 bytes, and a
+    # second full matrix would blow past it (1043 bytes vs the cap). Instead we advertise a
+    # minimal 2.5 marker and the frontend (video-generation-model-specs.ts) resolves 2.5's
+    # options by ALIASING this "fast" (2.3) limits block -- "mark available, use the 2.3
+    # limits; don't send a separate set of limits" (user direction 2026-08-18). A2V + extend
+    # stay unsupported for 2.5 (the worker routes it, but there's no 2.5 windowed-extend).
     return [
         {
             "pipeline": "fast",
@@ -155,5 +164,14 @@ def build_model_specs(vram_mb: int) -> list[dict]:
                 # Resolution-aware extend ceiling, driven by this GPU's VRAM budget.
                 "extend": build_extend_capability(),
             },
-        }
+        },
+        {
+            "pipeline": "ltx-2.5",
+            "spec": {
+                "display_name": "LTX-2.5 (Runner)",
+                # Intentionally NO supported_resolutions_durations -- the frontend aliases the
+                # "fast" (2.3) limits above (see video-generation-model-specs.ts). Keeping the
+                # matrix here as a duplicate would push the heartbeat metadata over its cap.
+            },
+        },
     ]
