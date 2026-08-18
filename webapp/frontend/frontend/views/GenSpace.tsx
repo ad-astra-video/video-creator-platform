@@ -508,6 +508,24 @@ function formatSeconds(seconds: number): string {
 const DEFAULT_LORA_SCALE = 1.0
 const IMAGE_STEPS_GENERATE = 4
 const IMAGE_STEPS_EDIT = 35 // Balanced default for Qwen-Image-Edit (Fast 25 / Balanced 35 / High 50)
+// HiDream-O1-Image step presets (mirrors runner/image/inference.py HIDREAM_STEP_PRESETS).
+// HiDream is a flow-matching model tuned on the full "author" recipe, so its
+// default quality is High (50) rather than the Z-Image-distilled numbers below.
+const HIDREAM_STEP_PRESETS: Record<'fast' | 'balanced' | 'high', number> = {
+  fast: 20,
+  balanced: 28,
+  high: 50,
+}
+// Z-Image Turbo / FLUX.2 Klein use distilled step counts; kept as name->steps
+// so the QUALITY dropdown can stay model-aware without special-casing.
+const DISTILLED_STEP_PRESETS: Record<'fast' | 'balanced' | 'high', number> = {
+  fast: 4,
+  balanced: 8,
+  high: 12,
+}
+function qualityStepsFor(model: string | undefined, q: 'fast' | 'balanced' | 'high'): number {
+  return (model === 'hidream' ? HIDREAM_STEP_PRESETS : DISTILLED_STEP_PRESETS)[q]
+}
 const DEFAULT_RESTYLE_PROMPT = 'restyle this video'
 
 // Multi-select LoRA picker with a per-LoRA strength slider.
@@ -1242,7 +1260,15 @@ function PromptBar({
               <SettingsDropdown
                 title="MODEL"
                 value={settings.imageEditModel ?? 'qwen-edit'}
-                onChange={(v) => onSettingsChange({ ...settings, imageEditModel: v as 'qwen-edit' | 'klein' | 'hidream' })}
+                onChange={(v) => {
+                  const model = v as 'qwen-edit' | 'klein' | 'hidream'
+                  onSettingsChange({
+                    ...settings,
+                    imageEditModel: model,
+                    // HiDream defaults to High quality (its tuned full recipe).
+                    ...(model === 'hidream' ? { imageEditQuality: 'high' as const } : {}),
+                  })
+                }}
                 options={[
                   { value: 'qwen-edit', label: 'Qwen-Image-Edit' },
                   { value: 'klein', label: 'FLUX.2 klein', disabled: imageMaskActive, tooltip: imageMaskActive ? 'Masks require the inpaint engine — FLUX.2 klein is disabled while an item/layer is selected.' : undefined },
@@ -1262,7 +1288,17 @@ function PromptBar({
               <SettingsDropdown
                 title="MODEL"
                 value={settings.imageModel ?? 'zimage'}
-                onChange={(v) => onSettingsChange({ ...settings, imageModel: v as 'zimage' | 'klein' | 'hidream' })}
+                onChange={(v) => {
+                  const model = v as 'zimage' | 'klein' | 'hidream'
+                  onSettingsChange({
+                    ...settings,
+                    imageModel: model,
+                    // HiDream defaults to High quality (its tuned full recipe);
+                    // snap the step count so the QUALITY dropdown reflects it.
+                    // Other models keep whatever the user had selected.
+                    ...(model === 'hidream' ? { imageSteps: HIDREAM_STEP_PRESETS.high } : {}),
+                  })
+                }}
                 options={[
                   { value: 'zimage', label: 'Z-Image Turbo' },
                   { value: 'klein', label: 'FLUX.2 Klein 4B' },
@@ -1287,7 +1323,7 @@ function PromptBar({
               <>
                 <SettingsDropdown
                   title="QUALITY"
-                  value={settings.imageEditQuality ?? 'balanced'}
+                  value={settings.imageEditQuality ?? (settings.imageEditModel === 'hidream' ? 'high' : 'balanced')}
                   onChange={(v) => onSettingsChange({ ...settings, imageEditQuality: v as 'fast' | 'balanced' | 'high' })}
                   options={[
                     { value: 'fast', label: 'Fast' },
@@ -1297,7 +1333,7 @@ function PromptBar({
                   trigger={
                     <>
                       <Sparkles className="h-3.5 w-3.5" />
-                      <span className="capitalize">{settings.imageEditQuality ?? 'balanced'}</span>
+                      <span className="capitalize">{settings.imageEditQuality ?? (settings.imageEditModel === 'hidream' ? 'high' : 'balanced')}</span>
                     </>
                   }
                 />
@@ -1346,29 +1382,37 @@ function PromptBar({
                   }
                 />
 
-                {/* Quality (inference steps) dropdown */}
-                <SettingsDropdown
-                  title="QUALITY"
-                  value={String(settings.imageSteps || 4)}
-                  onChange={(v) => onSettingsChange({ ...settings, imageSteps: parseInt(v, 10) })}
-                  options={[
-                    { value: '4', label: 'Fast' },
-                    { value: '8', label: 'Balanced' },
-                    { value: '12', label: 'High' },
-                  ]}
-                  trigger={
-                    <>
-                      <Sparkles className="h-3.5 w-3.5" />
-                      <span>
-                        {(settings.imageSteps || 4) >= 12
-                          ? 'High'
-                          : (settings.imageSteps || 4) >= 8
-                            ? 'Balanced'
-                            : 'Fast'}
-                      </span>
-                    </>
-                  }
-                />
+                {/* Quality (inference steps) dropdown — model-aware so HiDream's
+                    full-recipe steps (20/28/50) are offered and shown, not the
+                    Z-Image distilled 4/8/12. */}
+                {(() => {
+                  const qs = (k: 'fast' | 'balanced' | 'high') =>
+                    qualityStepsFor(settings.imageModel, k)
+                  const cur = settings.imageSteps || 4
+                  const label = cur >= qs('high')
+                    ? 'High'
+                    : cur >= qs('balanced')
+                      ? 'Balanced'
+                      : 'Fast'
+                  return (
+                    <SettingsDropdown
+                      title="QUALITY"
+                      value={String(cur)}
+                      onChange={(v) => onSettingsChange({ ...settings, imageSteps: parseInt(v, 10) })}
+                      options={[
+                        { value: String(qs('fast')), label: 'Fast' },
+                        { value: String(qs('balanced')), label: 'Balanced' },
+                        { value: String(qs('high')), label: 'High' },
+                      ]}
+                      trigger={
+                        <>
+                          <Sparkles className="h-3.5 w-3.5" />
+                          <span>{label}</span>
+                        </>
+                      }
+                    />
+                  )
+                })()}
               </>
             )}
           </>
@@ -3230,7 +3274,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     if (mode === 'image') {
       // Layered / region-selective editing via the ImageEditPanel, driven by the prompt bar.
       if (inputImage && imageEditPanelRef.current) {
-        const ok = await imageEditPanelRef.current.runEdit(prompt, { engine: settings.imageEditModel ?? 'qwen-edit', quality: settings.imageEditQuality ?? 'balanced', strength: settings.imageEditStrength ?? 0.55, paddingMaskCrop: settings.imageEditPadding ?? 0, onProgress: (p) => setImageEditProgress(p) })
+        const ok = await imageEditPanelRef.current.runEdit(prompt, { engine: settings.imageEditModel ?? 'qwen-edit', quality: settings.imageEditQuality ?? (settings.imageEditModel === 'hidream' ? 'high' : 'balanced'), strength: settings.imageEditStrength ?? 0.55, paddingMaskCrop: settings.imageEditPadding ?? 0, onProgress: (p) => setImageEditProgress(p) })
         if (ok) return
         // No capable runner / no edit — fall through to the standard image rail.
       }
