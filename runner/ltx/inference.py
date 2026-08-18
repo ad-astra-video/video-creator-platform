@@ -522,6 +522,25 @@ class VideoCreatorInferenceEngine:
         from ltx_core.model.video_vae import TilingConfig
         return TilingConfig.default()
 
+    def tiling_config_for(self, pipe) -> Any:
+        """Pick a decode tiling config for the given pipeline.
+
+        LTX-2.3 uses the classic conv video VAE and works with ``TileSizeConfig.default()``
+        (temporal overlap 24). LTX-2.5 uses a diffusion video VAE whose decoder requires a
+        larger minimum temporal overlap (40 frames); the ltx-pipelines pipeline
+        auto-recommends DiffVAE-appropriate tiling when handed the ``AUTO_TILING`` sentinel,
+        so we pass that for the 2.5 pipeline and let it resolve (the pipeline returns the
+        resolved config, which chunking uses). Returns ``AUTO_TILING`` for the 2.5 pipeline,
+        ``TileSizeConfig.default()`` otherwise.
+        """
+        if pipe is self._pipeline25:
+            try:
+                from ltx_core.model.video_vae import AUTO_TILING
+                return AUTO_TILING
+            except Exception:
+                pass
+        return self.default_tiling_config()
+
     @staticmethod
     def video_chunks_number(num_frames: int, tiling_config) -> int:
         from ltx_core.model.video_vae import get_video_chunks_number
@@ -643,7 +662,7 @@ class VideoCreatorInferenceEngine:
             self.set_loras(loras)
         pipe = self._ensure_pipeline(model=model)
         num_frames = self.snap_frames_to_grid(num_frames, pipe)
-        tiling_config = self.default_tiling_config()
+        tiling_config = self.tiling_config_for(pipe)
 
         video, audio, out_frames, out_tiling = self._call_pipeline(
             pipe,
@@ -701,7 +720,7 @@ class VideoCreatorInferenceEngine:
             start_img.save(tmp_img.name, format="PNG")
             tmp_img.close()
 
-            tiling_config = self.default_tiling_config()
+            tiling_config = self.tiling_config_for(pipe)
 
             video, audio, out_frames, out_tiling = self._call_pipeline(
                 pipe,
