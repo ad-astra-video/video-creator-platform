@@ -515,6 +515,26 @@ class VideoCreatorInferenceEngine:
         from ltx_core.model.video_vae import get_video_chunks_number
         return int(get_video_chunks_number(num_frames, tiling_config))
 
+    def snap_frames_to_grid(self, num_frames: int, pipe=None) -> int:
+        """Round ``num_frames`` down to the VAE temporal grid (k*time+1).
+
+        The ModelPaths-era ltx-pipelines enforces ``(frames-1) % scale.time == 0`` for
+        generation (LTX-2.3: time=8; LTX-2.5: time=2). Raw ``duration * fps`` values like
+        120 are off-grid and are rejected deep in VAE validation, so we snap here based on
+        the loaded pipeline's decoder checkpoint.
+        """
+        pipe = pipe or self._pipeline
+        try:
+            from ltx_pipelines.utils.helpers import snap_frames_to_grid, tiling_scale_factors_for_vae
+            cp = pipe.video_decoder.checkpoint_path
+            scale = tiling_scale_factors_for_vae(cp)
+            snapped = int(snap_frames_to_grid(num_frames, scale))
+            if snapped != num_frames:
+                logger.info("Snapping video frames %d -> %d (VAE grid %s)", num_frames, snapped, scale)
+            return snapped
+        except Exception:
+            return num_frames
+
     @staticmethod
     def encode_video_output(
         video: torch.Tensor,
@@ -610,6 +630,7 @@ class VideoCreatorInferenceEngine:
         if loras is not None:
             self.set_loras(loras)
         pipe = self._ensure_pipeline(model=model)
+        num_frames = self.snap_frames_to_grid(num_frames, pipe)
         tiling_config = self.default_tiling_config()
 
         video, audio, out_frames, out_tiling = self._call_pipeline(
@@ -656,6 +677,7 @@ class VideoCreatorInferenceEngine:
         if loras is not None:
             self.set_loras(loras)
         pipe = self._ensure_pipeline(model=model)
+        num_frames = self.snap_frames_to_grid(num_frames, pipe)
 
         # Decode base64, reflect-pad to the exact generation dims (no centre-crop).
         img_bytes = base64.b64decode(image_base64)
