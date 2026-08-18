@@ -160,7 +160,7 @@ def build_model_specs(vram_mb: int) -> list[dict]:
         {
             "pipeline": "fast",
             "spec": {
-                "display_name": "LTX-2.3 (Runner)",
+                "display_name": "LTX-2.3",
                 "supported_resolutions_durations": supported,
                 # A2V is advertised as unsupported via the ABSENCE of an a2v_* key (the frontend
                 # falls back to supported_resolutions_durations); an explicit null key is omitted
@@ -172,7 +172,7 @@ def build_model_specs(vram_mb: int) -> list[dict]:
         {
             "pipeline": "ltx-2.5",
             "spec": {
-                "display_name": "LTX-2.5 (Runner)",
+                "display_name": "LTX-2.5",
                 # Intentionally NO supported_resolutions_durations -- the frontend aliases the
                 # "fast" (2.3) limits above (see video-generation-model-specs.ts). Keeping the
                 # matrix here as a duplicate would push the heartbeat metadata over its cap.
