@@ -181,6 +181,36 @@ async def handle_scheduler_status(req: web.Request) -> web.Response:
     return web.json_response(_scheduler.status())
 
 
+async def handle_gpu_pick(req: web.Request) -> web.Response:
+    """POST /video-creator/v1/gpu-pick — assign a free GPU to a worker at boot.
+
+    Worker-token protected. The caller (a worker container, at startup) sends
+    ``{"worker": "ltx-worker"}``; we ask the scheduler to authoritatively pick
+    (and reserve) a free GPU for it using the same warm-reuse -> idle ->
+    LRU-evict policy as request dispatch. This is the source of truth for which
+    card is actually free: it's reconciled from every worker's /info, so it
+    knows the image worker holds GPU 0 even though that model loads lazily (and
+    would look "free" to a local nvidia-smi at ltx-worker boot time).
+    Returns ``{"worker": ..., "gpu": <idx>}``.
+    """
+    if req.headers.get("X-Worker-Token", "") != config.worker_token():
+        raise web.HTTPForbidden(reason="missing/mismatched X-Worker-Token")
+    if _scheduler is None:
+        raise web.HTTPServiceUnavailable(reason="live-runner not ready")
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    worker = str(body.get("worker") or "").strip()
+    if not worker:
+        return web.json_response({"error": "missing 'worker'"}, status=400)
+    try:
+        gpu = await _scheduler.pick_for_worker(worker)
+    except QueueTimeout as exc:
+        return web.json_response({"error": str(exc)}, status=503)
+    return web.json_response({"worker": worker, "gpu": gpu})
+
+
 async def _client_stage(info: dict):
     """Map an idv2v worker progress payload to a client-facing stage/message pair."""
     st = info.get("stage", "generating")
@@ -942,6 +972,7 @@ def create_app() -> web.Application:
     app.router.add_get(f"{p}/health", handle_health)
     app.router.add_get(f"{p}/info", handle_info)
     app.router.add_get(f"{p}/scheduler/status", handle_scheduler_status)
+    app.router.add_post(f"{p}/gpu-pick", handle_gpu_pick)
     # One parameterized route so handle_generic can read the endpoint from
     # match_info["endpoint"] and look it up in ROUTES. (Previously these were
     # registered as static paths with no {endpoint} placeholder, so match_info

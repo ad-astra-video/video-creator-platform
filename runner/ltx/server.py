@@ -21,6 +21,7 @@ from aiohttp import web
 
 from runner.ltx import enhance_forward
 from runner.ltx.config import (
+    LIVE_RUNNER_URL,
     ENHANCE_FORWARD_API_KEY,
     IDV2V_WORKER_URL,
     ENHANCE_FORWARD_MODEL,
@@ -65,18 +66,19 @@ registration = None
 ready = False
 
 
-def _pick_video_device(preferred: int) -> int:
+async def _pick_video_device(preferred: int) -> int:
     """Choose the CUDA device the video pipeline warms up on.
 
-    An explicit ``GPU_DEVICE`` env always wins (operator-pinned). Otherwise,
-    auto-select the card with the most free VRAM so a video worker lands on an
-    *unused* GPU instead of always GPU 0 (which the image worker may be holding
-    warm). This is the device-aware fallback for the video workers, which the
-    scheduler does not steer the way it does the image/gemma workers.
+    An explicit ``GPU_DEVICE`` env always wins (operator-pinned). Otherwise, ask
+    the live-runner's authoritative ``/gpu-pick`` endpoint (which owns the GPU
+    scheduler and reconciles real ownership from every worker's /info) which
+    card is free for us — this is the source of truth, and it knows the image
+    worker holds GPU 0 even though that model loads lazily (so a local nvidia-smi
+    would wrongly see GPU 0 as "free" at ltx-worker boot time).
 
-    Only reads ``nvidia-smi --query-gpu=memory.free`` — no CUDA context is
-    allocated — so it works even while another worker has a model resident on a
-    card. Cards too small to host the video model (< 15 GiB total) are skipped.
+    Falls back to local ``nvidia-smi memory.free`` (idlest card) only if the
+    live-runner isn't reachable / not configured. No CUDA context is allocated
+    in either path, so it works while other workers have models resident.
     """
     env = os.environ.get("GPU_DEVICE", "").strip()
     if env:
@@ -85,6 +87,33 @@ def _pick_video_device(preferred: int) -> int:
         except ValueError:
             logger.warning("GPU_DEVICE=%r not an int; will auto-select", env)
 
+    # 1) Authoritative: ask the live-runner scheduler for a free GPU.
+    lr = LIVE_RUNNER_URL
+    if lr:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{lr}/video-creator/v1/gpu-pick",
+                    json={"worker": "ltx-worker"},
+                    headers={"X-Worker-Token": worker_token()},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        gpu = data.get("gpu")
+                        if isinstance(gpu, int) and gpu >= 0:
+                            logger.info("Live-runner assigned GPU %d to ltx-worker",
+                                        gpu)
+                            return gpu
+                    logger.warning(
+                        "live-runner gpu-pick returned %s; falling back to local select",
+                        resp.status,
+                    )
+        except Exception as exc:
+            logger.warning("live-runner gpu-pick failed (%s); falling back to local select", exc)
+
+    # 2) Fallback: pick the idlest (most free VRAM) card from nvidia-smi.
     import subprocess
     try:
         r = subprocess.run(
@@ -920,7 +949,7 @@ async def on_startup(_app: web.Application) -> None:
     # Pick the CUDA device this worker warms up on. An explicit GPU_DEVICE env
     # always wins; otherwise auto-select the idlest (most-free-VRAM) card so a
     # video worker doesn't collide with the image worker's warm model on GPU 0.
-    video_device = _pick_video_device(GPU_DEVICE)
+    video_device = await _pick_video_device(GPU_DEVICE)
 
     # Detect GPU and build the VRAM-aware profile (4090 = streaming/24GB,
     # 5090 = full-resident/32GB, RTX PRO 6000 = full-resident/96GB).

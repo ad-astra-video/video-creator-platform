@@ -139,6 +139,10 @@ def ltx25_spatial_upscaler_path() -> str:
 if UPSCALER_PATH:
     os.environ.setdefault("UPSCALER_PATH", UPSCALER_PATH)
 GPU_DEVICE = int(os.environ.get("GPU_DEVICE", "0"))
+# The live-runner edge that owns the GPU scheduler. When unset, the worker
+# auto-selects the idlest card locally (nvidia-smi); when set, the worker asks
+# the live-runner's authoritative /gpu-pick endpoint for a free GPU at warmup.
+LIVE_RUNNER_URL = os.environ.get("LIVE_RUNNER_URL", "").strip()
 PORT = int(os.environ.get("PORT", "8991"))
 WARMUP = os.environ.get("WARMUP", "true").lower() == "true"
 PRICE = float(os.environ.get("PRICE", "0.5"))

@@ -220,6 +220,44 @@ class GPUScheduler:
                 best = s
         return best.gpu_id if best is not None else None
 
+    async def pick_for_worker(self, worker: str) -> int:
+        """Authoritatively assign a GPU to ``worker`` at startup/warmup.
+
+        Same warm-reuse -> idle -> LRU-evict policy as :meth:`acquire`, but
+        called ONCE from the worker's own boot (via the live-runner's gpu-pick
+        endpoint) so it lands on a genuinely free card instead of guessing from
+        a local nvidia-smi (which races the lazy image-worker load). Marks the
+        slot resident for ``worker``, so the first request-time ``acquire()``
+        reuses it (no reload). Raises ``QueueTimeout`` if nothing can be freed
+        within the deadline.
+        """
+        async with self._cond:
+            deadline = time.monotonic() + self.queue_timeout_s
+            while True:
+                warm = self._warm_gpu_of(worker)
+                if warm is not None:
+                    self._claim(warm, worker)
+                    logger.info("GPU pick: %s reuses warm GPU %d", worker, warm.gpu_id)
+                    return warm.gpu_id
+                idle = self._pick_idle_gpu()
+                if idle is not None:
+                    self._claim(idle, worker)
+                    logger.info("GPU pick: %s -> idle GPU %d", worker, idle.gpu_id)
+                    return idle.gpu_id
+                victim = self._pick_lru_victim(exclude=worker)
+                if victim is not None:
+                    await self._evict_slot(self._slot(victim), worker)
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise QueueTimeout(
+                        f"no GPU free for {worker} within {self.queue_timeout_s:.0f}s")
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise QueueTimeout(
+                        f"no GPU free for {worker} within {self.queue_timeout_s:.0f}s")
+
     async def release(self, worker: str, gpu_id: int) -> None:
         """Task done: keep the model WARM on ``gpu_id`` (no co-load next time);
         the slot goes idle-but-resident so another worker can evict it if needed."""
