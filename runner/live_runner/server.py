@@ -44,6 +44,9 @@ _ready = False
 _scheduler: GPUScheduler | None = None  # Plan B — one task -> one GPU, concurrent across GPUs
 _in_flight = 0        # active request counter (idle-backfill gate)
 _last_activity = 0.0  # monotonic ts of last request (idle-backfill grace)
+# monotonic ts of the last successful worker-availability reconcile (used by
+# gpu-pick to ensure it never assigns a GPU off a stale/not-yet-polled map).
+_last_worker_reconcile = 0.0
 
 # Plan B deployment guard: only workers that HONOR the device field from the
 # /load body (they are on their own dedicated GPU and stay resident there) get
@@ -204,6 +207,14 @@ async def handle_gpu_pick(req: web.Request) -> web.Response:
     worker = str(body.get("worker") or "").strip()
     if not worker:
         return web.json_response({"error": "missing 'worker'"}, status=400)
+    # Never assign a GPU off a stale/empty map: if we haven't polled the workers
+    # in the last heartbeat interval, poll them now. A worker that errors on the
+    # poll is DOWN and gets no GPU (reconcile frees its previous card).
+    if time.monotonic() - _last_worker_reconcile > config.HEARTBEAT_INTERVAL_S:
+        try:
+            await _reconcile_from_live_workers()
+        except Exception as exc:
+            logger.warning("gpu-pick reconcile failed (%s); continuing", exc)
     try:
         gpu = await _scheduler.pick_for_worker(worker)
     except QueueTimeout as exc:
@@ -827,6 +838,31 @@ async def handle_namespaced(req: web.Request) -> web.Response:
         _in_flight -= 1
 
 
+async def _reconcile_from_live_workers() -> None:
+    """Fix the advisory GPU map from each worker's live /info.
+
+    Polls every configured worker. A worker whose /info errors or times out is
+    treated as DOWN: it is left OUT of ``w_info``, so ``reconcile()`` frees any
+    GPU it previously held — a down worker must never lock a card (the caller
+    would round-robin to it and wedge). Recorded so ``gpu-pick`` can tell whether
+    the map was built off a live poll or is stale/unpolled.
+
+    Safe to re-run anytime (startup, before _ready; and on-demand from gpu-pick).
+    """
+    global _last_worker_reconcile
+    if _scheduler is None or _session is None:
+        return
+    w_info: dict = {}
+    for _name, _url in config.WORKERS.items():
+        _info = await _fetch_worker_info(_session, _url)
+        if _info is not None:
+            w_info[_name] = _info
+    await _scheduler.reconcile(w_info)
+    _last_worker_reconcile = time.monotonic()
+    logger.info("Reconciled GPU map from live workers (up=%s): %s",
+                sorted(w_info), _scheduler.status()["gpus"])
+
+
 async def on_startup(_app: web.Application) -> None:
     global _session, _worker_manager, _registration, _ready, _scheduler
     _session = aiohttp.ClientSession()
@@ -886,6 +922,11 @@ async def on_startup(_app: web.Application) -> None:
 
     # Refresh heartbeat metadata each beat from the swap policy + live worker /health.
     asyncio.create_task(_refresh_metadata_loop())
+    # Seed the advisory GPU map from live worker /info BEFORE anything can claim
+    # a card. On a restart the map starts empty; without this the ltx pick (or a
+    # task acquire) could grab GPU 0 while the image worker is already warm on it
+    # (the image model loads lazily and would look "free" to a local nvidia-smi).
+    await _reconcile_from_live_workers()
     # Plan B: load gemma-worker resident on GEMMA_RESIDENT_GPU and keep it there;
     # the scheduler holds that GPU out of the task pool. Fail-safe: the edge
     # boots even if gemma is down.
