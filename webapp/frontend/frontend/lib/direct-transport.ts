@@ -27,6 +27,20 @@ function fetchWithTimeout(ms: number): RequestInit['signal'] {
     : undefined
 }
 
+// 503 (Service Unavailable) retry policy — a runner returns 503 when it has no free GPU
+// (scheduler queue timeout) or its engine isn't loaded yet; both are transient and worth
+// waiting out with exponential backoff before surfacing a failure. Resolve early on abort.
+const MAX_503_RETRIES = 5
+const MAX_503_BACKOFF_MS = 5000
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve()
+    const onAbort = () => { clearTimeout(timer); resolve() }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 // Task -> runner endpoint (must match the live-runner /video-creator/v1 route table that the
 // runner service exposes. See orchestrator.ts TASK_ENDPOINTS — we mirror the same shape here
 // so the browser can POST to the runner directly).
@@ -297,6 +311,8 @@ export async function editImageViaRunner(
           try { msg = String((JSON.parse(data) as { error?: unknown }).error ?? msg) } catch { /* keep default */ }
           reject(new Error(msg))
         }
+      }).then(() => {
+        if (!settled) { settled = true; reject(new Error('Runner SSE connection closed before it completed')) }
       }).catch((e) => {
         if (!settled) { settled = true; reject(e instanceof Error ? e : new Error(String(e))) }
       })
@@ -471,6 +487,8 @@ export async function layerImageViaRunner(
         try { msg = String((JSON.parse(data) as { error?: unknown }).error ?? msg) } catch { /* keep default */ }
         reject(new Error(msg))
       }
+    }).then(() => {
+      if (!settled) { settled = true; reject(new Error('Runner SSE connection closed before it completed')) }
     }).catch((e) => {
       if (!settled) { settled = true; reject(e instanceof Error ? e : new Error(String(e))) }
     })
@@ -563,6 +581,36 @@ export async function postToRunnerWithTicket(
         'demo placeholder (DEMO_RUNNERS) — a real Livepeer orchestrator runner is required for paid generation.',
     )
   }
+  // When a runner returns 503 (Service Unavailable — no free GPU / engine not loaded yet),
+  // retry with exponential backoff (0.5s, 1s, 2s, 4s, then capped at 5s) before giving up.
+  // Every retry re-runs the full payment handshake so each attempt gets a freshly signed
+  // ticket for its own manifest. Non-503 responses are returned immediately.
+  let retries = 0
+  for (;;) {
+    const res = await attemptInference(runner, task, body, opts)
+    if (res.status === 503 && retries < MAX_503_RETRIES && !opts?.signal?.aborted) {
+      retries++
+      const delayMs = Math.min(MAX_503_BACKOFF_MS, 500 * 2 ** (retries - 1))
+      logger.info(`[direct] ${task} 503 (retry ${retries}/${MAX_503_RETRIES}); backing off ${delayMs}ms`)
+      // Free the rejected response so the connection can be reused before the next attempt.
+      try { await res.body?.cancel() } catch { /* best-effort */ }
+      await sleep(delayMs, opts?.signal)
+      continue
+    }
+    return res
+  }
+}
+
+/**
+ * One attempt of the Livepeer payment handshake -> the final orchestrator-proxied runner
+ * Response (which may be a 503 — postToRunnerWithTicket decides whether to retry).
+ */
+async function attemptInference(
+  runner: RunnerDto,
+  task: string,
+  body: unknown,
+  opts?: { signal?: AbortSignal; sse?: boolean },
+): Promise<Response> {
   // sse=1 rides the query string so it survives the go-livepeer reverse proxy
   // (it copies RawQuery) and tells the runner to answer as text/event-stream.
   let url = runner.url.replace(/\/+$/, '') + endpointForTask(task)
@@ -786,6 +834,10 @@ export async function postRunnerTaskWithTicketSSE(
         try { msg = String((JSON.parse(data) as { error?: unknown }).error ?? msg) } catch { /* keep default */ }
         reject(new Error(msg))
       }
+    }).then(() => {
+      // Stream ended without a terminal complete/error event — connection dropped
+      // (proxy idle timeout, runner exit) — surface a clear error instead of hanging.
+      if (!settled) { settled = true; reject(new Error('Runner SSE connection closed before it completed')) }
     }).catch((e) => {
       if (!settled) { settled = true; reject(e instanceof Error ? e : new Error(String(e))) }
     })
