@@ -60,6 +60,11 @@ SKIP_SAM3 = os.environ.get("IDV2V_SKIP_SAM3", "0").lower() in {"1", "true", "yes
 
 # GPU + runtime knobs.
 GPU_DEVICE = os.environ.get("GPU_DEVICE", "cuda:0")
+# The live-runner edge's base URL, used at startup to ask its authoritative
+# scheduler (POST /video-creator/v1/gpu-pick) which physical GPU is free so this
+# worker doesn't blindly default to GPU 0 (which the image worker may hold).
+# Blank = no live-runner consult -> fall back to GPU_DEVICE / local select.
+LIVE_RUNNER_URL = os.environ.get("LIVE_RUNNER_URL", "").strip()
 GPU_NAME = os.environ.get("GPU_NAME", "RTX 5090")
 GPU_VRAM_GB = float(os.environ.get("GPU_VRAM_GB", "32"))
 IDV2V_QUANT = os.environ.get("IDV2V_QUANT", "int8")       # int8 | none | bf16

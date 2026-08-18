@@ -163,7 +163,11 @@ services:
     runtime: nvidia
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN:-}
-      - GPU_DEVICE=${GPU_DEVICE:-0}
+      # Leave GPU_DEVICE unset by default so the worker asks the live-runner
+      # scheduler for a free GPU at startup (server._resolve_startup_device).
+      # Set an explicit index to pin it.
+      - GPU_DEVICE=${GPU_DEVICE:-}
+      - LIVE_RUNNER_URL=${LIVE_RUNNER_URL:-http://live-runner:8991}
       - MODEL_CHECKPOINT=${IDV2V_MODEL_CHECKPOINT:-/models/idv2v.pth}
       - WAN_MODEL_DIR=${WAN_MODEL_DIR:-/models/Wan-AI/Wan2.1-I2V-14B-720P}
       - SAM3_CKPT=${SAM3_CKPT:-/models/sam3}

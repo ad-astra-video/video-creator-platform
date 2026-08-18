@@ -145,6 +145,46 @@ def _device_index() -> int:
     return int(ds) if ds.isdigit() else 0
 
 
+async def _resolve_startup_device() -> None:
+    """Pick this worker's GPU at startup, asking the live-runner scheduler.
+
+    The live-runner (which owns the authoritative, /info-reconciled GPU map) knows
+    which physical card is actually free, so on a live-runner restart this worker
+    lands on a genuinely free GPU instead of blindly defaulting to GPU 0 (which
+    the image worker may hold warm). An EXPLICIT GPU_DEVICE env is honored as a
+    pin; when unset we consult ``LIVE_RUNNER_URL`` gpu-pick, falling back to the
+    existing GPU_DEVICE / local behavior if the live-runner is unreachable. The
+    resolved device is written back into ``config.GPU_DEVICE`` so every downstream
+    consumer (ModelManager, /info, gemma_device) agrees on one card.
+    """
+    raw = os.environ.get("GPU_DEVICE", "").strip()
+    if raw:
+        return  # explicit pin -> honor it as-is
+    base = config.LIVE_RUNNER_URL
+    if not base:
+        return  # no live-runner configured -> keep local default
+    try:
+        import aiohttp as _aio
+        async with _aio.ClientSession() as _s:
+            async with _s.post(
+                f"{base.rstrip('/')}/video-creator/v1/gpu-pick",
+                json={"worker": "idv2v-worker"},
+                headers={"X-Worker-Token": config.worker_token()},
+                timeout=_aio.ClientTimeout(total=8),
+            ) as r:
+                if r.status == 200:
+                    gpu = (await r.json()).get("gpu")
+                    if isinstance(gpu, int) and gpu >= 0:
+                        config.GPU_DEVICE = f"cuda:{gpu}"
+                        logger.info("idv2v-worker: live-runner assigned GPU %d", gpu)
+                        return
+        logger.warning("gpu-pick did not return a GPU; keeping GPU_DEVICE=%s",
+                       config.GPU_DEVICE)
+    except Exception as exc:
+        logger.warning("gpu-pick failed (%s); keeping GPU_DEVICE=%s",
+                       exc, config.GPU_DEVICE)
+
+
 def _gpu_info() -> dict:
     """Report the GPU this worker renders on (torch primary, nvidia-smi fallback).
 
@@ -428,6 +468,10 @@ def create_app() -> web.Application:
 
 
 async def _run() -> None:
+    # Ask the live-runner for a free GPU before serving so a cold/recovered
+    # worker never blindly lands on GPU 0 (mirrors ltx-worker; explicit
+    # GPU_DEVICE is still honored as a pin).
+    await _resolve_startup_device()
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
