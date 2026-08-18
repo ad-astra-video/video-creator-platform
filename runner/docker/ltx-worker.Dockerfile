@@ -36,6 +36,15 @@ RUN pip install --no-cache-dir \
     "git+https://github.com/Lightricks/LTX-2.git@fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca#subdirectory=packages/ltx-core" \
     "git+https://github.com/Lightricks/LTX-2.git@fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca#subdirectory=packages/ltx-pipelines"
 
+# NATTEN: the real 3D Neighborhood-Attention backend for the LTX-2.5 diffusion
+# video VAE decoder. Without it ltx-core falls back to a Triton na3d kernel that
+# crashes under the compiled decoder ("Pointer argument ... cannot be accessed
+# from Triton (cpu tensor?)"). Pin to the wheel matching our torch build
+# (2.11.0+cu128, py3.12) straight from the SHI-Labs NATTEN release (whl.natten.org
+# is not PEP 503 for pip local-version resolution, so install the .whl directly).
+RUN pip install --no-cache-dir \
+    "https://github.com/SHI-Labs/NATTEN/releases/download/v0.21.6/natten-0.21.6%2Btorch2110cu128-cp312-cp312-linux_x86_64.whl"
+
 # Diffusers for image generation (Z-Image-Turbo)
 RUN pip install --no-cache-dir diffusers accelerate
 
