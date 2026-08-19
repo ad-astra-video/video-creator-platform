@@ -165,8 +165,24 @@ def _memlog(tag: str) -> None:
     import torch as _t
     if not _t.cuda.is_available():
         return
-    parts = [f"g{i}={_t.cuda.memory_allocated(i)//1048576}M/{_t.cuda.memory_reserved(i)//1048576}M"
-             for i in range(_t.cuda.device_count())]
+    mi = 1024 * 1024
+    # Per-device total used from nvidia-smi (sees raw CUDA contexts torch's
+    # allocator does not track), plus torch's own accounting for completeness.
+    used = ["?"] * _t.cuda.device_count()
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+        for line in r.stdout.strip().splitlines():
+            idx, u, tot = (p.strip() for p in line.split(","))
+            used[int(idx)] = f"{u}MiB/{tot}MiB"
+    except Exception:
+        pass
+    parts = []
+    for i in range(_t.cuda.device_count()):
+        parts.append(f"g{i}[smi={used[i]} torch={_t.cuda.memory_allocated(i)//mi}M/{_t.cuda.memory_reserved(i)//mi}M]")
     logger.info("MEMLOG %-22s %s", tag, " ".join(parts))
 
 
@@ -1132,10 +1148,12 @@ async def on_startup(_app: web.Application) -> None:
                 logger.info("Gemma prompt-enhance model loaded at startup")
             except Exception as exc:
                 logger.error("Gemma startup warmup failed (will load on demand): %s", exc)
+            _memlog("after enhance load")
 
     _memlog("before ready")
     ready = True
     logger.info("Runner READY")
+    _memlog("after ready assigned")
 
 
 async def on_cleanup(_app: web.Application) -> None:
