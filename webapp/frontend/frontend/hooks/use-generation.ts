@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect, type RefObject } from 'react'
 import type { GenerationSettings } from '../components/SettingsPanel'
-import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
+import { ApiClient } from '../lib/api-client'
+import { activeRecoveryMarkerExists } from '../lib/generation-progress-poll'
 import {
   falGenerateI2I,
   falGenerateT2I,
@@ -15,7 +16,6 @@ import { createLocalGenerationError, type GenerationError } from '../lib/generat
 import { withGenerationActive } from '../lib/generation-active'
 import { useAppSettings } from '../contexts/AppSettingsContext'
 
-const POLLING_INTERVAL_MS = 2000
 
 export const GENERATION_RECOVERY_KEY = 'ltx-generation-recovery'
 // Parallel timestamp for the same marker: a lease so a crash-leaked marker can't permanently
@@ -113,32 +113,6 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary)
 }
 
-// Map phase to user-friendly message
-function getPhaseMessage(phase: string): string {
-  switch (phase) {
-    case 'validating_request':
-      return 'Validating request...'
-    case 'uploading_image':
-      return 'Uploading image...'
-    case 'uploading_audio':
-      return 'Uploading audio...'
-    case 'loading_model':
-      return 'Loading model...'
-    case 'encoding_text':
-      return 'Encoding prompt...'
-    case 'inference':
-      return 'Generating...'
-    case 'downloading_output':
-      return 'Downloading output...'
-    case 'decoding':
-      return 'Decoding video...'
-    case 'complete':
-      return 'Complete!'
-    default:
-      return 'Generating...'
-  }
-}
-
 export function useGeneration(): UseGenerationReturn {
   const { settings: appSettings, shouldImageGenerateWithFalApi, refreshSettings } = useAppSettings()
   const [state, setState] = useState<GenerationState>({
@@ -164,46 +138,52 @@ export function useGeneration(): UseGenerationReturn {
 
   useEffect(() => clearRecoveryPolling, [])
 
+  // HARD watchdog: while isGenerating is true, force it back to false after a max
+  // wall-clock cap no matter what the transport does. The SSE reader has its own
+  // idle (90s) + max-duration (25min) watchdog that makes a generation promise
+  // ALWAYS settle, but this is the final guarantee at the UI-state layer: even if
+  // some future path forgets to end its await, the webapp can never be wedged on
+  // "generating". On fire it aborts the in-flight request and surfaces an error.
+  const GENERATION_MAX_MS = 27 * 60 * 1000
+
+  useEffect(() => {
+    if (!state.isGenerating) return
+    const timer = setTimeout(() => {
+      abortControllerRef.current?.abort()
+      setState(prev => {
+        if (!prev.isGenerating) return prev
+        return {
+          ...prev,
+          isGenerating: false,
+          statusMessage: 'Generation timed out',
+          error: createLocalGenerationError(
+            `Generation did not complete within ${Math.round(GENERATION_MAX_MS / 60000)} minutes. ` +
+            'It was stopped to avoid the app hanging. Please retry.',
+          ),
+        }
+      })
+    }, GENERATION_MAX_MS)
+    return () => clearTimeout(timer)
+  }, [state.isGenerating])
+
   // Re-attach to a generation that was running OR finished while the frontend was
   // unmounted. Polls the backend progress endpoint; localStorage recovery context
   // (inputs, settings incl. loras) is owned by the caller (GenSpace). Returns the
   // recovered status so the caller can restore context for 'running' AND 'complete'
   // (a generation that finished during the unmount window still needs its metadata).
   const resumeIfRunning = useCallback(async (): Promise<'running' | 'complete' | 'none'> => {
-    const apply = (data: ApiSuccessOf<'getGenerationProgress'>): 'running' | 'complete' | 'other' => {
-      if (data.status === 'complete' && data.result != null) {
-        const vp = typeof data.result === 'string' ? data.result : null
-        const ips = Array.isArray(data.result) ? data.result : []
-        setState({
-          isGenerating: false, progress: 100, statusMessage: 'Complete!',
-          videoPath: vp, imagePath: ips[0] ?? null, imagePaths: ips, error: null,
-        })
-        return 'complete'
-      }
-      if (data.status === 'running') {
-        setState(prev => ({
-          ...prev, isGenerating: true, progress: data.progress,
-          statusMessage: getPhaseMessage(data.phase),
-        }))
-        return 'running'
-      }
-      setState(prev => ({ ...prev, isGenerating: false, statusMessage: '' }))
-      return 'other'
+    // The webapp has no backend generation-job row — the /api/generation/progress endpoint was
+    // removed, so there is no server progress/resume or server 'complete' result to restore
+    // (a reloaded tab's direct-rail result is gone). The only in-flight signal is the local
+    // recovery marker: if its lease is live, treat the generation as still running and restore
+    // a generic generating state; the owning flow clears the marker on completion.
+    if (activeRecoveryMarkerExists()) {
+      setState(prev => ({ ...prev, isGenerating: true, progress: 0, statusMessage: 'Generating...' }))
+      return 'running'
     }
-
-    const initial = await ApiClient.getGenerationProgress()
-    if (!initial.ok) return 'none'
-    const status = apply(initial.data)
-    if (status === 'complete') return 'complete'
-    if (status !== 'running') return 'none'
-
     clearRecoveryPolling()
-    recoveryIntervalRef.current = setInterval(async () => {
-      const r = await ApiClient.getGenerationProgress()
-      if (!r.ok) return
-      if (apply(r.data) !== 'running') clearRecoveryPolling()
-    }, POLLING_INTERVAL_MS)
-    return 'running'
+    setState(prev => ({ ...prev, isGenerating: false, statusMessage: '' }))
+    return 'none'
   }, [])
 
   const generate = useCallback(async (
