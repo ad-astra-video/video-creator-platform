@@ -29,22 +29,38 @@ logger = logging.getLogger(__name__)
 def _disable_diffvae_swiglu_triton() -> None:
     """Force the diffusion-VAE SwiGLU to its pure-PyTorch path (torch.mm + F.silu).
 
-    The LTX-2.5 diffusion VAE's `plain_mlp` (det / diff blocks) calls swiglu_tiled(),
-    which auto-selects a raw `@triton.jit` fused gate+up kernel whenever CUDA is
-    available. On this Blackwell/sm120 stack the raw kernel fails at launch with
-    ``ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)``
-    (a triton device-resolution bug, cf. triton-lang/triton#2441) -- and it is
-    INDEPENDENT of the natten package (natten only affects the NA-attention backend,
-    not the SiLU-gated MLP). Killing `triton_swiglu_available()` makes swiglu_tiled()
-    and dual_gate_up_triton_eligible() take the chunked eager torch.mm branch, which
-    is Dynamo/triton-free and keeps VRAM bounded (workspace is per-token-tile).
+    The LTX-2.5 diffusion VAE's MLP blocks (BOTH the det/plain `plain_mlp` in
+    transformer/swiglu.py AND the chunked `residual_modulating_mlp` in
+    transformer/chunked/mlp.py) auto-select a raw `@triton.jit` fused gate/up-mul
+    kernel whenever `triton_swiglu_available()` is True. On this Blackwell/sm120
+    stack that raw kernel fails at launch with
+    ``ValueError: Pointer argument ... cannot be accessed from Triton (cpu tensor?)``
+    (a triton device-resolution bug, cf. triton-lang/triton#2441) -- INDEPENDENT of
+    the natten package (natten only affects the NA-attention backend, not the
+    SiLU-gated MLP). PATCH CAVEAT: each consumer module does `from ...swiglu import
+    triton_swiglu_available`, binding its OWN copy of the function name, so we must
+    rebind the name in EVERY already-imported submodule under transformer/ -- patching
+    only the source swiglu module silently leaves chunked/mlp.py calling the original
+    (that is exactly how the first fix missed this path). With the flag False, both
+    swiglu paths take the chunked eager torch.mm branch (Dynamo/triton-free, VRAM
+    bounded via per-token-tile workspace).
     """
     try:
+        import sys
+
         import ltx_core.model.video_vae.transformer.swiglu as _swiglu
 
-        if getattr(_swiglu, "triton_swiglu_available", None) is not None:
-            _swiglu.triton_swiglu_available = lambda: False
-            logger.info("DiffVAE: disabled Triton SwiGLU kernel (using eager torch.mm path)")
+        # Always rebind in the source module (also covers late `from`-imports).
+        _swiglu.triton_swiglu_available = lambda: False  # type: ignore[method-assign]
+
+        # Rebind the name in every module under transformer/ that imported a copy.
+        patched = 0
+        for _name, _mod in list(sys.modules.items()):
+            if _name.startswith("ltx_core.model.video_vae.transformer") and _name != _swiglu.__name__:
+                if getattr(_mod, "triton_swiglu_available", None) is not None:
+                    _mod.triton_swiglu_available = lambda: False  # type: ignore[method-assign]
+                    patched += 1
+        logger.info("DiffVAE: disabled Triton SwiGLU kernel (eager torch.mm; patched source + %d submodules)", patched)
     except Exception as exc:  # pragma: no cover - best-effort guard
         logger.warning("DiffVAE: could not disable Triton SwiGLU path: %s", exc)
 
