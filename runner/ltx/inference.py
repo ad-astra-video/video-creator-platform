@@ -26,6 +26,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _memlog(tag: str) -> None:
+    import torch as _t
+    if not _t.cuda.is_available():
+        return
+    parts = [f"g{i}={_t.cuda.memory_allocated(i)//1048576}M/{_t.cuda.memory_reserved(i)//1048576}M"
+             for i in range(_t.cuda.device_count())]
+    logger.info("MEMLOG %-24s %s", tag, " ".join(parts))
+
+
 def _reflect_pad_to_target(image: "Image.Image", width: int, height: int) -> "Image.Image":
     """Resize (contain) + reflect-pad a start image to the exact target dims.
 
@@ -245,6 +254,7 @@ class VideoCreatorInferenceEngine:
             )
         logger.info("DistilledPipeline loaded (api=%s, offload=%s, fp8=%s)",
                     self._pipe_api, offload_mode, quantization is not None)
+        _memlog("pipeline23 constructed")
 
     def _load_pipeline25(self, loras: list[tuple[str, float]] | None = None) -> None:
         """Load the LTX-2.5 DistilledPipeline into ``self._pipeline25`` (model='ltx-2.5').
@@ -342,6 +352,7 @@ class VideoCreatorInferenceEngine:
         )
         logger.info("LTX-2.5 DistilledPipeline loaded (fp8cast=%s)",
                     quantization is not None)
+        _memlog("pipeline25 constructed")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1792,6 +1803,7 @@ class VideoCreatorInferenceEngine:
                 output_path=output_path,
                 video_chunks_number_value=chunks,
             )
+            _memlog("warmup encode done")
         finally:
             if os.path.exists(output_path):
                 os.unlink(output_path)

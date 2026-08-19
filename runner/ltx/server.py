@@ -161,6 +161,15 @@ def _read_file_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode()
 
 
+def _memlog(tag: str) -> None:
+    import torch as _t
+    if not _t.cuda.is_available():
+        return
+    parts = [f"g{i}={_t.cuda.memory_allocated(i)//1048576}M/{_t.cuda.memory_reserved(i)//1048576}M"
+             for i in range(_t.cuda.device_count())]
+    logger.info("MEMLOG %-22s %s", tag, " ".join(parts))
+
+
 def _require_token(request: web.Request) -> None:
     """Reject the request unless it carries the shared worker token.
 
@@ -1042,10 +1051,12 @@ async def on_startup(_app: web.Application) -> None:
     # GPU 0 even though the model loads explicitly on cuda:N -- which collides
     # with whichever worker actually owns GPU 0. Models still load on cuda:N.
     torch.cuda.set_device(video_device)
+    _memlog("after set_device")
 
     # Detect GPU and build the VRAM-aware profile (4090 = streaming/24GB,
     # 5090 = full-resident/32GB, RTX PRO 6000 = full-resident/96GB).
     gpu_profile = build_profile(video_device, GPU_VRAM_GB, GPU_NAME)
+    _memlog("after build_profile")
     if not gpu_profile.supports_generation:
         logger.error(
             "GPU[%d] %.1f GiB below the %d GiB minimum — generation will fail. "
@@ -1061,6 +1072,7 @@ async def on_startup(_app: web.Application) -> None:
     enhance_device = torch.device(f"cuda:{ENHANCE_GPU_DEVICE}") if ENHANCE_GPU_DEVICE else device
     engine = VideoCreatorInferenceEngine(MODEL_CHECKPOINT, TEXT_ENCODER_ROOT, UPSCALER_PATH, device,
                                 profile=gpu_profile, enhance_device=enhance_device)
+    _memlog("after engine")
     logger.info("Inference engine ready on %s (mode=%s, max_res=%s)",
                 device, gpu_profile.mode, gpu_profile.max_resolution)
 
@@ -1095,6 +1107,7 @@ async def on_startup(_app: web.Application) -> None:
         tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         try:
             engine.warmup(tmp.name)
+            _memlog("after warmup")
             logger.info("Warmup complete")
         finally:
             # warmup() already unlinks its own output; ignore if already gone.
@@ -1120,6 +1133,7 @@ async def on_startup(_app: web.Application) -> None:
             except Exception as exc:
                 logger.error("Gemma startup warmup failed (will load on demand): %s", exc)
 
+    _memlog("before ready")
     ready = True
     logger.info("Runner READY")
 
