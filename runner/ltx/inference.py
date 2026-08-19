@@ -1028,8 +1028,10 @@ class VideoCreatorInferenceEngine:
         # classic conv-VAE default (24). AUTO_TILING is only passed for the 2.5 pipeline.
         tiling = self.tiling_config_for(pipe)
         # Source-encoding tiling: 2.3 uses 24-frame/16-overlap tiles; the 2.5 diffusion VAE
-        # encoder needs a larger temporal overlap, so bump tile+overlap for 2.5.
-        enc_tile, enc_overlap = (40, 40) if is25 else (24, 16)
+        # encoder needs a larger temporal overlap, so bump overlap for 2.5. The tile MUST
+        # stay strictly larger than the overlap (DimensionSizeConfig enforces
+        # overlap < tile), so a 40-frame overlap needs a >40 tile.
+        enc_tile, enc_overlap = (48, 40) if is25 else (24, 16)
         encoding_tiling = TileSizeConfig(
             frames=DimensionSizeConfig(tile_size=enc_tile, overlap=enc_overlap),
             height=DimensionSizeConfig(tile_size=256, overlap=64),
