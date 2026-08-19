@@ -1141,13 +1141,19 @@ async def on_startup(_app: web.Application) -> None:
             if os.path.isdir(TEXT_ENCODER_ROOT) else []
         )
         if any(n.startswith("model") and n.endswith(".safetensors") for n in _gemma_files):
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, engine.enhance_prompt, "<startup warmup>", None, 0, None
+            if engine.can_enhance_locally():
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, engine.enhance_prompt, "<startup warmup>", None, 0, None
+                    )
+                    logger.info("Gemma prompt-enhance model loaded at startup")
+                except Exception as exc:
+                    logger.error("Gemma startup warmup failed (will load on demand): %s", exc)
+            else:
+                logger.info(
+                    "Skipping Gemma prompt-enhance startup warmup "
+                    "(local enhance unavailable at this pin)"
                 )
-                logger.info("Gemma prompt-enhance model loaded at startup")
-            except Exception as exc:
-                logger.error("Gemma startup warmup failed (will load on demand): %s", exc)
             _memlog("after enhance load")
 
     _memlog("before ready")
