@@ -381,36 +381,6 @@ class VideoCreatorInferenceEngine:
             self._pipeline25 = None
             self._free_vram()
 
-    def can_enhance_locally(self) -> bool:
-        """Return True only if the local prompt-enhance Gemma can actually load.
-
-        The enhance model is usable only when ``ltx_core.text_encoders.gemma``
-        exposes the loader ops this pin's ``enhance_prompt`` imports
-        (``GEMMA_LLM_KEY_OPS``). At some ltx-core pins those names were renamed;
-        importing them here fails, which means ``enhance_prompt`` would fail at
-        startup too. The server uses this to skip the startup warmup entirely
-        (no pointless eviction, no stray CUDA context) when the module can't
-        import, while still reporting the reason.
-
-        Does a real import so the check reflects exactly what ``enhance_prompt``
-        will hit, but never allocates CUDA.
-        """
-        try:
-            from ltx_core.text_encoders.gemma import (  # noqa: F401
-                GEMMA_LLM_KEY_OPS,
-                GEMMA_MODEL_OPS,
-                GemmaTextEncoderConfigurator,
-                module_ops_from_gemma_root,
-            )
-            return True
-        except ImportError as exc:
-            logger.warning(
-                "Local prompt-enhance Gemma unavailable (module import failed: %s) "
-                "— skipping enhance startup warmup",
-                exc,
-            )
-            return False
-
     def free(self) -> None:
         """Release ALL resident pipelines + cached GPU memory.
 

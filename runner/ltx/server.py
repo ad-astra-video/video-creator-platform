@@ -1130,32 +1130,11 @@ async def on_startup(_app: web.Application) -> None:
             if os.path.exists(tmp.name):
                 os.unlink(tmp.name)
 
-    # Load Gemma for /prompt-enhance at startup so it's warm (the first enhance
-    # won't pay a multi-second cold load). Skips forwarded-enhance mode, where no
-    # local Gemma is loaded. Loading Gemma may evict the video pipeline (they
-    # share one GPU) — it reloads lazily on the next generation. Never crash the
-    # runner if the warmup fails; enhance will load on demand.
-    if not ENHANCE_FORWARD_URL and engine is not None:
-        _gemma_files = (
-            [f.name for f in os.scandir(TEXT_ENCODER_ROOT) if f.is_file()]
-            if os.path.isdir(TEXT_ENCODER_ROOT) else []
-        )
-        if any(n.startswith("model") and n.endswith(".safetensors") for n in _gemma_files):
-            if engine.can_enhance_locally():
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, engine.enhance_prompt, "<startup warmup>", None, 0, None
-                    )
-                    logger.info("Gemma prompt-enhance model loaded at startup")
-                except Exception as exc:
-                    logger.error("Gemma startup warmup failed (will load on demand): %s", exc)
-            else:
-                logger.info(
-                    "Skipping Gemma prompt-enhance startup warmup "
-                    "(local enhance unavailable at this pin)"
-                )
-            _memlog("after enhance load")
-
+    # No startup warmup for the local prompt-enhance Gemma. /prompt-enhance is
+    # routed to the dedicated gemma-worker (live-runner routing); the ltx worker
+    # is only a cold fallback if that worker is down. Pre-warming its local
+    # Gemma here would evict the just-warmed video pipeline (they share one GPU)
+    # and cost startup for no benefit — it loads lazily on (rare) fallback use.
     _memlog("before ready")
     ready = True
     logger.info("Runner READY")
