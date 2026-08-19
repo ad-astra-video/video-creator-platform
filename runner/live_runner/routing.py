@@ -209,6 +209,7 @@ async def proxy_worker_sse(
     HTTP connection so the client sees live progress without buffering the (large)
     base64 result.
     """
+    import asyncio
     from . import config as cfg
     await worker_manager.ensure(worker, device=device)
     base = cfg.WORKERS[worker]
@@ -226,11 +227,41 @@ async def proxy_worker_sse(
             except Exception:
                 pass
             return
-        # Relay the worker's SSE byte-for-byte.
-        async for chunk in resp.content.iter_any():
-            if not chunk:
-                continue
+
+        # Keep-alive heartbeat on the RELAYED stream. The worker's own SSE
+        # (ltx /extend, image /layer, /edit) does not self-heartbeat, and a long
+        # quiet leg (big decode / multi-chunk denoise) can exceed the browser's
+        # SSE idle watchdog. Inject the same `: keepalive` comment the live-runner
+        # uses on its own streams so the relayed connection ALWAYS has byte flow
+        # and the client only times out on a genuinely dead connection.
+        stop_beat = asyncio.Event()
+        async def _heartbeat() -> None:
+            while not stop_beat.is_set():
+                try:
+                    await asyncio.wait_for(stop_beat.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pass
+                if stop_beat.is_set():
+                    break
+                try:
+                    await client_resp.write(b": keepalive\n\n")
+                except Exception:
+                    return
+        beat = asyncio.create_task(_heartbeat())
+
+        try:
+            # Relay the worker's SSE byte-for-byte.
+            async for chunk in resp.content.iter_any():
+                if not chunk:
+                    continue
+                try:
+                    await client_resp.write(chunk)
+                except Exception:
+                    break
+        finally:
+            stop_beat.set()
+            beat.cancel()
             try:
-                await client_resp.write(chunk)
-            except Exception:
-                break
+                await beat
+            except (asyncio.CancelledError, Exception):
+                pass

@@ -15,8 +15,10 @@
  */
 
 import { ApiClient } from './api-client'
+import { getBillingProjectId } from './billing-context'
 import { getBlob, getBlobUrl, registerBlob, setDimensions } from './runtime/web-store'
 import { decodeMediaPayload } from './media-decode'
+import { readSSEStream } from './sse-stream'
 import { logger } from './logger'
 import { isWebPlatform, discoverRunners, getRunnerDiscoveryConfig, loadExcludedRunnerUrls } from './livepeer-discovery'
 
@@ -672,6 +674,7 @@ async function attemptInference(
     type,
     manifestId,
     state,
+    projectId: getBillingProjectId() ?? undefined,
   })
   logger.info(`[direct] signTicket ok=${signed.ok} (${Date.now() - t1}ms)`)
   if (!signed.ok) {
@@ -679,21 +682,61 @@ async function attemptInference(
   }
 
   // 3) Retry with the payment material.
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    'Livepeer-Payment': signed.data.payment,
-    'Livepeer-Segment': signed.data.segCreds,
-    Origin: window.location.origin,
-  }
-  logger.info(`[direct] paid retry POST ${url}`)
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'Livepeer-Payment': signed.data.payment,
+      'Livepeer-Segment': signed.data.segCreds,
+      Origin: window.location.origin,
+    }
+    logger.info(`[direct] paid retry POST ${url}`)
 
-  return fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal: opts?.signal,
-  })
-}
+    // Guard the HEADER arrival of the paid retry: a proxy that accepts the connection
+    // but never returns response headers would otherwise leave this fetch (and thus the
+    // whole generation) pending forever. This bounds ONLY the header wait — for a
+    // long-lived SSE body stream we must NOT abort after headers (the body is governed
+    // by readSSEStream's idle/max-duration watchdog instead). So we race the HEADER
+    // wait, not the body.
+    const headerSignal = new AbortController()
+    const payoutHeaderTimer = setTimeout(() => headerSignal.abort(), 60_000)
+    const combined = combineAbortSignals(opts?.signal, headerSignal.signal)
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: combined,
+      })
+    } catch (e) {
+      if (headerSignal.signal.aborted && !(opts?.signal?.aborted)) {
+        throw new Error(
+          'Runner did not respond in time (60s). The orchestrator/runner connection stalled; ' +
+          'no response headers were received. Please retry.',
+        )
+      }
+      throw e
+    } finally {
+      clearTimeout(payoutHeaderTimer)
+    }
+  }
+
+  /**
+   * Return a signal that aborts when EITHER of `a` or `b` aborts. TL;DR for the paid
+   * retry header guard: AbortSignal.timeout would kill the long SSE body too, but we only
+   * want to bound the header wait, so we gate on a short-lived controller plus the user's
+   * own abort (cancellation) signal.
+   */
+  function combineAbortSignals(a: AbortSignal | undefined, b: AbortSignal | undefined): AbortSignal | undefined {
+    if (!a && !b) return undefined
+    if (a && !b) return a
+    if (b && !a) return b
+    const c = new AbortController()
+    const onAbort = () => c.abort()
+    a!.addEventListener('abort', onAbort, { once: true })
+    b!.addEventListener('abort', onAbort, { once: true })
+    // Ensure it's aborted if either already was.
+    if (a!.aborted || b!.aborted) c.abort()
+    return c.signal
+  }
 
 /**
  * Generic Livepeer task over HTTP with the FULL payment handshake
@@ -737,46 +780,6 @@ export async function postRunnerTaskWithTicket(
 // text/event-stream. The final `complete` event carries the whole result payload
 // (media as base64) in ONE event. Because SSE rides a normal fetch + ReadableStream,
 // it keeps the working HTTP payment rail (no browser WebSocket -> no header limits).
-
-/**
- * Drive `reader` and deliver parsed SSE events to onEvent.
- * Splits the byte stream on blank lines; a block's `event:` field names the event
- * (default "message") and its `data:` lines are joined with newlines per the SSE spec.
- */
-async function readSSEStream(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  signal: AbortSignal | undefined,
-  onEvent: (event: string, data: string) => void,
-): Promise<void> {
-  const decoder = new TextDecoder()
-  let buf = ''
-  const onAbort = () => { void reader.cancel().catch(() => {}) }
-  if (signal) {
-    if (signal.aborted) onAbort()
-    else signal.addEventListener('abort', onAbort, { once: true })
-  }
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      let idx: number
-      while ((idx = buf.indexOf('\n\n')) !== -1) {
-        const blockText = buf.slice(0, idx)
-        buf = buf.slice(idx + 2)
-        let event = 'message'
-        const datas: string[] = []
-        for (const line of blockText.split('\n')) {
-          if (line.startsWith('event:')) event = line.slice(6).trim()
-          else if (line.startsWith('data:')) datas.push(line.slice(5).replace(/^\s/, ''))
-        }
-        if (datas.length) onEvent(event, datas.join('\n'))
-      }
-    }
-  } finally {
-    if (signal) signal.removeEventListener('abort', onAbort)
-  }
-}
 
 /**
  * Generation task over SSE with the full Livepeer payment handshake.
