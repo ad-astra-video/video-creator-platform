@@ -1036,6 +1036,13 @@ async def on_startup(_app: web.Application) -> None:
     # video worker doesn't collide with the image worker's warm model on GPU 0.
     video_device = await _pick_video_device(GPU_DEVICE)
 
+    # Pin torch's CURRENT/primary CUDA device to the picked card BEFORE any CUDA
+    # allocation. Without this, torch initializes its default context on device 0
+    # and unqualified ops (.cuda()/device="cuda") leak a ~500MB footprint onto
+    # GPU 0 even though the model loads explicitly on cuda:N -- which collides
+    # with whichever worker actually owns GPU 0. Models still load on cuda:N.
+    torch.cuda.set_device(video_device)
+
     # Detect GPU and build the VRAM-aware profile (4090 = streaming/24GB,
     # 5090 = full-resident/32GB, RTX PRO 6000 = full-resident/96GB).
     gpu_profile = build_profile(video_device, GPU_VRAM_GB, GPU_NAME)
