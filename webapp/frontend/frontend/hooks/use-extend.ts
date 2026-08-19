@@ -17,6 +17,8 @@ export interface ExtendSubmitParams {
   duration: number
   prompt: string
   mode: ExtendDirection
+  // Which LTX model to extend with: '' (default) = LTX 2.3, 'ltx-2.5' = LTX 2.5.
+  model?: string
   resolution?: { width: number; height: number }
 }
 
@@ -77,6 +79,7 @@ export function useExtend() {
           // Worker extends by FRAMES, not seconds. 24fps (LTX band) preserves the chosen duration.
           extendFrames: Math.round(params.duration * 24),
           mode: params.mode,
+          model: params.model ?? '',
           seed: 42,
           fps: 24,
           resolution: params.resolution,

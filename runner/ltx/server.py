@@ -557,6 +557,7 @@ async def handle_extend(req: web.Request) -> web.Response:
     mode = body.get("mode", "end")  # "start" or "end"
     seed = body.get("seed", 42)
     fps = body.get("fps", 24)
+    model = str(body.get("model", ""))  # "ltx-2.5" picks the LTX-2.5 pipeline; else 2.3
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     try:
@@ -569,6 +570,7 @@ async def handle_extend(req: web.Request) -> web.Response:
             seed=seed,
             fps=fps,
             output_path=tmp.name,
+            model=model,
         )
         b64 = _read_file_b64(tmp.name)
         return web.json_response({

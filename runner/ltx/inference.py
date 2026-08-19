@@ -149,6 +149,9 @@ class VideoCreatorInferenceEngine:
         # regenerates audio during extension). Sentinel (_AUDIO_COND_MISSING) until first
         # use; None once a build attempt failed (extend then degrades to video-only).
         self._audio_cond: Any = _AUDIO_COND_MISSING
+        # Checkpoint the AudioConditioner was built from (the 2.5 kit has its OWN audio-vae
+        # path distinct from the 2.3 monolith), so the cache invalidates on a model switch.
+        self._audio_cond_cp: str | None = None
 
     # ------------------------------------------------------------------
     # Pipeline lifecycle
@@ -468,20 +471,34 @@ class VideoCreatorInferenceEngine:
         pad = torch.zeros(pad_shape, device=latent.device, dtype=latent.dtype)
         return torch.cat([pad, latent] if at == "start" else [latent, pad], dim=2)
 
-    def _extend_audio_conditioner(self) -> Any:
+    def _extend_audio_conditioner(self, pipe=None) -> Any:
         """Lazily build the audio latent encoder (AudioConditioner) needed to reproduce
-        LTX-Desktop's extend (encode source audio -> pad -> regenerate). Cached; None on
-        failure so extend degrades to video-only rather than crashing."""
+        LTX-Desktop's extend (encode source audio -> pad -> regenerate). Cached per
+        checkpoint; None on failure so extend degrades to video-only rather than crashing.
+
+        The 2.5 kit ships its OWN audio VAE, distinct from the 2.3 monolith's bundled
+        audio path -- so which checkpoint we build from is pipeline-dependent and the
+        cache invalidates when the model switches (2.3 <-> 2.5). If the 2.5 audio-vae
+        path isn't consumable by AudioConditioner at this rev, the except below degrades
+        to video-only extend, which is the safe fallback."""
+
+        cp = self._checkpoint
+        if pipe is self._pipeline25:
+            from runner.ltx import config as _cfg
+            cp = os.path.join(_cfg.LTX25_MODEL_DIR, "vae", _cfg.LTX25_AUDIO_VAE)
+        if self._audio_cond_cp != cp:
+            self._audio_cond = _AUDIO_COND_MISSING
+            self._audio_cond_cp = cp
         if self._audio_cond is not _AUDIO_COND_MISSING:
             return self._audio_cond
         try:
             from ltx_pipelines.utils.blocks import AudioConditioner
             self._audio_cond = AudioConditioner(
-                self._checkpoint,
+                cp,
                 dtype=torch.bfloat16,
                 device=self._device,
             )
-            logger.info("Built AudioConditioner for extend audio regeneration")
+            logger.info("Built AudioConditioner for extend audio regeneration (%s)", cp)
         except Exception:
             logger.warning("AudioConditioner unavailable; extend will regenerate video only",
                            exc_info=True)
@@ -846,8 +863,13 @@ class VideoCreatorInferenceEngine:
         fps: float,
         output_path: str,
         context_seconds: float = 1.0,
+        model: str = "",
     ) -> None:
         """Extend a video - windowed reproduction of LTX-Desktop's extend.
+
+        ``model=='ltx-2.5'`` extends with the additive LTX-2.5 pipeline (its OWN
+        diffusion video VAE + audio VAE); anything else uses the default LTX-2.3
+        pipeline.
 
         The desktop algorithm (encode WHOLE source video+audio to a latent, zero-pad the
         time axis, TemporalRegionMask over only the new region + seam feather, prompt-gated
@@ -933,7 +955,7 @@ class VideoCreatorInferenceEngine:
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", fr,
                         "-c:a", "aac", "-b:a", "128k", window)
                 # Faithful latent extend over the 1 s window -> [window + new frames].
-                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment)
+                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment, model=model)
                 if remain >= 1:
                     _concat(prefix, segment, output_path)
                 else:
@@ -948,7 +970,7 @@ class VideoCreatorInferenceEngine:
                     _ffmpeg("-ss", f"{context_seconds}", "-i", src, "-frames:v", str(remain),
                             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", fr,
                             "-c:a", "aac", "-b:a", "128k", rest)
-                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment)
+                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment, model=model)
                 if remain >= 1:
                     _concat(segment, rest, output_path)
                 else:
@@ -966,8 +988,13 @@ class VideoCreatorInferenceEngine:
         seed: int,
         fps: float,
         output_path: str,
+        model: str = "",
     ) -> None:
         """Faithful LTX-Desktop extend on an already-extracted source FILE (a 1 s window).
+
+        ``model=='ltx-2.5'`` extends with the LTX-2.5 pipeline (AUTO_TILING decode +
+        its OWN audio VAE, because the 2.5 diffusion video VAE needs the larger 40-frame
+        overlap and a different audio latent space); anything else uses LTX-2.3.
 
         Encodes the whole ``video_path`` (video + audio) to a latent, zero-pads the latent on
         the time axis by ``extend_frames`` (front for ``start``, back for ``end``), lays a
@@ -977,10 +1004,10 @@ class VideoCreatorInferenceEngine:
         LTX-Desktop's ``LTXRetakePipeline.extend`` (services/retake_pipeline/ltx_retake_pipeline.py),
         driven through the already-loaded ``DistilledPipeline`` components.
         """
-        self._ensure_pipeline()
-        pipe = self._pipeline
+        pipe = self._ensure_pipeline(model=model)
         dtype = torch.bfloat16
         device = self._device
+        is25 = pipe is self._pipeline25
 
         from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
         from ltx_core.components.noisers import GaussianNoiser
@@ -996,9 +1023,15 @@ class VideoCreatorInferenceEngine:
         from ltx_pipelines.utils.media_io import encode_video, get_videostream_metadata
         from ltx_pipelines.utils.types import ModalitySpec
 
-        tiling = TileSizeConfig.default()
+        # Decode tiling is pipeline-dependent: the 2.5 DIFFUSION video VAE requires the
+        # larger 40-frame temporal overlap (AUTO_TILING resolves it), while 2.3 keeps the
+        # classic conv-VAE default (24). AUTO_TILING is only passed for the 2.5 pipeline.
+        tiling = self.tiling_config_for(pipe)
+        # Source-encoding tiling: 2.3 uses 24-frame/16-overlap tiles; the 2.5 diffusion VAE
+        # encoder needs a larger temporal overlap, so bump tile+overlap for 2.5.
+        enc_tile, enc_overlap = (40, 40) if is25 else (24, 16)
         encoding_tiling = TileSizeConfig(
-            frames=DimensionSizeConfig(tile_size=24, overlap=16),
+            frames=DimensionSizeConfig(tile_size=enc_tile, overlap=enc_overlap),
             height=DimensionSizeConfig(tile_size=256, overlap=64),
             width=DimensionSizeConfig(tile_size=256, overlap=64),
         )
@@ -1015,7 +1048,7 @@ class VideoCreatorInferenceEngine:
                 tiling_config=encoding_tiling,
             )
         )
-        audio_cond = self._extend_audio_conditioner()
+        audio_cond = self._extend_audio_conditioner(pipe)
         initial_audio_latent = (
             audio_cond(
                 lambda enc: audio_latent_from_file(
@@ -1032,6 +1065,10 @@ class VideoCreatorInferenceEngine:
 
         # --- Resolve target shape + the temporal region to regenerate ---
         target_shape = output_shape._replace(frames=output_shape.frames + extend_frames)
+        # Keep the extended target on the loaded VAE's temporal grid (2.3: time=8, 2.5:
+        # time=2) so the decode's grid validation passes; padding is derived below from
+        # the snapped target vs source latent-frame counts.
+        target_shape = target_shape._replace(frames=self.snap_frames_to_grid(target_shape.frames, pipe))
         pad_video_frames = (
             VideoLatentShape.from_pixel_shape(target_shape).frames
             - VideoLatentShape.from_pixel_shape(output_shape).frames
@@ -1091,7 +1128,14 @@ class VideoCreatorInferenceEngine:
 
         decoded_audio = pipe.audio_decoder(audio_state.latent)
         decoded_video = pipe.video_decoder(video_state.latent, tiling, generator)
-        video_chunks = get_video_chunks_number(target_shape.frames, tiling)
+        # Chunk-count hint only -- the DECODE above uses `tiling` (AUTO_TILING for the 2.5
+        # diffusion VAE). get_video_chunks_number needs a CONCRETE config, so fall back to a
+        # plain default if handed the AUTO_TILING sentinel (it still drives how encode_video
+        # streams frames; accurate count is cosmetically the mp4 chunk size).
+        try:
+            video_chunks = get_video_chunks_number(target_shape.frames, tiling)
+        except Exception:
+            video_chunks = get_video_chunks_number(target_shape.frames, TileSizeConfig.default())
         encode_video(
             video=decoded_video,
             fps=int(fps),
