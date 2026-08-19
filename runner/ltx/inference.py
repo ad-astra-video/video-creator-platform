@@ -26,6 +26,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _disable_diffvae_swiglu_triton() -> None:
+    """Force the diffusion-VAE SwiGLU to its pure-PyTorch path (torch.mm + F.silu).
+
+    The LTX-2.5 diffusion VAE's `plain_mlp` (det / diff blocks) calls swiglu_tiled(),
+    which auto-selects a raw `@triton.jit` fused gate+up kernel whenever CUDA is
+    available. On this Blackwell/sm120 stack the raw kernel fails at launch with
+    ``ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)``
+    (a triton device-resolution bug, cf. triton-lang/triton#2441) -- and it is
+    INDEPENDENT of the natten package (natten only affects the NA-attention backend,
+    not the SiLU-gated MLP). Killing `triton_swiglu_available()` makes swiglu_tiled()
+    and dual_gate_up_triton_eligible() take the chunked eager torch.mm branch, which
+    is Dynamo/triton-free and keeps VRAM bounded (workspace is per-token-tile).
+    """
+    try:
+        import ltx_core.model.video_vae.transformer.swiglu as _swiglu
+
+        if getattr(_swiglu, "triton_swiglu_available", None) is not None:
+            _swiglu.triton_swiglu_available = lambda: False
+            logger.info("DiffVAE: disabled Triton SwiGLU kernel (using eager torch.mm path)")
+    except Exception as exc:  # pragma: no cover - best-effort guard
+        logger.warning("DiffVAE: could not disable Triton SwiGLU path: %s", exc)
+
+
 def _memlog(tag: str) -> None:
     import torch as _t
     if not _t.cuda.is_available():
@@ -336,6 +359,9 @@ class VideoCreatorInferenceEngine:
                             _cfg.ltx25_transformer_filename())
             except Exception:
                 logger.warning("LTX-2.5: fp8-cast policy unavailable, loading BF16 without it")
+        # The 2.5 diffusion VAE decode crashes if its SwiGLU uses the raw Triton
+        # kernel on this Blackwell stack; force the eager torch.mm path first.
+        _disable_diffvae_swiglu_triton()
         self._pipeline25 = DistilledPipeline(
             model_paths=ModelPaths.from_split(
                 transformer_path=transformer,
