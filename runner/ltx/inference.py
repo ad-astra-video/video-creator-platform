@@ -560,8 +560,32 @@ class VideoCreatorInferenceEngine:
 
     @staticmethod
     def video_chunks_number(num_frames: int, tiling_config) -> int:
-        from ltx_core.model.video_vae import get_video_chunks_number
+        """Number of video chunks for a given frame count + tiling config."""
         return int(get_video_chunks_number(num_frames, tiling_config))
+
+    def _resolve_decode_tiling(self, pipe, tiling, shape) -> Any:
+        """Return a CONCRETE TileSizeConfig for a decode call.
+
+        The top-level ``pipe(...)`` entry auto-resolves the ``AUTO_TILING`` sentinel
+        into a DiffVAE-appropriate layout internally, but our extend path drives
+        ``pipe.video_decoder(...)`` directly, which needs a real ``TileSizeConfig``
+        (it calls ``to_splitters()`` on it). When ``tiling`` is the AUTO_TILING
+        sentinel (LTX-2.5 diffusion video VAE), ask the decoder for its recommended
+        config for this exact shape; otherwise pass through the given concrete config.
+        """
+        if getattr(tiling, "__class__", None) and tiling.__class__.__name__ == "AutoTiling":
+            try:
+                return pipe.video_decoder.recommended_tiling_config(
+                    height=int(shape.height),
+                    width=int(shape.width),
+                    num_frames=int(shape.frames),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "DiffVAE recommended tiling unavailable (%s); falling back to TileSizeConfig.default()", exc
+                )
+                return self.default_tiling_config()
+        return tiling
 
     def snap_frames_to_grid(self, num_frames: int, pipe=None) -> int:
         """Round ``num_frames`` down to the VAE temporal grid (k*time+1).
@@ -1129,7 +1153,10 @@ class VideoCreatorInferenceEngine:
         )
 
         decoded_audio = pipe.audio_decoder(audio_state.latent)
-        decoded_video = pipe.video_decoder(video_state.latent, tiling, generator)
+        # Resolve AUTO_TILING (2.5 diff-VAE sentinel) to a CONCRETE TileSizeConfig:
+        # the direct .video_decoder() call can't auto-resolve it the way pipe() does.
+        decode_tiling = self._resolve_decode_tiling(pipe, tiling, target_shape)
+        decoded_video = pipe.video_decoder(video_state.latent, decode_tiling, generator)
         # Chunk-count hint only -- the DECODE above uses `tiling` (AUTO_TILING for the 2.5
         # diffusion VAE). get_video_chunks_number needs a CONCRETE config, so fall back to a
         # plain default if handed the AUTO_TILING sentinel (it still drives how encode_video
