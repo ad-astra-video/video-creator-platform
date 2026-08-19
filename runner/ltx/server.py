@@ -10,6 +10,7 @@ import asyncio
 import base64
 import functools
 import io
+import json
 import logging
 import os
 import tempfile
@@ -548,7 +549,16 @@ async def handle_edit(req: web.Request) -> web.Response:
 
 
 async def handle_extend(req: web.Request) -> web.Response:
-    """POST /video-creator/v1/extend — extend a video by appending/prepending frames."""
+    """POST /video-creator/v1/extend — extend a video by appending/prepending frames.
+
+    With ``?sse=1`` the response is text/event-stream: `accepted` -> `progress`*
+    (honest STAGE text: encoding / generating / decoding / finalizing; numeric
+    ``progress`` is always null because the LTX denoise loop exposes no per-step
+    callback -- no fabricated %) -> a single `complete` {video_base64,...} or `error`.
+    The live-runner edge relays those events verbatim to the browser over the same
+    paid connection, matching the image-worker /layer && /edit SSE surface.
+    Without the flag the plain JSON response is returned (unchanged behaviour).
+    """
     body = await req.json()
     assert engine
     prompt = body["prompt"]
@@ -558,6 +568,10 @@ async def handle_extend(req: web.Request) -> web.Response:
     seed = body.get("seed", 42)
     fps = body.get("fps", 24)
     model = str(body.get("model", ""))  # "ltx-2.5" picks the LTX-2.5 pipeline; else 2.3
+
+    if req.query.get("sse") in ("1", "true", "yes"):
+        return await _run_extend_sse(req, prompt, video_base64, extend_frames,
+                                     mode, seed, fps, model)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     try:
@@ -580,6 +594,75 @@ async def handle_extend(req: web.Request) -> web.Response:
         })
     finally:
         os.unlink(tmp.name)
+
+
+async def _run_extend_sse(req: web.Request, prompt: str, video_base64: str,
+                          extend_frames: int, mode: str, seed: int,
+                          fps: float, model: str) -> web.StreamResponse:
+    """Serve /video-creator/v1/extend as text/event-stream when ``?sse=1``.
+
+    Events: accepted -> progress* (STAGE text, no fabricated %) -> complete
+    (video_base64 + content_type + generation_id), or error."""
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+    await resp.prepare(req)
+    assert engine
+
+    async def _ev(event: str, data: dict) -> None:
+        try:
+            await resp.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+        except Exception:
+            pass
+
+    await _ev("accepted", {
+        "endpoint": "extend",
+        "model": model or "ltx-2.3",
+        "extend_frames": extend_frames,
+        "mode": mode,
+    })
+    loop = asyncio.get_running_loop()
+
+    # generate_extend runs in a worker thread (run_in_executor), so progress
+    # callbacks must hop back onto the loop before touching the stream.
+    def _on_progress(stage: str, message: str, progress) -> None:
+        loop.call_soon_threadsafe(
+            asyncio.create_task,
+            _ev("progress", {"stage": stage, "message": message, "progress": progress}),
+        )
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    try:
+        try:
+            await _run_generation(
+                engine.generate_extend,
+                prompt=prompt,
+                video_base64=video_base64,
+                extend_frames=extend_frames,
+                mode=mode,
+                seed=seed,
+                fps=fps,
+                output_path=tmp.name,
+                model=model,
+                progress_cb=_on_progress,
+            )
+        except Exception as exc:
+            logger.exception("extend SSE failed")
+            await _ev("error", {"error": str(exc)})
+            await resp.write_eof()
+            return resp
+        b64 = _read_file_b64(tmp.name)
+        await _ev("complete", {
+            "video_base64": b64,
+            "content_type": "video/mp4",
+            "generation_id": uuid.uuid4().hex[:8],
+        })
+    finally:
+        os.unlink(tmp.name)
+    await resp.write_eof()
+    return resp
 
 
 async def handle_upscale(req: web.Request) -> web.Response:

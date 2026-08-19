@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicket, pathToBase64 } from '../lib/direct-transport'
+import { resolveRunner, postRunnerTaskWithTicketSSE, pathToBase64 } from '../lib/direct-transport'
 import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY } from './use-generation'
 
 export type ExtendDirection = 'start' | 'end'
@@ -73,7 +73,7 @@ export function useExtend() {
           return
         }
 
-        const res = await postRunnerTaskWithTicket(runner, 'extend', {
+        const res = await postRunnerTaskWithTicketSSE(runner, 'extend', {
           video_base64: videoBase64,
           prompt: params.prompt,
           // Worker extends by FRAMES, not seconds. 24fps (LTX band) preserves the chosen duration.
@@ -85,9 +85,9 @@ export function useExtend() {
           resolution: params.resolution,
         }, {
           onProgress: (ev) => {
-            if (ev.stage === 'generating') {
-              setState(prev => ({ ...prev, extendStatus: ev.message || 'Extending...' }))
-            }
+            // Live stage text over SSE (encoding / generating / decoding / finalizing).
+            if (ev.message) setState(prev => ({ ...prev, extendStatus: ev.message }))
+            else if (ev.stage === 'generating') setState(prev => ({ ...prev, extendStatus: 'Extending...' }))
           },
         })
         if (!res.mediaBlob) {
@@ -97,8 +97,8 @@ export function useExtend() {
           return
         }
 
-        // The runner streams the generated media back over the WebSocket — store it as a local
-        // object URL for the project asset store.
+        // The SSE `complete` event carries the generated media as base64 — decode it to a
+        // Blob and store it as a local object URL for the project asset store.
         const videoPath = URL.createObjectURL(res.mediaBlob)
         setState({
           isExtending: false,

@@ -197,23 +197,22 @@ async def proxy(
     return web.json_response({"error": f"no worker available for {endpoint}"}, status=502)
 
 
-async def proxy_layer_sse(
-    worker_manager, session, token, body: dict,
+async def proxy_worker_sse(
+    worker_manager, session, token, worker: str, endpoint: str, body: dict,
     client_resp: "web.StreamResponse", device: int | None = None,
 ) -> None:
-    """Relay /layer?sse=1 to the image-worker's own SSE stream verbatim.
+    """Relay ``{worker}/{endpoint}?sse=1`` SSE stream verbatim to the browser.
 
-    The image-worker emits `accepted` -> `progress`* (per denoise step) ->
-    `complete` as text/event-stream. We stream those events straight through to
-    the browser over the same paid HTTP connection so the client sees live
-    per-step progress without buffering the (large) base64 result.
+    Endpoints whose worker emits text/event-stream itself (image-worker ``/layer``
+    and ``/edit``; ltx-worker ``/extend``) stream `accepted` -> `progress`* ->
+    `complete` (or `error`). We fan the bytes straight through over the same paid
+    HTTP connection so the client sees live progress without buffering the (large)
+    base64 result.
     """
     from . import config as cfg
-    from .swap import HttpWorkerTransport
-    target = "image-worker"
-    await worker_manager.ensure(target, device=device)
-    base = cfg.WORKERS[target]
-    url = f"{base}/video-creator/v1/layer?sse=1"
+    await worker_manager.ensure(worker, device=device)
+    base = cfg.WORKERS[worker]
+    url = f"{base}/video-creator/v1/{endpoint}?sse=1"
     headers = {"X-Worker-Token": token}
     async with session.post(
         url, json=body, headers=headers,

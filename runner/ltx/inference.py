@@ -561,6 +561,7 @@ class VideoCreatorInferenceEngine:
     @staticmethod
     def video_chunks_number(num_frames: int, tiling_config) -> int:
         """Number of video chunks for a given frame count + tiling config."""
+        from ltx_core.model.video_vae import get_video_chunks_number
         return int(get_video_chunks_number(num_frames, tiling_config))
 
     def _resolve_decode_tiling(self, pipe, tiling, shape) -> Any:
@@ -888,6 +889,7 @@ class VideoCreatorInferenceEngine:
         output_path: str,
         context_seconds: float = 1.0,
         model: str = "",
+        progress_cb: Any | None = None,
     ) -> None:
         """Extend a video - windowed reproduction of LTX-Desktop's extend.
 
@@ -967,6 +969,14 @@ class VideoCreatorInferenceEngine:
             ctx_frames = max(1, min(int(round(context_seconds * meta.fps)), total))
             fr = str(int(round(fps or meta.fps)))
 
+            def _emit(stage: str, message: str) -> None:
+                if progress_cb is not None:
+                    try:
+                        progress_cb(stage, message, None)
+                    except Exception:
+                        pass
+
+            _emit("encoding", "Encoding source window...")
             if mode == "end":
                 remain = total - ctx_frames
                 if remain >= 1:
@@ -979,7 +989,7 @@ class VideoCreatorInferenceEngine:
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", fr,
                         "-c:a", "aac", "-b:a", "128k", window)
                 # Faithful latent extend over the 1 s window -> [window + new frames].
-                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment, model=model)
+                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment, model=model, progress_cb=progress_cb)
                 if remain >= 1:
                     _concat(prefix, segment, output_path)
                 else:
@@ -994,11 +1004,12 @@ class VideoCreatorInferenceEngine:
                     _ffmpeg("-ss", f"{context_seconds}", "-i", src, "-frames:v", str(remain),
                             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", fr,
                             "-c:a", "aac", "-b:a", "128k", rest)
-                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment, model=model)
+                self._extend_file(window, prompt, extend_frames, mode, seed, fps, segment, model=model, progress_cb=progress_cb)
                 if remain >= 1:
                     _concat(segment, rest, output_path)
                 else:
                     _sp.run(["cp", segment, output_path], check=True)
+            _emit("finalizing", "Finalizing output...")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -1013,6 +1024,7 @@ class VideoCreatorInferenceEngine:
         fps: float,
         output_path: str,
         model: str = "",
+        progress_cb: Any | None = None,
     ) -> None:
         """Faithful LTX-Desktop extend on an already-extracted source FILE (a 1 s window).
 
@@ -1032,6 +1044,13 @@ class VideoCreatorInferenceEngine:
         dtype = torch.bfloat16
         device = self._device
         is25 = pipe is self._pipeline25
+
+        def _emit(stage: str, message: str) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(stage, message, None)
+                except Exception:
+                    pass
 
         from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
         from ltx_core.components.noisers import GaussianNoiser
@@ -1138,6 +1157,7 @@ class VideoCreatorInferenceEngine:
                 frozen=initial_audio_latent is not None,
             )
 
+        _emit("generating", f"Extending {extend_frames} new frames...")
         sigmas = torch.tensor(_distilled_sigmas).to(dtype=torch.float32, device=device)
         denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         video_state, audio_state = pipe.stage(
@@ -1152,6 +1172,7 @@ class VideoCreatorInferenceEngine:
             audio=audio_modality_spec,
         )
 
+        _emit("decoding", "Decoding output...")
         decoded_audio = pipe.audio_decoder(audio_state.latent)
         # Resolve AUTO_TILING (2.5 diff-VAE sentinel) to a CONCRETE TileSizeConfig:
         # the direct .video_decoder() call can't auto-resolve it the way pipe() does.
