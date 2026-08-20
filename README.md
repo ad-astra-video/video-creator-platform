@@ -29,7 +29,7 @@ email recovery, job dispatch (minting a signer session), and operator admin. See
 | `POST /recover/request { email }` / `POST /recover/confirm { email, code }` | public | lost/compromised key via **email**: one-time code; confirm **rotates** to a fresh key |
 | `POST /recover/backup { code }` | public | lost key via **one-time backup code** (no email): rotate to a fresh key + mint a NEW backup code |
 | `POST /webhook/stripe` | signature | grants `credits` only (never the fee) — idempotent |
-| `POST /sign-ticket { paymentParams, type, manifestId, state? }` | **user key** | PymtHouse signer DMZ proxy → returns `{ payment, segCreds, state }` (the `Livepeer-Payment` / `Livepeer-Segment` header values) |
+| `POST /sign-ticket { pymt: { orchestrator, type, ManifestID, state? }, projectId? }` | **user key** | PymtHouse signer DMZ proxy. The `pymt` field is relayed verbatim to the DMZ; `projectId` and other sibling fields are local tracking read by the Worker and never forwarded. Returns `{ payment, segCreds, state }` (the `Livepeer-Payment` / `Livepeer-Segment` header values) |
 | `GET /signer/address` | **user key** | payer/broadcaster address for the `Livepeer-Payer-Address` header |
 | `POST /authorize` | **webhook secret** | go-livepeer remote-signer identity webhook (verifies the end-user signer JWT) |
 | `GET /admin/payments` | **admin** key | monitor payments received (credit-audit ledger) |

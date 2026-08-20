@@ -339,6 +339,35 @@ export interface PlatformBalance {
   authorityUsdMicros?: number
 }
 
+export interface PlatformSpendEntry {
+  requestId: string
+  /** The project that triggered this spend, when attributed (null otherwise). */
+  projectId: string | null
+  /** USD micros charged (ticketEV — exactly what PymtHouse debits, fixed at sign time). */
+  amountUsdMicros: string
+  createdAt: string
+}
+
+export interface PlatformProjectSpend {
+  projectId: string | null
+  totalUsdMicros: string
+  count: number
+}
+
+export interface PlatformHistory {
+  /**
+   * Per-transaction spend history (newest first) from the Worker's durable
+   * local ledger. PymtHouse has no project dimension, so the per-ticket entries
+   * (with project attribution) live here.
+   */
+  history: PlatformSpendEntry[]
+  /** Per-project spend totals (the null projectId bucket = unattributed spend). */
+  perProject: PlatformProjectSpend[]
+  /** PymtHouse's own per-user invoices (authoritative settled charges). */
+  invoices: unknown[]
+  configured: boolean
+}
+
 export interface PlatformCheckoutResponse {
   url: string
   configured: boolean
@@ -478,7 +507,6 @@ export class ApiClient {
 
   static cancelGeneration = makeEndpointClient('/api/generate/cancel', 'post')
 
-  static getGenerationProgress = makeEndpointClient('/api/generation/progress', 'get')
 
   static generateImage = makeEndpointClient('/api/generate-image', 'post')
 
@@ -605,6 +633,13 @@ export class ApiClient {
     type: string
     manifestId?: string
     state?: string
+    /**
+     * Optional project attribution. Sent as a sibling `projectId` body field next
+     * to `pymt`: the Worker reads it for its durable spend ledger but never
+     * forwards it to the PymtHouse DMZ payload (per-project spend is a local
+     * concept — PymtHouse meters by end-user only). Absent => unattributed spend.
+     */
+    projectId?: string
   }): Promise<
     { ok: true; data: { payment: string; segCreds: string; state?: string } }
     | { ok: false; status: number; error: any }
@@ -616,14 +651,20 @@ export class ApiClient {
     //     ManifestID: <manifest_id>, state? }
     // So the 402's payment_params must be placed under `orchestrator` and the
     // manifest id under the capitalised `ManifestID`.
-    const dmz: Record<string, unknown> = {
-      orchestrator: body.paymentParams,
-      type: body.type,
-      ManifestID: body.manifestId ?? '',
+    // `pymt` is the ONLY field the Worker relays to PymtHouse — it must hold the
+    // exact DMZ payload ({ orchestrator, type, ManifestID, state? }). Everything
+    // else (projectId, ...) is local tracking the Worker reads and never forwards.
+    const payload: Record<string, unknown> = {
+      pymt: {
+        orchestrator: body.paymentParams,
+        type: body.type,
+        ManifestID: body.manifestId ?? '',
+        ...(body.state ? { state: body.state } : {}),
+      },
     }
-    if (body.state) dmz.state = body.state
+    if (body.projectId) payload.projectId = body.projectId
     try {
-      const res = await backendFetch('/sign-ticket', { method: 'POST', body: JSON.stringify(dmz) })
+      const res = await backendFetch('/sign-ticket', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       const json = await res.json().catch(() => null)
       if (res.ok && json?.payment) return { ok: true, data: json }
       return { ok: false, status: res.status, error: json }
@@ -652,6 +693,11 @@ export class ApiClient {
 
   static getPlatformBalance(): Promise<PlatformRequestResult<PlatformBalance>> {
     return platformRequest<PlatformBalance>('/api/platform/balance', 'get')
+  }
+
+  /** GET /api/platform/history — spending history + per-project totals. */
+  static getPlatformHistory(): Promise<PlatformRequestResult<PlatformHistory>> {
+    return platformRequest<PlatformHistory>('/api/platform/history', 'get')
   }
 
   static createPlatformCheckout(tier: number): Promise<PlatformRequestResult<PlatformCheckoutResponse>> {

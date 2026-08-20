@@ -21,10 +21,11 @@ import {
   recordOptimisticDebit,
   getBalanceSync,
   setBalanceSync,
+  recordSpendEntry,
 } from "./ledger";
 import { resolveUserBalance } from "./balance";
 import { sendCodeEmail } from "./recovery";
-import { createCheckoutSession, verifyWebhook } from "./stripe";
+import { verifyWebhook } from "./stripe";
 import type { Env } from "./types";
 import { getPayerAddress, getSignerProxy, handleAuthorize, invalidatePayerAddress } from "./signer";
 import {
@@ -42,14 +43,14 @@ import {
 } from "./utils";
 import { getHealth } from "./routes/health";
 import { getSettingsRoute, postSettingsRoute, getSettingsFalKey } from "./routes/settings";
-import { getPlatformStatus } from "./routes/platform";
+import { getPlatformHistory, getPlatformStatus } from "./routes/platform";
 
 async function handle(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
 
-    if (method === "OPTIONS") return handleOptions(env);
+    if (method === "OPTIONS") return handleOptions(request, env);
 
     // Liveness (keep-remote).
     if (method === "GET" && path === "/health") return await getHealth();
@@ -125,6 +126,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       // Platform:
       if (method === "GET" && path === "/api/platform/status") return await getPlatformStatus(request, env);
       if (method === "GET" && path === "/api/platform/balance") return await getPlatformBalance(env, uid);
+      if (method === "GET" && path === "/api/platform/history") return await getPlatformHistory(request, env, uid);
       if (method === "POST" && path === "/api/platform/checkout") return await postPlatformCheckout(request, env, uid);
       if (method === "POST" && path === "/api/platform/link-email") return await postPlatformLinkEmail(request, env, uid);
 
@@ -310,8 +312,13 @@ async function postPlatformCheckout(request: Request, env: Env, externalUserId: 
   const tier = findTier(env, body?.tier ?? NaN);
   if (!tier) return err("Unknown top-up tier", 400);
   await upsertAccount(env.DB, externalUserId);
-  const { url } = await createCheckoutSession(env, externalUserId, tier, {});
-  return ok({ url, configured: true });
+  // Merchant billing: per-user top-up via PymtHouse's hosted Stripe Checkout
+  // (Connect rail). Funds land in the user's wallet on checkout.session.completed.
+  const client = new PymtHouseClient(env);
+  const amountUsd = tier.creditsCents / 100;
+  const { checkoutUrl } = await client.createWalletTopUp(externalUserId, amountUsd);
+  if (!checkoutUrl) return err("PymtHouse did not return a checkout URL", 502);
+  return ok({ url: checkoutUrl, configured: true });
 }
 
 async function postPlatformLinkEmail(request: Request, env: Env, externalUserId: string): Promise<Response> {
@@ -368,9 +375,38 @@ async function postPlatformRecoverConfirm(request: Request, env: Env): Promise<R
 // The upstream response is relayed to the browser unchanged.
 // ---------------------------------------------------------------------------
 async function handleSignTicket(request: Request, env: Env, externalUserId: string): Promise<Response> {
+  // The browser sends `{ pymt: <DMZ payload>, projectId?, ... }`. `pymt` is the
+  // ONLY field forwarded to PymtHouse — it is relayed verbatim to the DMZ
+  // (orchestrator/type/ManifestID/state). Everything else in the body is local
+  // tracking/analytics (e.g. projectId) that the Worker reads for its own durable
+  // spend ledger and NEVER forwards, so the third-party DMZ payload stays clean.
+  // Per-project spend is a LOCAL concept: PymtHouse meters by end-user only.
+  let projectId: string | null = null;
+  let relay: Request = request;
+  const parsed = (await request.clone().json().catch(() => ({}))) as Record<string, unknown>;
+  if (parsed && typeof parsed === "object") {
+    const rawPid = (parsed as { projectId?: unknown }).projectId;
+    projectId = typeof rawPid === "string" && rawPid.trim() ? rawPid.trim() : null;
+    if (parsed.pymt !== undefined) {
+      // Rebuild the relay with ONLY the pymt payload — drop every tracking field so
+      // it never reaches the DMZ. Authorization (the auth key) is preserved; the
+      // SDK proxy replaces it with the minted signer JWT.
+      const clone = request.clone();
+      const h = new Headers(clone.headers);
+      h.set("content-type", "application/json");
+      h.delete("x-vc-project-id"); // belt-and-suspenders: the header is no longer used
+      relay = new Request(clone.url, {
+        method: clone.method,
+        headers: h,
+        body: JSON.stringify(parsed.pymt),
+        redirect: clone.redirect,
+      });
+    }
+  }
+
   let upstream: Response;
   try {
-    upstream = await (await getSignerProxy(env))(request);
+    upstream = await (await getSignerProxy(env))(relay);
   } catch (e) {
     return err(`sign-ticket failure: ${(e as Error).message}`, 502);
   }
@@ -392,6 +428,14 @@ async function handleSignTicket(request: Request, env: Env, externalUserId: stri
     const usage = extractTicketUsage(text);
     if (usage && usage.requestId && usage.ticketEvUsdMicros > 0) {
       await recordOptimisticDebitForUser(env, externalUserId, usage.requestId, usage.ticketEvUsdMicros);
+      // Durable spend-history row (never pruned) with optional project attribution.
+      if (env.DB) {
+        try {
+          await recordSpendEntry(env.DB, externalUserId, projectId, usage.requestId, usage.ticketEvUsdMicros);
+        } catch {
+          // Best-effort audit; never fail the sign.
+        }
+      }
     }
   } catch {
     // Optimistic debit is best-effort audit/display; never fail the client.
@@ -548,14 +592,19 @@ async function handleStripeWebhook(raw: string, signature: string | null, env: E
 // CORS
 // ---------------------------------------------------------------------------
 
-function handleOptions(env: Env): Response {
+function handleOptions(request: Request, env: Env): Response {
   const allow = env.ALLOWED_ORIGIN || "*";
+  // Echo back the exact set of headers the preflight asked for (authorization,
+  // content-type, X-VC-Project-Id, ...) instead of a hardcoded allow-list. A
+  // hardcoded list silently breaks every future custom header with a CORS
+  // preflight block — exactly what happened to /sign-ticket's X-VC-Project-Id.
+  const reqHeaders = request.headers.get("access-control-request-headers");
   return new Response(null, {
     status: 204,
     headers: {
       "access-control-allow-origin": allow,
       "access-control-allow-methods": "GET, POST, OPTIONS",
-      "access-control-allow-headers": "authorization, content-type",
+      "access-control-allow-headers": reqHeaders || "authorization, content-type",
       "access-control-max-age": "86400",
     },
   });

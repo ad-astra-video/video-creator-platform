@@ -351,6 +351,75 @@ export async function sumOptimisticDebits(db: D1Database, externalUserId: string
   return total;
 }
 
+// ---------------------------------------------------------------------------
+// Durable spend ledger (per-ticket spend history + per-project attribution)
+//
+// DISTINCT from the optimistic_debits mirror above. Every successful /sign-ticket
+// records ONE durable row here (deduped by (user, request_id)) with the exact
+// ticketEV PymtHouse charges and an OPTIONAL project_id. These rows are NEVER
+// pruned — they are the spend history the webapp surfaces. Per-project totals
+// come from grouping here, because PymtHouse has no project dimension (its
+// metering subject is the end-user only).
+// ---------------------------------------------------------------------------
+
+export interface SpendEntryRow {
+  id: number;
+  external_user_id: string;
+  project_id: string | null;
+  request_id: string;
+  /** Ticket expected value in USD micros (ticketEV) — exactly what PymtHouse charges. */
+  expected_value_usd_micros: number;
+  created_at: string;
+}
+
+/** Record one durable spend entry (idempotent by (user, requestId)). Returns true only if newly inserted. */
+export async function recordSpendEntry(
+  db: D1Database,
+  externalUserId: string,
+  projectId: string | null,
+  requestId: string,
+  expectedValueUsdMicros: number,
+): Promise<boolean> {
+  const inserted = await db
+    .prepare(
+      `INSERT OR IGNORE INTO spend_entries (external_user_id, project_id, request_id, expected_value_usd_micros)
+       VALUES (?1, ?2, ?3, ?4)`,
+    )
+    .bind(externalUserId, projectId || null, requestId, Math.max(0, Math.floor(expectedValueUsdMicros)))
+    .run();
+  return (inserted.meta.changes ?? 0) > 0;
+}
+
+/** Newest-first spend history for a user. */
+export async function listSpendEntries(db: D1Database, externalUserId: string, limit = 200): Promise<SpendEntryRow[]> {
+  const res = await db
+    .prepare("SELECT * FROM spend_entries WHERE external_user_id = ?1 ORDER BY id DESC LIMIT ?2")
+    .bind(externalUserId, limit)
+    .all<SpendEntryRow>();
+  return res.results as SpendEntryRow[];
+}
+
+export interface ProjectSpendRow {
+  project_id: string | null;
+  /** Sum of ticketEV in USD micros charged against this project. */
+  total_usd_micros: number;
+  /** Number of signed tickets attributed to this project. */
+  count: number;
+}
+
+/** Per-project spend totals for a user (global row included, project_id = null). */
+export async function sumSpendByProject(db: D1Database, externalUserId: string): Promise<ProjectSpendRow[]> {
+  const res = await db
+    .prepare(
+      `SELECT project_id, SUM(expected_value_usd_micros) AS total_usd_micros, COUNT(*) AS count
+       FROM spend_entries WHERE external_user_id = ?1
+       GROUP BY project_id`,
+    )
+    .bind(externalUserId)
+    .all<ProjectSpendRow>();
+  return res.results as ProjectSpendRow[];
+}
+
 export interface BalanceSyncRow {
   external_user_id: string;
   last_consumed_usd_micros: number;

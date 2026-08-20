@@ -83,8 +83,9 @@ export async function getSignerProxy(env: Env) {
       pymthouseM2MClientSecret: env.PYMTHOUSE_M2M_CLIENT_SECRET,
       remoteSignerUrl,
       // Browser POSTs to /sign-ticket; empty suffix → defaults to the DMZ's
-      // /generate-live-payment. The body (paymentParams/type/manifestId/state)
-      // is relayed verbatim to the DMZ.
+      // /generate-live-payment. handleSignTicket already rebuilt the relay body
+      // to contain ONLY the `pymt` field's payload (orchestrator/type/ManifestID/
+      // state); that is what this proxy relays verbatim to the DMZ.
       proxyPathPrefix: "/sign-ticket",
       defaultRemotePath: "/generate-live-payment",
       authenticate: (req) => authUserFromKey(req, env),

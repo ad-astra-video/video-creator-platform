@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { AlertCircle, CreditCard, RefreshCw, Wallet } from 'lucide-react'
-import { useAppSettings } from '../contexts/AppSettingsContext'
-import { ApiClient, type PlatformBalance, type PlatformStatus } from '../lib/api-client'
+import { AlertCircle, CreditCard, Receipt, RefreshCw, Wallet } from 'lucide-react'
+import { ApiClient, type PlatformBalance, type PlatformHistory, type PlatformStatus } from '../lib/api-client'
 
 const TIERS: Array<{ label: string; cents: number; charge: string }> = [
   { label: '$10', cents: 1000, charge: 'pays $11' },
@@ -21,33 +20,38 @@ function formatMicros(micros: number): string {
  * in the settings modal.
  */
 export function AccountPanel({ compact = false }: { compact?: boolean }) {
-  const { settings } = useAppSettings()
-
   const [status, setStatus] = useState<PlatformStatus | null>(null)
   const [balance, setBalance] = useState<PlatformBalance | null>(null)
+  const [history, setHistory] = useState<PlatformHistory | null>(null)
   const [loading, setLoading] = useState(false)
   const [busyTier, setBusyTier] = useState<number | null>(null)
   const [message, setMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
-  const configured = Boolean(settings.hasPlatformBaseUrl) && Boolean(status?.configured)
+  // "Configured" = the platform actually answers (PymtHouse reachable on the Worker),
+  // NOT the desktop-only `settings.hasPlatformBaseUrl` flag (which is never set in the
+  // web build and would leave this panel permanently in its "no platform" empty state
+  // while the header GlobalBalanceButton shows a live balance). status.configured is
+  // the authoritative answer from GET /api/platform/status.
+  const configured = Boolean(status?.configured)
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [s, b] = await Promise.all([
+    const [s, b, h] = await Promise.all([
       ApiClient.getPlatformStatus(),
       ApiClient.getPlatformBalance(),
+      ApiClient.getPlatformHistory(),
     ])
     if (s.ok) setStatus(s.data)
     if (b.ok) setBalance(b.data)
+    if (h.ok) setHistory(h.data)
     setLoading(false)
   }, [])
 
   // Load once a platform server is configured (and whenever it changes, so a
   // just-saved URL immediately reflects balance).
   useEffect(() => {
-    if (!settings.hasPlatformBaseUrl) return
     void load()
-  }, [settings.hasPlatformBaseUrl, load])
+  }, [load])
 
   const topUp = async (cents: number) => {
     setBusyTier(cents)
@@ -62,65 +66,26 @@ export function AccountPanel({ compact = false }: { compact?: boolean }) {
     setMessage({ kind: 'ok', text: 'Opening secure checkout in your browser. Refresh when you’re done.' })
   }
 
-  // Compact sidebar variant: just the essentials (balance + access), with a
-  // hint to open Settings for the full account view.
+  // Compact sidebar variant (main dashboard): just the wallet icon + live $$ balance,
+  // with a quiet refresh button on the right. No explanatory text (the settings
+  // Account tab carries the detail).
   if (compact) {
     return (
-      <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Wallet className="h-4 w-4 text-amber-400" />
-            <span className="text-xs font-semibold text-white uppercase tracking-wider">Account</span>
-          </div>
-          <button
-            onClick={() => { setMessage(null); void load() }}
-            disabled={loading}
-            className="inline-flex items-center text-[10px] text-zinc-400 hover:text-white disabled:text-zinc-600"
-            title="Refresh balance"
-          >
-            <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
-          </button>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <Wallet className="h-4 w-4 text-amber-400 shrink-0" />
+          <span className="text-sm font-semibold text-white truncate" title="Platform credits">
+            {balance ? formatMicros(Number(balance.balanceUsdMicros)) : '—'}
+          </span>
         </div>
-
-        {!configured ? (
-          <p className="text-[11px] text-zinc-500 leading-relaxed">
-            No platform connected. Balance and credits will appear here once a platform server is set in Settings.
-          </p>
-        ) : (
-          <>
-            {balance?.hasAccess === false && (
-              <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg px-2.5 py-1.5 text-[11px] text-amber-300 flex items-center gap-1.5">
-                <AlertCircle className="h-3 w-3 flex-shrink-0" />
-                Insufficient credits
-              </div>
-            )}
-            <div className="flex items-end justify-between">
-              <div>
-                <p className="text-[10px] text-zinc-500">Balance</p>
-                <p className="text-xl font-semibold text-white leading-tight">
-                  {balance ? formatMicros(Number(balance.balanceUsdMicros)) : '—'}
-                </p>
-                {balance && Number(balance.pendingUsdMicros ?? 0) > 0 && (
-                  <p className="text-[10px] text-amber-400/80 leading-tight">
-                    {formatMicros(Number(balance.pendingUsdMicros))} in-flight (updating)
-                  </p>
-                )}
-              </div>
-              <div className="text-right">
-                <p className="text-[10px] text-zinc-500">Remaining</p>
-                <p className="text-sm font-medium text-zinc-300 leading-tight">
-                  {balance ? formatMicros(Number(balance.remainingUsdMicros)) : '—'}
-                </p>
-              </div>
-            </div>
-          </>
-        )}
-
-        {message && (
-          <p className={`text-[11px] px-2 py-1 rounded ${message.kind === 'ok' ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'}`}>
-            {message.text}
-          </p>
-        )}
+        <button
+          onClick={() => void load()}
+          disabled={loading}
+          className="inline-flex items-center text-zinc-400 hover:text-white disabled:text-zinc-600 shrink-0"
+          title="Refresh balance"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+        </button>
       </div>
     )
   }
@@ -167,14 +132,10 @@ export function AccountPanel({ compact = false }: { compact?: boolean }) {
               </div>
             )}
 
-            <div className="grid grid-cols-2 gap-3 text-xs">
+            <div className="grid grid-cols-3 gap-3 text-xs">
               <div>
                 <p className="text-zinc-500">Balance</p>
                 <p className="text-lg font-semibold text-white">{balance ? formatMicros(Number(balance.balanceUsdMicros)) : '—'}</p>
-              </div>
-              <div>
-                <p className="text-zinc-500">Remaining</p>
-                <p className="text-lg font-semibold text-zinc-300">{balance ? formatMicros(Number(balance.remainingUsdMicros)) : '—'}</p>
               </div>
               <div>
                 <p className="text-zinc-500">Consumed</p>
@@ -215,10 +176,72 @@ export function AccountPanel({ compact = false }: { compact?: boolean }) {
             <div className="flex items-center gap-2 text-xs">
               <span className={`w-1.5 h-1.5 rounded-full ${configured ? 'bg-emerald-400' : 'bg-zinc-600'}`} />
               <span className="text-zinc-300">{configured ? 'Connected' : 'Not connected'}</span>
-              {settings.hasPlatformBaseUrl && (
-                <span className="text-zinc-600 truncate">· {settings.platformBaseUrl}</span>
+              {status?.configured && status.baseUrl && (
+                <span className="text-zinc-600 truncate">· {status.baseUrl}</span>
               )}
             </div>
+          </div>
+
+          {/* Spending history + per-project breakdown */}
+          <div className="bg-zinc-800/50 rounded-lg p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Receipt className="h-4 w-4 text-amber-400" />
+                <span className="text-sm font-medium text-white">Spending history</span>
+              </div>
+              <span className="text-[10px] text-zinc-500">charged at generation</span>
+            </div>
+
+            {!history || history.history.length === 0 ? (
+              <p className="text-[11px] text-zinc-500 leading-relaxed">
+                No spend recorded yet. Every paid generation is listed here the moment its payment
+                ticket is signed (per-project breakdown below).
+              </p>
+            ) : (
+              <>
+                {/* Per-project totals */}
+                <div className="space-y-1.5">
+                  {history.perProject
+                    .filter((p) => p.projectId !== null)
+                    .map((p) => (
+                      <div key={p.projectId} className="flex items-center justify-between text-xs">
+                        <span className="text-zinc-400 truncate pr-2">{p.projectId}</span>
+                        <span className="text-zinc-200 font-medium whitespace-nowrap">
+                          {formatMicros(Number(p.totalUsdMicros))}
+                          <span className="text-zinc-600 font-normal"> · {p.count}</span>
+                        </span>
+                      </div>
+                    ))}
+                </div>
+
+                {/* Recent transactions */}
+                <div className="border-t border-zinc-700/60 pt-2 space-y-1.5 max-h-48 overflow-y-auto">
+                  {history.history.slice(0, 20).map((entry) => (
+                    <div key={entry.requestId} className="flex items-center justify-between gap-2 text-xs">
+                      <div className="flex items-center gap-2 min-w-0">
+                        {entry.projectId ? (
+                          <span className="text-[10px] text-zinc-600 truncate">{entry.projectId}</span>
+                        ) : (
+                          <span className="text-[10px] text-zinc-600">—</span>
+                        )}
+                        <span className="text-zinc-500 shrink-0">
+                          {new Date(entry.createdAt.replace(' ', 'T') + 'Z').toLocaleDateString(undefined, {
+                            month: 'short',
+                            day: 'numeric',
+                          })}
+                        </span>
+                      </div>
+                      <span className="text-zinc-200 font-medium shrink-0">
+                        {formatMicros(Number(entry.amountUsdMicros))}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[10px] text-zinc-600">
+                  Amount is the ticket's expected value charged by PymtHouse at generation time.
+                </p>
+              </>
+            )}
           </div>
         </>
       )}

@@ -45,15 +45,17 @@ export class PymtHouseClient {
   }
 
   /**
-   * Real-time entitlement check. Reads the canonical per-user allowances endpoint,
-   * which INCLUDES manual top-up grants (the /usage/balance read only reflects the
-   * subscription/Starter ledger and omits top-ups). allowances.balanceUsdMicros is
-   * the current remaining entitlement ("Balance" in the UI).
+   * Real-time per-user entitlement check. Reads the lightweight `/usage/balance`
+   * gate endpoint which returns the per-user remaining entitlement
+   * (`balanceUsdMicros`, `consumedUsdMicros`, `lifetimeGrantedUsdMicros`,
+   * `hasAccess`). In merchant billing mode this endpoint is scoped per
+   * `externalUserId` (verified live); the legacy `/users/{id}/allowances` read
+   * returns an incompatible shape and must not be used.
    */
   async getBalance(externalUserId: string): Promise<Balance> {
     const raw = (await this.request(
       "GET",
-      `${this.base()}/users/${encodeURIComponent(externalUserId)}/allowances`,
+      `${this.base()}/usage/balance?externalUserId=${encodeURIComponent(externalUserId)}`,
     )) as { allowances?: AllowanceView } | AllowanceView;
     const a = (raw && (raw as { allowances?: AllowanceView }).allowances) || (raw as AllowanceView);
     const balUsd = String(a?.balanceUsdMicros ?? "0");
@@ -85,6 +87,37 @@ export class PymtHouseClient {
       amountUsdMicros,
       source: "job",
     });
+  }
+
+  /**
+   * Create a per-user prepaid top-up via PymtHouse's hosted Stripe Checkout
+   * (merchant/Connect rail). In merchant billing mode the `externalUserId` is
+   * required in the body and the checkout is scoped to that end-user; funds land
+   * in the user's wallet when Stripe fires `checkout.session.completed`
+   * (PymtHouse handles the Connect webhook — the worker does not). Returns the
+   * Stripe-hosted checkout URL the end-user completes.
+   */
+  async createWalletTopUp(
+    externalUserId: string,
+    amountUsd: number,
+    urls?: { successUrl?: string; cancelUrl?: string },
+  ): Promise<{ checkoutUrl: string }> {
+    const data = (await this.request("POST", `${this.base()}/billing/wallet/top-up`, {
+      externalUserId,
+      amountUsd,
+      successUrl: urls?.successUrl,
+      cancelUrl: urls?.cancelUrl,
+    })) as { checkoutUrl?: string };
+    return { checkoutUrl: String(data?.checkoutUrl || "") };
+  }
+
+  /** PymtHouse-issued invoices / billed charges for a user (authoritative settled spend). */
+  async getInvoices(externalUserId: string): Promise<unknown[]> {
+    const data = (await this.request(
+      "GET",
+      `${this.base()}/users/${encodeURIComponent(externalUserId)}/invoices`,
+    )) as { items?: unknown[] };
+    return Array.isArray(data?.items) ? data.items : [];
   }
 
   /** DMZ / identity-webhook URLs (Phase B). Resolves the direct signer DMZ from
