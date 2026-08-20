@@ -2,11 +2,23 @@
 # Serves prompt-enhance + chat/agent behind the live-runner edge, with the root
 # /health /load /evict control surface the swap policy drives.
 #
-# Blackwell (sm_120) note — RTX 5090: llama-cpp-python's prebuilt CUDA wheels
-# (PyPI = CPU-only; abetlen cu* indices are manylinux_2_35 prebuilts that, like
-# SageAttention, generally do NOT ship sm_120 kernels). So GGML_CUDA is compiled
-# here FROM SOURCE against the CUDA 13.0 devel base (nvcc), targeting sm_120 —
-# the same pattern the idv2v-worker uses for SageAttention.
+# Single-modell-host architecture: the NATIVE llama.cpp `llama-server` binary
+# (built from upstream ggml-org/llama.cpp) is the ONLY resident model instance.
+# The aiohttp Python worker (`runner/gemma/server.py`) is the HTTP FRONT + control
+# surface the live-runner swaps; every inference endpoint proxies to llama-server's
+# OpenAI-compatible `/v1*`. pydantic-ai (and any OpenAI client) talks to that same
+# endpoint directly.
+#
+# NOTE: llama-cpp-python is intentionally NOT installed — the worker never loads a
+# Python `Llama` binding (two 12B residents can't co-exist on a 32 GB card, and the
+# agent/reasoning path is the native server). Dropping it avoids the huge from-source
+# CUDA compile and keeps the image lean.
+#
+# Blackwell (sm_120) note — RTX 5090: the native llama.cpp llama-server is compiled
+# here FROM SOURCE against the CUDA 13.0 devel base (nvcc) because prebuilt `cu*`
+# binaries generally do NOT ship sm_120 kernels. We target a cross-generation SASS
+# set so the SAME image runs on Ampere (sm_80 / A100, RTX 3090), Ada (sm_89 /
+# RTX 4090) and Blackwell (sm_120 / RTX 5090): CMAKE_CUDA_ARCHITECTURES=80;89;120.
 #
 # The GGUF is NOT baked in: operators bind-mount their already-downloaded model
 # (google/gemma-4-12B-it-qat-q4_0-gguf) at /models/gemma/*.gguf and set
@@ -36,16 +48,36 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
-# Build llama-cpp-python with CUDA from source, targeting sm_120 (RTX 5090).
-# nvcc comes from the cu13 devel base so it matches the host driver family the
-# stack already runs (torch cu128 / nvidia-cuda:13 base).
-ENV CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=120" \
-    FORCE_CMAKE=1
-# Named version; llama-cpp-python ships its own pin. numpy is a runtime dep too.
-RUN pip install --no-cache-dir "llama-cpp-python>=0.3.30"
-# PyAV (>=13) bundles FFmpeg with Vulkan enabled -> agent media decode/introspect,
-# incl. Vulkan hw upload (needs libvulkan1 + host ICD via NVIDIA_DRIVER_CAPABILITIES).
+# Runtime python deps for the aiohttp control/proxy worker + media helpers.
 RUN pip install --no-cache-dir "aiohttp>=3.9" "numpy>=1.24" "av>=13.0" "Pillow>=10.0"
+
+# Native llama.cpp `llama-server` (upstream ggml-org/llama.cpp). This is the
+# OpenAI-compatible server that returns `reasoning_content` natively and does
+# function/tool calling — the endpoint pydantic-ai agents point at for the Gemma
+# backlog. Built from source for sm_120 (Blackwell) + sm_80/sm_89 (Ampere/Ada) so
+# the image runs across the GPU fleet. The aiohttp worker runs it as a managed
+# subprocess (spawn on /load, stop on /evict) so the GPU-swap policy still owns
+# card residency.
+# Bound the CUDA compile parallelism: an unbounded `-j` (all cores) spawns
+# hundreds of nvcc jobs and OOM-kills the BuildKit daemon (rpc EOF) under
+# Docker Desktop's limited WSL2 RAM. Override at build time with
+# --build-arg BUILD_JOBS=<n>.
+ARG BUILD_JOBS=4
+# CUDA 13 link fix: the devel image's stub dir only ships an unversioned
+# libcuda.so (SONAME libcuda.so.1). Linking llama-server then fails with
+# "libcuda.so.1 ... not found" + undefined refs (cuGetErrorString, cuMemCreate,
+# cuDeviceGet, ...). Provide the versioned name and put the stubs dir on the
+# executable link path (the ld -rpath-link hint).
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    git clone --depth 1 --branch master https://github.com/ggml-org/llama.cpp /tmp/llama.cpp && \
+    cd /tmp/llama.cpp && \
+    cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=on -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES="80;89;120" \
+      -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -L/usr/local/cuda/lib64/stubs" && \
+    cmake --build build --config Release -j${BUILD_JOBS} --target llama-server && \
+    install -m 0755 build/bin/llama-server /usr/local/bin/llama-server && \
+    rm -rf /tmp/llama.cpp
 
 # Vulkan loader bump. Ubuntu 24.04's libvulkan1 is 1.3.275, but the host
 # NVIDIA 580 driver's Vulkan ICD advertises API 1.4.312; the 1.3 loader cannot
@@ -59,7 +91,7 @@ RUN pip install --no-cache-dir "aiohttp>=3.9" "numpy>=1.24" "av>=13.0" "Pillow>=
 #     satisfied by noble's 2.39, so it installs with NO libc6 upgrade / no
 #     cross-release rebuild. dpkg -i correctly supersedes noble's 1.3.275 and
 #     re-runs ldconfig.
-# Kept as a late, separate RUN so the expensive llama-cpp sm_120 compile and the
+# Kept as a late, separate RUN so the expensive llama.cpp sm_120 compile and the
 # PyAV/Pillow layers above stay cache-hit on rebuild.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
     curl -fsSL -o /tmp/libvulkan1.deb \

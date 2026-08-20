@@ -28,6 +28,7 @@ from aiohttp import web
 
 from . import config
 from . import run as run_mod
+from . import gemma_forward
 from .model import ModelManager, health_check
 
 logger = logging.getLogger("video_creator.runner.idv2v.server")
@@ -243,37 +244,140 @@ async def handle_info(request: web.Request) -> web.Response:
 # Inference
 # ---------------------------------------------------------------------------
 
+async def _run_gemma_stage(source_b64: str, prompt: str,
+                           enhance_prompt: bool, seed) -> tuple:
+    """Run the Gemma prompt stage (enhance + auto video caption) for a restyle.
+
+    Prefers forwarding to the SHARED gemma-worker (config.GEMMA_FORWARD_URL, the
+    llama.cpp Gemma 4 worker on the compose network): when it is configured and
+    reachable, enhance/caption are sent there and the worker NEVER loads its own
+    embedded Gemma 3 (no redundant ~24.5 GB model, no shared-GPU eviction dance).
+    Falls back to the embedded Gemma 3 when forwarding is unavailable but the
+    checkpoint is provisioned, and finally degrades to the unmodified prompt.
+    Never raises: any failure is non-fatal so the restyle pipeline still runs.
+
+    Returns ``(final_prompt, meta)`` where meta carries ``caption``,
+    ``enhanced_prompt``, ``enhanced`` for the UI.
+    """
+    base = config.gemma_forward_base()
+    if base:
+        try:
+            if await gemma_forward.gemma_worker_available(base, config.worker_token()):
+                logger.info("Using shared gemma-worker (%s) for restyle enhance/caption", base)
+                return await _gemma_stage_forward(base, source_b64, prompt,
+                                                  enhance_prompt, seed)
+            logger.warning("gemma-worker %s unreachable — falling back to embedded Gemma 3", base)
+        except Exception as exc:
+            logger.warning("gemma-worker forward failed — falling back to embedded Gemma 3: %s", exc)
+
+    if config.gemma_enabled():
+        from .gemma import get_enhancer
+
+        def _gemma_wrapper():
+            enhancer = get_enhancer()
+            try:
+                return run_mod._gemma_stage(
+                    enhancer, source_b64, prompt, enhance_prompt, seed)
+            finally:
+                # Free VRAM so the video model can load on the shared GPU.
+                enhancer.unload()
+
+        return await asyncio.to_thread(_gemma_wrapper)
+
+    return (prompt, {"caption": None, "enhanced_prompt": None, "enhanced": False})
+
+
+async def _gemma_stage_forward(base: str, source_b64: str, prompt: str,
+                               enhance_prompt: bool, seed) -> tuple:
+    """Mirror of ``run._gemma_stage`` but via the shared gemma-worker.
+
+    Uses the id-v2v worker's own DEDICATED system prompts so the restyle
+    semantics are preserved (the color-fidelity RESTYLE_ENHANCE prompt, the
+    CAPTION prompt) while the actual inference runs on the gemma-worker.
+    """
+    from .gemma import CAPTION_SYSTEM_PROMPT, RESTYLE_ENHANCE_SYSTEM_PROMPT
+
+    want_caption = (not prompt.strip()
+                    or prompt.strip().lower() == "restyle this video")
+    final = prompt
+    meta = {"caption": None, "enhanced_prompt": None, "enhanced": False}
+    token = config.worker_token()
+    if want_caption:
+        frames = await asyncio.to_thread(run_mod._sample_source_frames, source_b64)
+        if frames:
+            context_frames = await asyncio.to_thread(_encode_frames_to_b64_jpeg, frames)
+            logger.info("gemma-worker captioning %d sampled frame(s)", len(frames))
+            caption_seed = None if seed is None else (seed + 1)
+            captioned = await gemma_forward.forward_prompt_enhance(
+                base, prompt="Describe this video clip.",
+                system_prompt=CAPTION_SYSTEM_PROMPT,
+                context_frames=context_frames, seed=caption_seed, token=token)
+            if captioned:
+                final = captioned
+                meta["caption"] = captioned
+                logger.info("gemma-worker auto-caption result: %r", final)
+            else:
+                logger.info("gemma-worker caption empty — keeping original prompt")
+    if enhance_prompt and final.strip():
+        enhanced = await gemma_forward.forward_prompt_enhance(
+            base, prompt=final, system_prompt=RESTYLE_ENHANCE_SYSTEM_PROMPT,
+            seed=seed, token=token)
+        if enhanced:
+            meta["enhanced_prompt"] = enhanced
+            meta["enhanced"] = True
+            final = enhanced
+            logger.info("gemma-worker enhanced prompt: %r", final)
+    return (final, meta)
+
+
+def _encode_frames_to_b64_jpeg(frames, max_side: int = 896) -> list:
+    """Encode PIL RGB frames to base64 JPEG strings (aspect-preserved).
+
+    Matches the gemma-worker's expectation that ``context_frames`` are base64
+    JPEG image strings (one per sampled video frame), and the id-v2v SigLIP
+    caption convention of ~896 max-side.
+    """
+    import base64 as _b64
+    import io as _io
+
+    from PIL import Image
+
+    out = []
+    for frame in frames:
+        img = frame.convert("RGB")
+        w, h = img.size
+        scale = min(1.0, max_side / max(w, h))
+        if scale < 1.0:
+            img = img.resize(
+                (max(2, int(round(w * scale))), max(2, int(round(h * scale)))),
+                Image.BICUBIC,
+            )
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        out.append(_b64.b64encode(buf.getvalue()).decode("ascii"))
+    return out
+
+
 async def handle_restyle(request: web.Request) -> web.Response:
     _require_token(request)
     body = await request.json()
     job_id = body.get("job_id") or uuid.uuid4().hex[:12]
 
-    # Gemma LLM stage (enhance + auto video caption). It shares ONE GPU with the
-    # id-v2v model, so it runs BEFORE the video model loads — Gemma loads (evicting
-    # any resident video model from a prior job via the evict hook), enhances, then
-    # is unloaded to free VRAM. The enhanced prompt + LLM metadata ride into
-    # process_job via body["prompt"] / body["_gemma_meta"].
+    # Gemma LLM stage (enhance + auto video caption). Prefers forwarding to the
+    # shared gemma-worker (config.GEMMA_FORWARD_URL, the llama.cpp Gemma 4 worker
+    # on the compose network) — the worker then does NOT load its own embedded
+    # Gemma 3 (no redundant ~24.5 GB model, no shared-GPU eviction). It falls back
+    # to the embedded Gemma 3 when forwarding is unavailable, and is non-fatal
+    # either way (the original prompt survives). The enhanced prompt + LLM metadata
+    # ride into process_job via body["prompt"] / body["_gemma_meta"].
     _prompt = str(body.get("prompt") or "").strip()
     _enhance = bool(body.get("enhance_prompt", False))
     _want_caption = (not _prompt or _prompt.lower() == "restyle this video")
-    if config.gemma_enabled() and (_want_caption or _enhance):
-        from .gemma import get_enhancer
-        from . import run as _run
-
-        def _gemma_wrapper():
-            enhancer = get_enhancer()
-            try:
-                final, meta = _run._gemma_stage(
-                    enhancer, body.get("source_video", ""), _prompt,
-                    _enhance, body.get("seed"),
-                )
-            finally:
-                # Free VRAM so the video model can load on the shared GPU.
-                enhancer.unload()
-            return final, meta
-
+    if _want_caption or _enhance:
         try:
-            final, gemma_meta = await asyncio.to_thread(_gemma_wrapper)
+            final, gemma_meta = await _run_gemma_stage(
+                body.get("source_video", ""), _prompt, _enhance, body.get("seed"),
+            )
             body["prompt"] = final
             body["_gemma_meta"] = gemma_meta
             run_mod.set_progress(job_id, 0.04, "preprocessing", "decoding source + conditioning")
@@ -406,9 +510,12 @@ async def handle_prompt_enhance(request: web.Request) -> web.Response:
     Body JSON: {prompt: str, image_base64?: str (optional, for image-edit/i2v
     enhancement via the vision tower), seed?: int}.
 
-    Serves the SAME Gemma 3 model the worker uses for auto-captioning, so the
-    whole LLM feature (video enhance + auto-caption + image-edit enhance) is
-    provided by this worker alone and never depends on the LTX runner being up.
+    Prefers forwarding to the SHARED gemma-worker (config.GEMMA_FORWARD_URL)
+    using this worker's own DEDICATED system prompts (text ->
+    ENHANCE_T2V_SYSTEM_PROMPT, image -> IMAGE_ENHANCE_SYSTEM_PROMPT), so the
+    actual inference runs on the shared llama.cpp Gemma 4 worker and the embedded
+    Gemma 3 is never loaded. Falls back to the embedded Gemma 3 when the
+    gemma-worker is unreachable, and to a 503 when neither is available.
 
     Returns {enhanced_prompt: str, image: bool}.
     """
@@ -417,15 +524,32 @@ async def handle_prompt_enhance(request: web.Request) -> web.Response:
     prompt = str(body.get("prompt") or "").strip()
     if not prompt:
         return web.json_response({"error": "missing 'prompt'"}, status=400)
+    image_b64 = body.get("image_base64")
+    has_image = bool(image_b64)
+    seed = body.get("seed")
+
+    base = config.gemma_forward_base()
+    if base:
+        try:
+            if not await gemma_forward.gemma_worker_available(base, config.worker_token()):
+                raise RuntimeError("gemma-worker unreachable")
+            from .gemma import ENHANCE_T2V_SYSTEM_PROMPT, IMAGE_ENHANCE_SYSTEM_PROMPT
+            system = IMAGE_ENHANCE_SYSTEM_PROMPT if has_image else ENHANCE_T2V_SYSTEM_PROMPT
+            enhanced = await gemma_forward.forward_prompt_enhance(
+                base, prompt=prompt, system_prompt=system,
+                image_base64=image_b64 or None, seed=seed,
+                token=config.worker_token())
+            return web.json_response({"enhanced_prompt": enhanced, "image": has_image})
+        except Exception as exc:
+            logger.warning(
+                "gemma-worker /prompt-enhance forward failed (using embedded Gemma 3): %s", exc)
+
     if not config.gemma_enabled():
         return web.json_response(
             {"error": "Gemma not provisioned (GEMMA_ROOT missing)"}, status=503)
 
     from .gemma import get_enhancer
     enhancer = get_enhancer()
-    image_b64 = body.get("image_base64")
-    has_image = bool(image_b64)
-    seed = body.get("seed")
 
     def _run():
         if has_image:

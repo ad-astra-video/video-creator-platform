@@ -1,19 +1,23 @@
-"""gemma-worker HTTP service (aiohttp).
+"""gemma-worker HTTP service (aiohttp) — front + control surface over llama-server.
 
-A swappable worker container driven by the `live-runner` edge on the internal
-Docker network — it does NOT register with the Livepeer Orchestrator or do
-heartbeats (that's the live-runner's job). It exposes the control + inference
-surface the live-runner needs, mirroring ltx-worker / idv2v-worker:
+The native llama.cpp ``llama-server`` is the SINGLE resident model host (built
+from upstream ggml-org/llama.cpp; reasoning + tool-calling). This aiohttp worker
+is the swappable front the live-runner drives, mirroring ltx-worker /
+idv2v-worker. It exposes the root control + inference surface and proxies every
+inference endpoint to the managed llama-server subprocess:
 
-    GET  /health                          — liveness + model-loaded status
-    POST /load                            — load the Gemma GGUF (mmap)
-    POST /evict                           — drop the model, free GPU layers
-    POST /video-creator/v1/prompt-enhance — rewrite a generation prompt
-    POST /video-creator/v1/chat           — general agent chat (future frontend)
+    GET  /health                          — liveness + llama-server status
+    POST /load                            — spawn llama-server (model resident)
+    POST /evict                           — stop llama-server (free GPU)
+    GET  /video-creator/v1/info           — uniform worker info for the scheduler
+    POST /video-creator/v1/prompt-enhance — proxy: rewrite a generation prompt
+    POST /video-creator/v1/chat           — proxy: general agent chat
+    POST /video-creator/v1/suggest-layers — proxy: Qwen layer-count rubric
 
-Auth: every POST requires the shared `X-Worker-Token` header (WORKER_TOKEN env).
-Concurrency: at most GEMMA_MAX_PARALLEL prompt executions admitted concurrently;
-actual GPU eval is serialized inside GemmaLLM.
+Auth: every POST requires the shared `X-Worker-Token` header (WORKER_TOKEN env),
+which is also forwarded to llama-server as a Bearer token. Concurrency: at most
+GEMMA_MAX_PARALLEL prompt executions admitted; llama-server serializes actual GPU
+eval (--parallel 1).
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from typing import Any
 from aiohttp import web
 
 from . import config
-from .model import GemmaLLM
+from . import llama_server as llms
 from runner.ltx.enhance_forward import (
     DEFAULT_I2V_SYSTEM_PROMPT,
     DEFAULT_T2V_SYSTEM_PROMPT,
@@ -49,58 +53,44 @@ def _require_token(request: web.Request) -> None:
         raise web.HTTPForbidden(reason="missing/mismatched X-Worker-Token")
 
 
-# ── Model lifecycle ──────────────────────────────────────────────────────────
+# ── Admission ────────────────────────────────────────────────────────────────
 
-_llm: GemmaLLM | None = None
-_llm_build_lock = threading.Lock()
 # Admission cap: at most GEMMA_MAX_PARALLEL prompt executions in flight.
 _parallel = asyncio.Semaphore(config.GEMMA_MAX_PARALLEL)
 
 
-def _get_llm() -> GemmaLLM:
-    global _llm
-    if _llm is None:
-        with _llm_build_lock:
-            if _llm is None:
-                _llm = GemmaLLM(
-                    model_path=config.GEMMA_MODEL,
-                    mmproj=config.GEMMA_MMPROJ or None,
-                    n_gpu_layers=config.GEMMA_N_GPU_LAYERS,
-                    main_gpu=config.gemma_device_index(),
-                    n_ctx=config.N_CTX,
-                )  # flash_attn is always on (GemmaLLM default True; required)
-    return _llm
-
-
 async def handle_load(request: web.Request) -> web.Response:
     _require_token(request)
-    llm = _get_llm()
-    if not llm.is_ready:
-        try:
-            await asyncio.wait_for(asyncio.to_thread(llm.load), timeout=3600)
-        except asyncio.TimeoutError:
-            return web.json_response({"error": "model load timed out"}, status=504)
-    return web.json_response({"loaded": True, "already_loaded": llm.is_ready})
+    already = await llms.is_running()
+    try:
+        await asyncio.wait_for(llms.ensure_running(), timeout=3600)
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "llama-server start timed out"}, status=504)
+    return web.json_response({"loaded": True, "already_loaded": already})
 
 
 async def handle_evict(request: web.Request) -> web.Response:
     _require_token(request)
-    llm = _get_llm()
-    await asyncio.to_thread(llm.evict)
+    await llms.stop()
     return web.json_response({"evicted": True})
 
 
 async def handle_health(_request: web.Request) -> web.Response:
-    llm = _get_llm()
+    running = await llms.is_running()
     return web.json_response({
         "status": "ok",
-        "model_loaded": llm.is_ready,
+        "model_loaded": running,
         "model": MODEL_NAME,
         "device": config.GEMMA_GPU_DEVICE or "shared",
         "main_gpu": config.gemma_device_index(),
         "n_gpu_layers": config.GEMMA_N_GPU_LAYERS,
         "max_parallel": config.GEMMA_MAX_PARALLEL,
         "dedicated": config.is_dedicated_gpu(),
+        "agent": {
+            "running": running,
+            "base_url": llms.agent_base_url() if running else None,
+            "port": llms.AGENT_PORT,
+        },
     })
 
 
@@ -116,22 +106,25 @@ async def handle_info(_request: web.Request) -> web.Response:
     card), it owns no single GPU -> device_in_use is None so the scheduler never
     pins a card to it.
     """
-    llm = _get_llm()
+    running = await llms.is_running()
     return web.json_response({
         "app": "video-creator",
         "model": MODEL_NAME,
-        "ready": llm.is_ready,
-        "model_loaded": llm.is_ready,
+        "ready": running,
+        "model_loaded": running,
         "device": config.GEMMA_GPU_DEVICE or "shared",
         "main_gpu": config.gemma_device_index(),
         "dedicated": config.is_dedicated_gpu(),
         "devices_visible": 1,
         # Physical card owned (dedicated pin) or None (shared/evictable).
         "device_in_use": config.GEMMA_PHYSICAL_GPU if config.is_dedicated_gpu() else None,
+        # Native OpenAI-compatible agent endpoint provided by llama-server.
+        "agent_base_url": llms.agent_base_url() if running else None,
+        "agent_port": llms.AGENT_PORT,
     })
 
 
-
+# ── Inference (proxied to llama-server) ──────────────────────────────────────
 
 # The rubric used to ask Gemma how many semantic layers an image decomposes into.
 # The model is asked to THINK through the scene before committing to a count, then
@@ -152,13 +145,12 @@ LAYER_SUGGEST_RUBRIC = (
     "2. Consider background, foreground subjects, and any independent objects.\n"
     "3. Estimate whether each element is cleanly separable for editing.\n"
     "4. Choose the SMALLEST number that adequately represents the image.\n"
-    "5. Show your reasoning in <think>...</think> tags, then answer with ONLY "
+    "5. Show your reasoning in  thinking... response tags, then answer with ONLY "
     "the final integer 2-8 on the very last line, inside a single pair of "
     "angle brackets, e.g. <5>.\n"
     "Put no other text after the bracketed number."
 )
 
-# ── Inference ────────────────────────────────────────────────────────────────
 
 def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
     """Build the OpenAI-style chat messages for prompt enhancement.
@@ -172,6 +164,8 @@ def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]],
       - neither: plain text -> DEFAULT_T2V_SYSTEM_PROMPT.
 
     A caller-supplied `system_prompt` (body) always overrides the relevant default.
+    llama-server accepts these OpenAI-format messages directly (incl. multimodal
+    image_url data-URL parts).
     """
     prompt = str(body.get("prompt") or "").strip()
     system_prompt = body.get("system_prompt")
@@ -232,18 +226,20 @@ async def handle_prompt_enhance(request: web.Request) -> web.Response:
         return web.json_response({"error": "missing 'prompt'"}, status=400)
     messages, has_image = _build_enhance_messages(body)
     seed = body.get("seed")
-    llm = _get_llm()
-    if not llm.is_ready:
-        return web.json_response({"error": "Gemma LLM not loaded"}, status=503)
     async with _parallel:
         try:
-            enhanced = await asyncio.to_thread(
-                llm.chat, messages, seed=seed if isinstance(seed, int) else None
+            reasoning, enhanced = await llms.chat_with_reasoning(
+                messages, max_tokens=4096, temperature=0.7,
+                seed=seed if isinstance(seed, int) else None,
             )
         except Exception as exc:
             logger.error("Prompt enhance failed: %s", exc, exc_info=True)
             return web.json_response({"error": str(exc)}, status=500)
-    return web.json_response({"enhanced_prompt": enhanced, "image": has_image})
+    return web.json_response({
+        "enhanced_prompt": enhanced,
+        "reasoning_content": reasoning,
+        "image": has_image,
+    })
 
 
 async def handle_chat(request: web.Request) -> web.Response:
@@ -252,17 +248,13 @@ async def handle_chat(request: web.Request) -> web.Response:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         return web.json_response({"error": "missing 'messages' (list)"}, status=400)
-    llm = _get_llm()
-    if not llm.is_ready:
-        return web.json_response({"error": "Gemma LLM not loaded"}, status=503)
     max_tokens = int(body.get("max_tokens", 512))
     temperature = float(body.get("temperature", 0.7))
     seed = body.get("seed")
     async with _parallel:
         try:
-            content = await asyncio.to_thread(
-                llm.chat, messages, max_tokens=max_tokens,
-                temperature=temperature,
+            content = await llms.chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
                 seed=seed if isinstance(seed, int) else None,
             )
         except Exception as exc:
@@ -278,8 +270,8 @@ async def handle_suggest_layers(request: web.Request) -> web.Response:
     Response: {layers: int (2-8) | null, raw: str}
 
     Feeds the uploaded image + the Qwen-Image-Layered layer-count rubric to the
-    multimodal Gemma chat and returns the parsed integer 2-8 (null when the LLM
-    doesn't produce a parseable number, so the caller falls back to its default).
+    multimodal llama-server chat and returns the parsed integer 2-8 (null when the
+    LLM doesn't produce a parseable number, so the caller falls back to its default).
     """
     _require_token(request)
     body = await request.json()
@@ -296,13 +288,9 @@ async def handle_suggest_layers(request: web.Request) -> web.Response:
             {"type": "text", "text": "How many layers should this image be decomposed into?"},
         ]},
     ]
-    llm = _get_llm()
-    if not llm.is_ready:
-        return web.json_response({"error": "Gemma LLM not loaded"}, status=503)
     async with _parallel:
         try:
-            content = await asyncio.to_thread(llm.chat, messages, max_tokens=512,
-                                              temperature=0.6)
+            content = await llms.chat(messages, max_tokens=512, temperature=0.6)
         except Exception as exc:
             logger.error("suggest-layers failed: %s", exc, exc_info=True)
             return web.json_response({"error": str(exc)}, status=500)

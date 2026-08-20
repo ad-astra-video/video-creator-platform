@@ -25,30 +25,57 @@ logger = logging.getLogger(__name__)
 # Default system prompts, mirroring the desktop app's generic free-rewrite
 # fallback (services/prompt_enhancement/system_prompt.py). Overridable per-
 # (system prompts are fixed constants — not env-overridable on the runner).
-_OUTPUT_FORMAT_INSTRUCTION = (
-    "Respond with ONLY the rewritten prompt, as a single continuous paragraph of "
-    "natural language. No titles, headings, prefaces, explanations, quotes, or "
-    "markdown formatting (no **bold**, no bullet points) — just the prompt text itself."
+_VERBOSE_FORMAT_INSTRUCTION = (
+    "Respond with ONLY the rewritten prompt, as a SINGLE long, deliberately "
+    "VERBOSE paragraph of natural language. Be exhaustively detailed: write "
+    "several dense sentences of rich, concrete visual description instead of a "
+    "terse one-liner — the prompt must be LONG. Never truncate, summarize, or "
+    "shorten it, and never favor brevity over detail; every sentence should add "
+    "specific, granular visual information. No titles, headings, prefaces, "
+    "explanations, quotes, or markdown formatting (no **bold**, no bullet "
+    "points, no numbered list) — just the prompt text itself."
 )
 
 DEFAULT_T2V_SYSTEM_PROMPT = (
     "You are a prompt engineer for a text-to-video generation model. Rewrite the "
-    "user's prompt into a single, vivid, concrete visual description — subject, "
-    "action, setting, lighting, and camera framing — preserving the user's "
-    "original subject and intent without inventing an unrelated scene. "
-    + _OUTPUT_FORMAT_INSTRUCTION
+    "user's prompt into a single, vivid, concrete and VERY LONG visual "
+    "description, preserving the user's original subject and intent without "
+    "inventing an unrelated scene. Describe the scene in great detail, being "
+    "deliberately verbose and covering each of these dimensions as fully as "
+    "possible: "
+    "(1) SUBJECT — identity, age, build, distinctive appearance, clothing, colors, "
+    "facial expression, body language; "
+    "(2) ACTION & MOTION — exactly what the subject does, how, at what pace or "
+    "intensity, and any secondary movement in the frame; "
+    "(3) SETTING — the full environment: location, background, foreground props, "
+    "weather, time of day, and how it is decorated; "
+    "(4) LIGHTING & COLOR — light source and direction, shadows, highlights, mood, "
+    "and the overall color palette; "
+    "(5) CAMERA — framing, angle, distance, lens feel, and any camera movement; "
+    "(6) ATMOSPHERE — texture, material detail, cinematography style, genre, and "
+    "overall mood or tone. "
+    "Err on the side of MORE detail: the more granular and specific your "
+    "description, the better the generated video matches the intent. "
+    + _VERBOSE_FORMAT_INSTRUCTION
 )
 
 DEFAULT_I2V_SYSTEM_PROMPT = (
     "You are a prompt engineer for a text-to-video generation model. The user has also "
     "provided a reference IMAGE that must drive the result: carefully inspect that image and "
-    "rewrite their prompt into a single, vivid, concrete description of the result video — "
-    "subject identity, appearance and pose, action, setting, composition, lighting, color "
-    "palette, and camera framing. Ground every detail in what the image actually shows: "
-    "faithfully preserve the image's subject and its visual appearance, surrounding scene, "
-    "composition, and style, while describing the desired motion on top of it. Do not invent "
+    "rewrite their prompt into a single, vivid, concrete and VERY LONG description of the "
+    "result video, grounded in every detail the image actually shows. Be deliberately "
+    "verbose and cover, as fully as possible: "
+    "(1) the image's subject — identity, appearance, pose, clothing and colors; "
+    "(2) the surrounding scene and composition; "
+    "(3) the action and MOTION to animate on top of the still, including pace and intensity; "
+    "(4) lighting, color palette and style, matching the reference; "
+    "(5) camera framing and any camera movement; "
+    "(6) atmosphere, texture and overall mood. "
+    "Faithfully preserve the image's subject and its visual appearance, surrounding scene, "
+    "composition, and style while describing the desired motion in detail. Do not invent "
     "a different subject, character, or setting that contradicts the reference image. "
-    + _OUTPUT_FORMAT_INSTRUCTION
+    "Err on the side of MORE detail: exhaustively describe the scene in great detail. "
+    + _VERBOSE_FORMAT_INSTRUCTION
 )
 
 DEFAULT_EXTEND_SYSTEM_PROMPT = (
@@ -57,29 +84,32 @@ DEFAULT_EXTEND_SYSTEM_PROMPT = (
     "video's context window — the stretch of footage right at the boundary the extension "
     "attaches to (the last second for an 'end' extension, the first second for a 'start' "
     "extension). Carefully inspect those frames and rewrite the user's short direction into "
-    "a single, vivid continuation prompt that is fully grounded in the source: continue the "
-    "same subject(s) with their identity, appearance, clothing and pose, the same setting, "
-    "composition, framing, lighting, color palette and overall style shown in the frames, "
-    "and the same motion/action already in progress — while honoring the motion or scene "
-    "change the user's direction requests. Do not invent a different subject, character, "
-    "location, or a jarring visual style that contradicts the context frames. The result "
-    "must read as the natural next moment of the supplied footage. "
-    + _OUTPUT_FORMAT_INSTRUCTION
+    "a single, vivid, VERY LONG continuation prompt fully grounded in the source. Be "
+    "deliberately verbose, describing in great detail and at length: the same subject(s) — "
+    "identity, appearance, clothing and pose; the same setting, composition, framing, "
+    "lighting, color palette and overall style shown in the frames; the same motion/action "
+    "already in progress — while honoring the motion or scene change the user's direction "
+    "requests, and the natural next beat of the footage. Do not invent a different subject, "
+    "character, location, or a jarring visual style that contradicts the context frames; the "
+    "result must read as the natural next moment of the supplied footage. "
+    "Lavish concrete visual detail on every element so the continuation is seamless. "
+    + _VERBOSE_FORMAT_INSTRUCTION
 )
 
 DEFAULT_RETAKE_SYSTEM_PROMPT = (
     "You are a prompt engineer for a video RETAKE (re-render) model. The user is "
     "re-rendering a selected segment of an existing clip and has provided FRAMES sampled "
     "from that selected segment. Carefully inspect those frames and rewrite the user's short "
-    "instruction into a single, vivid prompt that re-renders the segment to match the source "
-    "closely: the same subject(s) with their identity, appearance, clothing and pose, the same "
-    "setting, composition, framing, lighting, color palette and style, and the same general "
-    "activity. Change ONLY the one specific thing the user's direction asks to change (for "
-    "example, if a jet is moving erratically, have it straighten out its flight path) and "
-    "leave every other visual element exactly as the frames show. Do not alter anything the "
-    "direction does not explicitly touch. The result must remain visually continuous with the "
-    "supplied frames. "
-    + _OUTPUT_FORMAT_INSTRUCTION
+    "instruction into a single, vivid, VERY LONG prompt that re-renders the segment to match "
+    "the source closely. Be deliberately verbose and richly detailed: restate at length the "
+    "same subject(s) — identity, appearance, clothing and pose — the same setting, "
+    "composition, framing, lighting, color palette and style, and the same general activity. "
+    "Change ONLY the one specific thing the user's direction asks to change (for example, if "
+    "a jet is moving erratically, have it straighten out its flight path) and leave every "
+    "other visual element exactly as the frames show; do not alter anything the direction "
+    "does not explicitly touch. The result must remain visually continuous with the supplied "
+    "frames. Describe everything in great, granular detail. "
+    + _VERBOSE_FORMAT_INSTRUCTION
 )
 
 def _image_mime(base64_image: str) -> str:
@@ -132,12 +162,12 @@ async def forward_prompt_enhance(
         user_content = f"user prompt: {prompt}"
 
     payload: dict[str, Any] = {
-        "messages": [
+        "messages": [ 
             {"role": "system", "content": resolved_system},
             {"role": "user", "content": user_content},
-        ],
+        ], 
         "temperature": 0.7,
-        "max_tokens": 512,
+        "max_tokens": 4096,
         "stream": False,
     }
     if model:

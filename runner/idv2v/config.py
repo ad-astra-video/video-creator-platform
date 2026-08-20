@@ -87,12 +87,21 @@ IDV2V_STAGED = os.environ.get("IDV2V_STAGED", "true").lower() in {"1", "true", "
 #                    same card as the video model; set e.g. cuda:1 to override)
 #   GEMMA_ATTN_IMPL  attention implementation for the LLM (default eager —
 #                    portable, no flash_attn dependency in this image)
-#   GEMMA_ENABLED    "auto" (use only if checkpoint present) | "1" | "0"
-#                    |"force" (error if absent)
+# NOTE: the embedded Gemma 3 is ALWAYS available as the local improve/enhance
+# fallback (see config.gemma_enabled()) — there is intentionally NO env switch
+# to disable it. It only ever loads lazily when the shared gemma-worker
+# (GEMMA_FORWARD_URL) is unreachable.
 GEMMA_ROOT = os.environ.get("GEMMA_ROOT", "/models/gemma")
 GEMMA_GPU_DEVICE = os.environ.get("GEMMA_GPU_DEVICE", "")
 GEMMA_ATTN_IMPL = os.environ.get("GEMMA_ATTN_IMPL", "eager")
-GEMMA_ENABLED = os.environ.get("GEMMA_ENABLED", "auto")
+# Forward prompt-enhance + auto-caption to the SHARED gemma-worker instead of
+# loading the embedded Gemma 3. When set, the worker POSTs enhance/caption
+# requests to <GEMMA_FORWARD_URL>/video-creator/v1/prompt-enhance (the shared
+# llama.cpp Gemma 4 worker; on the compose network http://gemma-worker:8993)
+# and does NOT load its own Gemma 3 (saves ~24.5 GB + the shared-GPU eviction
+# choreography). Falls back to the embedded Gemma 3 if the target is
+# unreachable (config.gemma_enabled() still governs that fallback).
+GEMMA_FORWARD_URL = os.environ.get("GEMMA_FORWARD_URL", "").strip()
 
 
 def gemma_device() -> str:
@@ -107,25 +116,25 @@ def gemma_device() -> str:
 
 
 def gemma_enabled() -> bool:
-    """Whether the Gemma LLM should be engaged for enhance/caption.
+    """Whether the embedded Gemma LLM fallback is available for enhance/caption.
 
-    "auto": engage when the checkpoint directory is present on disk.
-    "1"/"force": always engage (a missing checkpoint then surfaces as an load
-    error). "0": never.
+    ALWAYS enabled (hardcoded — no env override, by design). The embedded Gemma 3
+    is the local fallback the worker uses whenever the shared gemma-worker
+    (GEMMA_FORWARD_URL) is unreachable. It is loaded lazily only when that
+    fallback is actually invoked; if the checkpoint (GEMMA_ROOT) is missing, the
+    load raises and the caller degrades gracefully (non-fatal, original prompt
+    preserved).
     """
-    mode = GEMMA_ENABLED.strip().lower()
-    if mode in ("0", "false", "no", "off"):
-        return False
-    if mode in ("1", "true", "yes", "force"):
-        return True
-    # auto
-    try:
-        return os.path.isdir(GEMMA_ROOT) and any(
-            f.endswith(".safetensors") or f.endswith(".bin")
-            for f in os.listdir(GEMMA_ROOT)
-        )
-    except OSError:
-        return False
+    return True
+
+
+def gemma_forward_base() -> str:
+    """Base URL of the shared gemma-worker (trailing slash stripped); ``""`` = off.
+
+    When non-empty, the worker prefers forwarding enhance/caption to this
+    gemma-worker instead of loading its own embedded Gemma 3.
+    """
+    return GEMMA_FORWARD_URL.rstrip("/")
 
 
 # HTTP server.

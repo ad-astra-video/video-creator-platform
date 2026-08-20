@@ -167,7 +167,16 @@ services:
     runtime: nvidia
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN:-}
-      # Leave GPU_DEVICE unset by default so the worker asks the live-runner
+      # Forward prompt-enhance + auto-caption to the SHARED gemma-worker (llama.cpp
+      # Gemma 4) over the compose network, so the id-v2v worker does NOT load its
+      # own embedded Gemma 3. Falls back to the embedded Gemma 3 if unreachable.
+      - GEMMA_FORWARD_URL=${GEMMA_FORWARD_URL:-http://gemma-worker:8993}
+      # Embedded Gemma 3 is ALWAYS enabled as the local fallback (hardcoded in
+      # config.gemma_enabled(), no env override): enhance/caption prefer the
+      # shared gemma-worker (GEMMA_FORWARD_URL) but fall back to the embedded
+      # model whenever the gemma-worker is unreachable (non-fatal). It is loaded
+      # lazily only when the fallback is actually invoked.
+      # Leave GPU_DEVICE unset by default so the worker asks
       # scheduler for a free GPU at startup (server._resolve_startup_device).
       # Set an explicit index to pin it.
       - GPU_DEVICE=${GPU_DEVICE:-}

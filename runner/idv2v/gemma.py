@@ -96,7 +96,12 @@ CAPTION_SYSTEM_PROMPT = (
 # the max side they're downscaled to (the SigLIP tower expects ~896).
 CAPTION_MAX_FRAMES = 4
 CAPTION_MAX_SIDE = 896
-MAX_NEW_TOKENS = 384
+# Output ceiling matches the DOWNSTREAM Wan 2.1 I2V-14B text encoder's max
+# prompt length (UMT5-XXL max_sequence_length = 512): the enhanced/captioned
+# prompt is fed straight into the Wan restyle, so generating more than 512
+# tokens would only be truncated by the renderer. 512 = the full prompt the
+# video model can ingest.
+MAX_NEW_TOKENS = 512
 
 
 class GemmaEnhancer:
