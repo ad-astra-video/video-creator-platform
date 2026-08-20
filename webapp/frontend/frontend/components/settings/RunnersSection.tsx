@@ -272,16 +272,13 @@ export function RunnersSection() {
 
                 <div className="flex items-center gap-2 text-xs text-zinc-400">
                   <span className="font-medium text-zinc-300">Capacity:</span>
-                  {vramMb ? (
-                    <span className="text-zinc-300">{Math.round(vramMb / 1024)} GB VRAM</span>
-                  ) : (
-                    <span>VRAM unknown</span>
-                  )}
-                  {cap != null && (
+                  {cap != null ? (
                     <span className={hasAdvertisedCapacity ? 'text-emerald-400' : 'text-emerald-400/90'}>
-                      {hasAdvertisedCapacity ? `· ${cap} concurrent` : `· ~${cap} concurrent (est.)`}
+                      {hasAdvertisedCapacity ? `${cap} concurrent` : `~${cap} concurrent (est.)`}
                       {capacityInUse != null && cap > 0 ? ` · ${capacityInUse} in use` : ''}
                     </span>
+                  ) : (
+                    <span className="text-zinc-500">Not advertised</span>
                   )}
                 </div>
 
