@@ -905,10 +905,15 @@ async def on_startup(_app: web.Application) -> None:
         price=config.PRICE,
         unit=config.PRICE_UNIT,
         currency=config.PRICE_CURRENCY,
+        # Advertise capacity = GPU count so the orchestrator allocates concurrent
+        # inputs that the scheduler spreads across all cards (default 1 would
+        # only ever let ONE generation through, wasting the multi-GPU scheduler).
+        capacity=config.GPU_COUNT,
         gpu=gpu,
         label="restyle",
         metadata=json.dumps({
             "capabilities": CAPABILITIES,
+            "gpu_count": config.GPU_COUNT,
             "model_specs": _MODEL_SPECS,
             "models": MODELS,
             "gpu": gpu_meta,
