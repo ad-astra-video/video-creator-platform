@@ -117,7 +117,7 @@ def _gemma_generate(
     messages: list[dict[str, object]],
     image: "torch.Tensor | None",
     seed: int,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 4096,
 ) -> str:
     """Generate an enhanced prompt with the Gemma text encoder.
 
@@ -1306,7 +1306,12 @@ class VideoCreatorInferenceEngine:
         # Calculate frame range for the segment
         start_frame = int(start_time * fps)
         end_frame = int(end_time * fps)
-        segment_frames = end_frame - start_frame
+        # Snap to the VAE temporal grid (k*time+1) exactly like generate_t2v / generate_i2v
+        # do. A raw `duration * fps` count can be off-grid and is rejected deep in the
+        # LTX VAE validation ("frame count did not match"); snapping keeps the segment
+        # request valid. `video_chunks_number` below is computed from the SNAPPED count so
+        # the encode chunking matches the frames actually generated.
+        segment_frames = self.snap_frames_to_grid(end_frame - start_frame, self._pipeline)
 
         # Extract the conditioning frame (first frame of segment)
         frames = []
@@ -1363,9 +1368,12 @@ class VideoCreatorInferenceEngine:
 
                 parts.append(segment_path)
 
-                if end_frame < (total_frames or end_frame):
+                # Append the original remainder [end_time, end_of_video] AFTER the freshly
+                # regenerated segment. (Old code trimmed [start_time, end_time] here — the
+                # ORIGINAL segment region — which duplicated it instead of keeping the tail.)
+                if total_frames and end_frame < total_frames:
                     after = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-                    self._trim_video(src_file.name, start_time, end_time, after)
+                    self._trim_video(src_file.name, end_time, total_frames / fps, after)
                     parts.append(after)
 
                 if len(parts) > 1:
