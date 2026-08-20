@@ -1,6 +1,6 @@
 """Warm-resident GPU scheduler tests (pure asyncio, no GPU, no aiohttp server).
 
-Covers the all-GPUs / keep-warm / LRU-evict policy:
+Covers the all-GPUs / keep-warm / LRU-evict policy, now MULTI-RESIDENT:
   - gemma's resident GPU is held out of the task pool
   - acquiring for gemma returns its resident GPU
   - a worker that is already warm reuses the same GPU (no reload)
@@ -10,7 +10,14 @@ Covers the all-GPUs / keep-warm / LRU-evict policy:
     video card; with a free GPU available it takes a different card so a later
     video gen never co-resides/OOMs. When only the video card is left free, the
     video worker EVICTS whatever is warm there before loading.
-  - reconcile() from worker /info self-heals a dead worker's slot
+  - MULTI-RESIDENT: two concurrent requests for the SAME worker spread across
+    two DIFFERENT GPUs (parallel), not serialize on one warm card
+  - MULTI-RESIDENT: after the burst both copies stay warm (idle+resident); the
+    next request reuses an idle warm copy (no reload), keeping all cards hot
+  - eviction passes the SPECIFIC device so a multi-resident worker only frees
+    the one card being handed over (not all its copies)
+  - reconcile() from worker /info (device LIST) marks several slots per worker
+  - reconcile() self-heals a dead worker's slot
   - FIFO queue + timeout -> QueueTimeout (mapped to 503 by the server)
 """
 
@@ -28,6 +35,16 @@ from runner.live_runner.scheduler import GPUScheduler, QueueTimeout  # noqa: E40
 def _mk(gpu_count: int = 3, gemma_gpu: int = 1, timeout: float = 10.0) -> GPUScheduler:
     return GPUScheduler(gemma_resident_gpu=gemma_gpu, gpu_count=gpu_count,
                         queue_timeout_s=timeout)
+
+
+class _Harness:
+    """Records (worker, device) evictions for assertions."""
+
+    def __init__(self):
+        self.evicted = []
+
+    async def evict(self, name, device):
+        self.evicted.append((name, device))
 
 
 def test_gemma_gpu_reserved_at_boot():
@@ -90,17 +107,58 @@ def test_two_tasks_get_two_distinct_gpus():
     asyncio.run(_t())
 
 
+def test_two_concurrent_same_worker_spread_to_distinct_gpus():
+    """MULTI-RESIDENT: a second request for the SAME worker arriving while the
+    first is still busy (not released) takes a DIFFERENT free GPU, so two
+    concurrent requests run in parallel instead of serializing on one card."""
+    s = _mk(gpu_count=3, gemma_gpu=1)
+
+    async def _t():
+        g1 = await s.acquire("image-worker")   # cold -> free card (0 or 2)
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[g1]["state"] == "busy"       # first is in flight
+        g2 = await s.acquire("image-worker")   # no idle warm -> new free card
+        assert g1 != g2                        # spread, not serialise
+        assert {g1, g2} <= {0, 2}              # neither is gemma's
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[g1]["worker"] == "image-worker" and st[g1]["state"] == "busy"
+        assert st[g2]["worker"] == "image-worker" and st[g2]["state"] == "busy"
+
+    asyncio.run(_t())
+
+
+def test_multi_resident_kept_warm_and_reused():
+    """MULTI-RESIDENT: after a burst both copies stay warm (idle+resident).
+    A subsequent single request reuses an IDLE warm copy (no reload, no new
+    card) rather than spending a fresh load."""
+    s = _mk(gpu_count=3, gemma_gpu=1)
+
+    async def _t():
+        g1 = await s.acquire("image-worker")
+        g2 = await s.acquire("image-worker")
+        assert g1 != g2
+        await s.release("image-worker", g1)
+        await s.release("image-worker", g2)
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        # both copies kept warm
+        assert st[g1]["resident"] and st[g1]["state"] == "idle"
+        assert st[g2]["resident"] and st[g2]["state"] == "idle"
+        assert st[g1]["worker"] == "image-worker" and st[g2]["worker"] == "image-worker"
+        # next request reuses one of the warm cards (no new load needed)
+        g3 = await s.acquire("image-worker")
+        assert g3 in (g1, g2)
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[g3]["state"] == "busy"       # the reused one is busy again
+        # the OTHER copy is still warm+idle, ready for a concurrent peer
+        other = (g1 if g3 == g2 else g2)
+        assert st[other]["state"] == "idle" and st[other]["resident"] is True
+
+    asyncio.run(_t())
+
+
 def test_lru_eviction_when_all_gpus_warm():
     """3 free GPUs minus gemma leaves 2. After 2 different workers are warm on
     both, a 3rd worker must EVICT the LRU warm model to get a GPU."""
-
-    class _Harness:
-        def __init__(self):
-            self.evicted = []
-
-        async def evict(self, name):
-            self.evicted.append(name)
-
     h = _Harness()
     s = _mk(gpu_count=3, gemma_gpu=1, timeout=10.0)
     s.evict_cb = h.evict
@@ -117,6 +175,30 @@ def test_lru_eviction_when_all_gpus_warm():
         st = {g["gpu_id"]: g for g in s.status()["gpus"]}
         assert st[ltx]["worker"] == "ltx-worker"
         assert st[ltx]["resident"] is True
+
+    asyncio.run(_t())
+
+
+def test_lru_eviction_passes_specific_device():
+    """Eviction hands the scheduler the SPECIFIC GPU, so a multi-resident worker
+    frees only the one card being handed over (not all its copies)."""
+    h = _Harness()
+    s = _mk(gpu_count=3, gemma_gpu=1, timeout=10.0)
+    s.evict_cb = h.evict
+
+    async def _t():
+        a = await s.acquire("image-worker")
+        b = await s.acquire("idv2v-worker")
+        # third worker needs a card -> LRU warm (image or idv2v) is evicted
+        ltx = await s.acquire("ltx-worker")
+        assert len(h.evicted) >= 1
+        victim, device = h.evicted[0]
+        assert device in (a, b)              # the freed card
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[device]["worker"] == "ltx-worker"   # that card is now ltx's
+        # the OTHER worker's card is untouched (still warm)
+        kept = a if device == b else b
+        assert st[kept]["worker"] != "ltx-worker"
 
     asyncio.run(_t())
 
@@ -161,19 +243,44 @@ def test_reconcile_frees_slot_of_dead_worker():
     asyncio.run(_t())
 
 
+def test_reconcile_multiple_devices_per_worker():
+    """MULTI-RESIDENT: reconcile accepts a device LIST and marks several slots
+    as owned by one worker; gemma's pinned card is never touched."""
+    s = _mk(gpu_count=3, gemma_gpu=1)
+
+    async def _t():
+        await s.reconcile({"image-worker": {"devices": [0, 2]}})
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[0]["worker"] == "image-worker" and st[0]["resident"] is True
+        assert st[2]["worker"] == "image-worker" and st[2]["resident"] is True
+        # gemma's pinned card untouched
+        assert st[1]["worker"] == "gemma-worker"
+
+    asyncio.run(_t())
+
+
+def test_reconcile_frees_multi_device_worker_when_gone():
+    """MULTI-RESIDENT: when a multi-resident worker disappears, reconcile frees
+    ALL of its slots, not just one."""
+    s = _mk(gpu_count=3, gemma_gpu=1)
+
+    async def _t():
+        await s.reconcile({"image-worker": {"devices": [0, 2]}})
+        # image-worker gone -> both its slots freed
+        await s.reconcile({"idv2v-worker": {"device_in_use": None}})
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[0]["worker"] is None and st[0]["resident"] is False
+        assert st[2]["worker"] is None and st[2]["resident"] is False
+        assert st[1]["worker"] == "gemma-worker"
+
+    asyncio.run(_t())
+
+
 def test_video_takes_free_gpu_not_evicting_image():
     """THE regression: a video task arriving while image is warm on GPU 0 takes
     a FREE card (GPU 1) instead of evicting image — so image stays warm for a
     fast repeat and no model is dropped. Eviction only happens when NO GPU is
     free."""
-
-    class _Harness:
-        def __init__(self):
-            self.evicted = []
-
-        async def evict(self, name):
-            self.evicted.append(name)
-
     h = _Harness()
     s = _mk(gpu_count=3, gemma_gpu=2, timeout=10.0)
     s.evict_cb = h.evict

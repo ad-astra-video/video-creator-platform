@@ -1,9 +1,15 @@
 """ResidentWorkerManager — owns GPU residency across the worker containers.
 
-Only ONE worker has its model resident on the shared 32 GB GPU at a time.
-``ensure(name)`` evicts the current resident (POST /evict) before loading the
-target (POST /load), and records the new resident. Serialized by an asyncio lock
-so concurrent requests can never race two models into VRAM simultaneously.
+Only ONE worker's model is resident on a given GPU at a time. ``ensure(name)``
+evicts the current resident (POST /evict) before loading the target (POST
+/load), and records the new resident. Serialized by an asyncio lock so
+concurrent requests can never race two models into one GPU's VRAM.
+
+MULTI-RESIDENT (Plan B, device-aware): ``ensure(name, device)`` loads ``name``
+resident on that single GPU index. A worker may be resident on SEVERAL GPUs at
+once (``_resident`` maps a worker to the SET of devices it is warm on) so
+concurrent requests for the same worker can run in parallel on different cards.
+Only the same worker reloads (evict + rebuild) when asked to move off a device.
 
 Pinned workers (dedicated GPU): a worker listed in ``pinned`` is loaded once (via
 ``load_pinned`` / ``ensure``) and is NEVER evicted — it lives on a separate GPU,
@@ -75,13 +81,15 @@ class ResidentWorkerManager:
     _current: str | None = field(default=None, init=False)   # shared-GPU resident (never a pinned)
     _pinned_loaded: set[str] = field(default_factory=set, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
-    # Plan B — per-worker device residency: worker name -> device index it is
-    # resident on. Workers loaded via ensure(name, device=<idx>) stay resident
-    # on that GPU and are NEVER evicted by another worker loading on a different
-    # GPU (each task owns one GPU; cross-GPU eviction would tear down a
-    # concurrently-running task's model). Only the same worker reloads (evict +
-    # rebuild) when asked to move to a different device index.
-    _resident: dict[str, int] = field(default_factory=dict, init=False)
+    # Plan B — per-worker device residency: worker name -> SET of device indices
+    # it is resident on (multi-resident). A worker loaded via ensure(name,
+    # device=<idx>) stays resident on that GPU and is NEVER evicted by another
+    # worker loading on a different GPU (each task owns one GPU; cross-GPU
+    # eviction would tear down a concurrently-running task's model). Only the
+    # SAME worker reloads (evict + rebuild) when asked to move off a device.
+    # Eviction is per-device (POST /evict {device}) so freeing card B of a
+    # multi-resident worker never drops the copy still warm on card A.
+    _resident: dict[str, set[int]] = field(default_factory=dict, init=False)
 
     def _base(self, name: str) -> str:
         """Resolve a worker name to its base URL from the injected mapping."""
@@ -100,6 +108,10 @@ class ResidentWorkerManager:
         """Names of pinned (dedicated-GPU) workers currently loaded."""
         return sorted(self._pinned_loaded)
 
+    def devices(self, name: str) -> set[int]:
+        """Resident GPU indices for ``name`` (multi-resident: may be several)."""
+        return set(self._resident.get(name, ()))
+
     async def load_pinned(self) -> None:
         """Load every pinned worker (dedicated GPUs) — run at startup, never evicted."""
         async with self._lock:
@@ -116,25 +128,26 @@ class ResidentWorkerManager:
         pinned worker is never ``_current``) evict each other.
 
         Plan B (``device`` supplied): ``name`` is loaded resident on that single
-        GPU index and stays there — it is tracked in ``_resident`` and is never
-        evicted by another worker (which runs on a different GPU). If the same
-        worker is asked to move to a different device, it evicts + reloads. This
-        lets different tasks run concurrently on different GPUs.
+        GPU index and stays there — it is tracked in ``_resident`` (a SET, so a
+        worker may be resident on several cards at once) and is never evicted by
+        another worker (which runs on a different GPU). If the same worker is
+        asked to move to a different device, it evicts + reloads. This lets
+        different tasks run concurrently on different GPUs.
         """
         async with self._lock:
             if device is not None:
-                if self._resident.get(name) == device:
+                resident = self._resident.setdefault(name, set())
+                if device in resident:
                     return  # already resident on that GPU
                 # Load FIRST, then record residency ONLY after /load succeeds. The
-                # prior code set _resident[name]=device BEFORE the POST, so a failed
-                # first load (e.g. the worker not yet resolvable at startup) left the
-                # entry set and every later ensure() short-circuited above — the
-                # worker's model was NEVER (re)loaded ("warm but unloaded"; gemma
-                # routes 503'd). Assigning after success lets the idle backfill keep
-                # retrying until the load actually lands.
+                # prior code set residency BEFORE the POST, so a failed first load
+                # (e.g. the worker not yet resolvable at startup) left the entry set
+                # and every later ensure() short-circuited above — the worker's
+                # model was NEVER (re)loaded ("warm but unloaded"). Assigning after
+                # success lets the idle backfill keep retrying until the load lands.
                 await self.transport.post(self._base(name), "/load",
                                           {"device": device})
-                self._resident[name] = device
+                resident.add(device)
                 if name in self.pinned:
                     self._pinned_loaded.add(name)
                     logger.info("GPU pin: %s resident (dedicated)", name)
@@ -158,14 +171,32 @@ class ResidentWorkerManager:
             self._current = name
             logger.info("GPU swap: %s resident", name)
 
-    async def evict(self, name: str) -> None:
-        """Evict a specific worker's residency (Plan B / manual)."""
+    async def evict(self, name: str, device: int | None = None) -> None:
+        """Evict worker ``name``'s residency.
+
+        ``device`` given (Plan B): frees only that ONE card of a multi-resident
+        worker (POST /evict {device}) so the copies still warm on other cards
+        survive. ``device`` None (legacy/manual): drops ALL residency for
+        ``name`` (POST /evict {}) and clears the shared ``_current``.
+        """
         async with self._lock:
-            self._resident.pop(name, None)
-            if self._current == name:
-                self._current = None
-            await self.transport.post(self._base(name), "/evict")
-            logger.info("GPU swap: evicted %s", name)
+            if device is not None:
+                resident = self._resident.get(name)
+                if resident is not None:
+                    resident.discard(device)
+                    if not resident:
+                        del self._resident[name]
+                    if self._current == name:
+                        self._current = None
+                self._pinned_loaded.discard(name)
+                await self.transport.post(self._base(name), "/evict", {"device": device})
+                logger.info("GPU swap: evicted %s on GPU %d", name, device)
+            else:
+                self._resident.pop(name, None)
+                if self._current == name:
+                    self._current = None
+                await self.transport.post(self._base(name), "/evict")
+                logger.info("GPU swap: evicted %s", name)
 
     async def backfill(self, name: str) -> None:
         """Load ``name`` only if it won't displace anything (idle-safe, no eviction)."""
@@ -191,8 +222,8 @@ class ResidentWorkerManager:
     async def _reconcile_loaded(self, health: dict[str, dict]) -> None:
         """Drop residency for any worker we believe is loaded but whose /health
         reports ``model_loaded`` is False (e.g. its container was restarted and
-        the fresh process has no model). The next ``ensure()``/idle backfill will
-        re-issue /load. Safe because every worker's load() is idempotent.
+        the fresh process has no model). The next ``ensure()``/idle backfill
+        will re-issue /load. Safe because every worker's load() is idempotent.
 
         Only workers whose /health exposes a ``model_loaded`` key are affected
         (today: gemma-worker) — others are ignored. Missing/error health is

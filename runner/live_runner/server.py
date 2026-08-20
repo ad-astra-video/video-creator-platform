@@ -881,9 +881,9 @@ async def on_startup(_app: web.Application) -> None:
     # before handing its GPU to a DIFFERENT worker's task, so two models never
     # co-reside on one card (the image-then-video OOM). Any worker can be the
     # victim; the generalized callback POST /evict frees its VRAM first.
-    async def _evict_worker(name: str) -> None:
+    async def _evict_worker(name: str, device: int) -> None:
         try:
-            await _worker_manager.evict(name)
+            await _worker_manager.evict(name, device)
         except Exception:
             logger.warning("worker evict failed (%s, may be down)", name, exc_info=True)
     _scheduler.evict_cb = _evict_worker

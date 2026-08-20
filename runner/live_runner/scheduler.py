@@ -7,24 +7,29 @@ warm model before a different worker's task takes the same card**, so two models
 can never co-reside in one GPU's VRAM (the image-then-video OOM).
 
 Placement policy (per the operator's directive):
-  1. If a worker's model is ALREADY warm on some GPU -> reuse that card (no reload).
-  2. Else if a GPU has nothing warm on it -> allocate the task there and leave
-     the model warm on it (fully utilizes all GPUs).
-  3. Else (every GPU already holds a warm model) -> evict the least-recently-used
+  1. One GPU serves ONE request at a time.
+  2. A worker may be resident on SEVERAL GPUs at once (multi-resident), and the
+     scheduler uses ALL GPUs as needed for the current request burst instead of
+     parking cards idle — so concurrent requests for the SAME worker spread
+     across its warm cards / free cards and run in parallel.
+  3. If a worker has an IDLE warm copy somewhere -> reuse that card (no reload);
+     a concurrent peer finds it busy and loads a new copy on a free GPU.
+  4. Else if a GPU has nothing on it -> allocate there and leave it warm.
+  5. Else (every GPU already holds a warm model) -> evict the least-recently-used
      warm model that is NOT needed for the incoming task, and hand its GPU over.
 
-Eviction is VRAM-safe: ``evict_cb(worker)`` (POST /evict) frees the old model's
-VRAM BEFORE the new one loads, so two models never transiently co-reside.
+Eviction is VRAM-safe: ``evict_cb(worker, device)`` (POST /evict {device}) frees
+the OLD model's VRAM on that ONE GPU BEFORE the new one loads, so two models
+never transiently co-reside. Passing the device matters for multi-resident
+workers: freeing card B must not tear down the copy still warm on card A.
 
 Device awareness:
   * ALL workers (image, gemma, ltx, idv2v) are device-aware — they honor
     ``device`` in ``/load`` (free + relocate onto the given GPU) and can live
-    on ANY GPU. No worker is pinned. Every task goes through the same
-    warm-reuse -> free-GPU -> LRU-evict path, so image AND video spread across
-    all cards: image warms on one GPU while video warms on another, keeping
-    both resident for fast image -> video iteration.
+    on ANY GPU. No worker is pinned. Image AND video spread across all cards,
+    and concurrent same-worker requests can occupy multiple cards at once.
 
-The map is ADVISORY: reconciled from each worker's ``/info`` at heartbeat, so a
+The map is ADVISORY: reconciled from each worker's /info at heartbeat, so a
 crashed/restarted worker self-heals between heartbeats.
 """
 
@@ -59,10 +64,12 @@ class GPUScheduler:
     gemma_resident_gpu: int | None = None
     gpu_count: int = 3
     queue_timeout_s: float = 600.0
-    # Async hook that EVICTS a worker's model from VRAM before another task
-    # takes its GPU. Generalized to any worker; wired in server.py to POST
-    # /evict. None = never auto-evict (evictable victim search is skipped).
-    evict_cb: Callable[[str], Awaitable[None]] | None = field(default=None, init=False)
+    # Async hook that EVICTS a worker's model from a SPECIFIC GPU before another
+    # task takes that card. ``(worker, device)`` so a multi-resident worker only
+    # frees the one card being handed over, not all its copies. Generalized to
+    # any worker; wired in server.py to POST /evict {device}. None = never
+    # auto-evict (evictable victim search is skipped).
+    evict_cb: Callable[[str, int], Awaitable[None]] | None = field(default=None, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _cond: asyncio.Condition = field(init=False)
     _slots: list[GPUSlot] = field(init=False)
@@ -92,6 +99,25 @@ class GPUScheduler:
                 return s
         return None
 
+    def devices(self, worker: str) -> list[int]:
+        """Resident GPU indices for ``worker`` (multi-resident: may be several)."""
+        return [s.gpu_id for s in self._slots if s.worker == worker]
+
+    def _pick_idle_warm(self, worker: str) -> GPUSlot | None:
+        """An IDLE (not busy) resident slot already warm for ``worker``.
+
+        Multi-resident: picks the least-recently-used idle warm card so a lone
+        request reuses a warm card (no reload) while concurrent peers - which
+        find that card busy - naturally load onto the other/free cards. This is
+        what lets a burst spread across ALL GPUs instead of serializing on one.
+        """
+        best: GPUSlot | None = None
+        for s in self._slots:
+            if s.worker == worker and s.state == "idle" and s.resident:
+                if best is None or s.last_used < best.last_used:
+                    best = s
+        return best
+
     # -- eviction ---------------------------------------------------------
 
     async def _evict_slot(self, slot: GPUSlot, incoming: str) -> None:
@@ -101,10 +127,11 @@ class GPUScheduler:
         victim = slot.worker
         if slot.resident and self.evict_cb is not None:
             # Drop the lock across the HTTP evict (avoid holding it during a
-            # network round-trip); re-acquire after.
+            # network round-trip); re-acquire after. Pass the SPECIFIC GPU so a
+            # multi-resident worker frees only this card, not all its copies.
             self._cond.release()
             try:
-                await self.evict_cb(victim)
+                await self.evict_cb(victim, slot.gpu_id)
             finally:
                 await self._cond.acquire()
         slot.worker = None
@@ -142,7 +169,12 @@ class GPUScheduler:
     # -- acquire / release -----------------------------------------------
 
     async def acquire(self, worker: str) -> int:
-        """Reserve a single GPU for ``worker`` (warm-reuse -> idle -> LRU-evict)."""
+        """Reserve a single GPU for ``worker`` (idle-warm-reuse -> free -> LRU-evict).
+
+        One GPU serves one request at a time. A worker may be resident on several
+        GPUs at once (multi-resident), so concurrent requests for the SAME worker
+        spread across its warm cards / free cards instead of serializing on one.
+        """
         if worker == "gemma-worker" and self.gemma_resident_gpu is not None:
             if not self._gemma_evicted:
                 self._slot(self.gemma_resident_gpu).last_used = time.monotonic()
@@ -166,14 +198,17 @@ class GPUScheduler:
         async with self._cond:
             deadline = time.monotonic() + self.queue_timeout_s
             while True:
-                # 1) Already warm -> reuse (no reload).
-                warm = self._warm_gpu_of(worker)
-                if warm is not None:
-                    self._claim(warm, worker)
-                    logger.info("GPU schedule: %s -> GPU %d (warm)", worker, warm.gpu_id)
-                    return warm.gpu_id
+                # 1) Reuse an IDLE warm copy of this worker (multi-resident):
+                #    if a card already holds this worker warm and isn't busy, use
+                #    it (no reload). Concurrent peers then find the other warm
+                #    cards busy and naturally load onto free cards instead.
+                idle_warm = self._pick_idle_warm(worker)
+                if idle_warm is not None:
+                    self._claim(idle_warm, worker)
+                    logger.info("GPU schedule: %s -> GPU %d (warm)", worker, idle_warm.gpu_id)
+                    return idle_warm.gpu_id
 
-                # 2) A GPU with nothing warm on it (use ALL GPUs).
+                # 2) A GPU with nothing on it (use ALL GPUs for the burst).
                 idle = self._pick_idle_gpu()
                 if idle is not None:
                     self._claim(idle, worker)
@@ -223,13 +258,13 @@ class GPUScheduler:
     async def pick_for_worker(self, worker: str) -> int:
         """Authoritatively assign a GPU to ``worker`` at startup/warmup.
 
-        Same warm-reuse -> idle -> LRU-evict policy as :meth:`acquire`, but
-        called ONCE from the worker's own boot (via the live-runner's gpu-pick
-        endpoint) so it lands on a genuinely free card instead of guessing from
-        a local nvidia-smi (which races the lazy image-worker load). Marks the
-        slot resident for ``worker``, so the first request-time ``acquire()``
-        reuses it (no reload). Raises ``QueueTimeout`` if nothing can be freed
-        within the deadline.
+        Same policy as :meth:`acquire`, but called ONCE from the worker's own
+        boot (via the live-runner's gpu-pick endpoint) so it lands on a
+        genuinely free card instead of guessing from a local nvidia-smi (which
+        races the lazy image-worker load). Marks the slot resident for
+        ``worker``, so the first request-time ``acquire()`` reuses it (no
+        reload). Raises ``QueueTimeout`` if nothing can be freed within the
+        deadline.
         """
         async with self._cond:
             deadline = time.monotonic() + self.queue_timeout_s
@@ -271,16 +306,25 @@ class GPUScheduler:
             self._cond.notify_all()
 
     async def reconcile(self, workers_info: dict[str, dict]) -> None:
-        """Heal the map from each worker's /info (advisory). A slot whose worker
-        is GONE (not in reachable set) is freed even if resident — a live warm
-        model can only exist while its process lives, so an unreachable worker
-        can't still be holding VRAM. Gemma's pinned slot is never freed here."""
+        """Heal the map from each worker's /info (advisory). A worker may report
+        a LIST of resident devices (``devices``, multi-resident) or a single
+        ``device_in_use`` (back-compat). A slot whose worker is GONE (not in
+        the reachable set) is freed even if resident — a live warm model can
+        only exist while its process lives, so an unreachable worker can't
+        still be holding VRAM. Gemma's pinned slot is never freed here."""
         async with self._cond:
             reachable = set(workers_info)
             for name, info in workers_info.items():
-                dev = info.get("device_in_use")
-                if isinstance(dev, int) and 0 <= dev < self.gpu_count:
-                    s = self._slot(dev)
+                devs = info.get("devices")
+                if isinstance(devs, (list, tuple, set)):
+                    devs = [int(d) for d in devs
+                            if isinstance(d, int) and 0 <= d < self.gpu_count]
+                else:
+                    dev = info.get("device_in_use")
+                    devs = [int(dev)] if (isinstance(dev, int)
+                                          and 0 <= dev < self.gpu_count) else []
+                for d in devs:
+                    s = self._slot(d)
                     s.worker = name
                     s.state = "busy"
                     s.resident = True
