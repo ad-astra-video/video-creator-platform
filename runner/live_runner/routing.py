@@ -99,18 +99,27 @@ def candidate_workers(endpoint: str, worker: str) -> list[str]:
     return [worker]
 
 
-async def _post_worker(session, token: str, worker: str, endpoint: str, body: dict) -> web.Response:
+async def _post_worker(session, token: str, worker: str, endpoint: str, body: dict,
+                       device: int | None = None) -> web.Response:
     """POST ``body`` to ``worker``'s inference endpoint and relay the response.
 
     Raises WorkerCallFailed on any upstream error (HTTP >= 400 or connection
     failure) so the caller can fall back to another worker; returns a web.Response
     on success. This is a single aiohttp HTTP request (no thread executor needed)
     so the live-runner's heartbeat asyncio tasks are never blocked.
+
+    ``device`` (when set) is forwarded as ``X-Worker-Device`` so a multi-engine
+    worker runs THIS request on the specific GPU the scheduler assigned (the
+    go-livepeer proxy is only on the browser->runner leg; this internal hop
+    carries the header untouched). When None (legacy shared-GPU), no header is
+    sent and the worker falls back to its default device.
     """
     from . import config as cfg
     base = cfg.WORKERS[worker]
     url = f"{base}/video-creator/v1/{endpoint}"
     headers = {"X-Worker-Token": token}
+    if device is not None:
+        headers["X-Worker-Device"] = str(device)
     try:
         async with session.post(
             url, json=body, headers=headers,
@@ -170,7 +179,7 @@ async def proxy(
             # lifecycle handle residency for these.
             if endpoint not in _IMAGE_ONLY_ENDPOINTS:
                 await worker_manager.ensure(target, device=device)
-            return await _post_worker(session, token, target, endpoint, body)
+            return await _post_worker(session, token, target, endpoint, body, device)
         except WorkerCallFailed as exc:
             last = exc
             logger.warning(
@@ -215,6 +224,8 @@ async def proxy_worker_sse(
     base = cfg.WORKERS[worker]
     url = f"{base}/video-creator/v1/{endpoint}?sse=1"
     headers = {"X-Worker-Token": token}
+    if device is not None:
+        headers["X-Worker-Device"] = str(device)
     async with session.post(
         url, json=body, headers=headers,
         timeout=ClientTimeout(total=3600.0),
