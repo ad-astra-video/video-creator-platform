@@ -7,7 +7,7 @@ import { ApiClient } from '../lib/api-client'
 import { resolveRunner, segmentSubjectViaRunner } from '../lib/direct-transport'
 import { ImageEditPanel } from './ImageEditPanel'
 import type { ImageEditPanelHandle, ImageEditCompleteMeta } from './ImageEditPanel'
-import { Image, X, Loader2, Check, Film, Wand2, Upload } from 'lucide-react'
+import { Image, X, Loader2, Check, Film, Wand2, Upload, ChevronLeft, ChevronRight } from 'lucide-react'
 import { logger } from '../lib/logger'
 import type { Asset } from '../types/project-model'
 
@@ -59,9 +59,10 @@ export interface RestyleFrameOptions {
   /**
    * First-frame editor engine: 'qwen-edit' (default) styles the frame via the
    * ltx-worker's /video-creator/v1/edit (Qwen-Image-Edit); 'klein' uses the
-   * existing id-v2v worker /style-frame rail (FLUX.2 klein 4B fast).
+   * existing id-v2v worker /style-frame rail (FLUX.2 klein 4B fast); 'hidream'
+   * uses the image-worker /edit whole-frame rail (HiDream-O1-Image).
    */
-  engine?: 'qwen-edit' | 'klein'
+  engine?: 'qwen-edit' | 'klein' | 'hidream'
 }
 
 export interface RestylePanelHandle {
@@ -153,6 +154,10 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   const [isStyling, setIsStyling] = useState(false)
   const [isExtracting, setIsExtracting] = useState(false)
   const [stylingError, setStylingError] = useState<string | null>(null)
+  const [frameEditProgress, setFrameEditProgress] = useState<{ step: number; totalSteps: number } | null>(null)
+
+  // Quick-pick asset sidebar collapsed state (left rail).
+  const [quickPickOpen, setQuickPickOpen] = useState(true)
 
 
   const videoKnownRef = useRef<string | null>(null)
@@ -319,11 +324,17 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
       // embedded ImageEditPanel performs the actual first-frame restyling (including layered /
       // region-selective masked editing) over the direct paid rail; onEditComplete records it.
       if (isWebPath(extractedFramePath) && imageEditRef.current) {
-        return imageEditRef.current.runEdit(opts.prompt, {
+        // Run the first-frame edit over the direct paid rail with SSE + per-step
+        // progress: passing onProgress makes editImageViaRunner request ?sse=1 so
+        // the stream stays alive and reports step X/Y while the model edits.
+        setFrameEditProgress(null)
+        const ok = await imageEditRef.current.runEdit(opts.prompt, {
           engine: opts.engine ?? 'qwen-edit',
           seed: opts.seed,
           enhance: opts.enhance,
+          onProgress: (p) => setFrameEditProgress(p),
         })
+        return ok
       }
       // First-frame styling routes to FLUX.2 [klein] 4B on the id-v2v worker
       // (/api/restyle/style-frame). FLUX.2 klein is a fixed 4-step distilled
@@ -361,6 +372,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
       return false
     } finally {
       setIsStyling(false)
+      setFrameEditProgress(null)
     }
   }, [extractedFramePath, setTab])
 
@@ -446,68 +458,92 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   )
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 gap-3">
-      {/* Quick-pick from the asset library */}
-      {(quickPickVideos.length > 0 || quickPickImages.length > 0) && (
-        <div className="flex-shrink-0 flex gap-4">
-          {quickPickVideos.length > 0 && (
-            <div className="flex-1 min-w-0">
-              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Quick pick video</div>
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                {quickPickVideos.map(a => (
-                  <button
-                    key={a.id}
-                    onClick={() => pickQuickVideo(a.path)}
-                    title={a.path.split(/[/\\]/).pop()}
-                    className={`w-24 flex-shrink-0 aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
-                      videoPath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
-                    }`}
-                  >
-                    {/* Poster: paint the first frame with a non-playing muted video. An <img> of
-                        a video blob (bigThumbnailPath for older/stale assets) renders as a broken
-                        image icon — same fix as the GenSpace asset grid, so use the asset's own
-                        path. Only falls back to the film icon if there is no source. */}
-                    {a.path ? (
-                      <video
-                        src={webAssetUrl(a.path)}
-                        muted
-                        playsInline
-                        preload="auto"
-                        disablePictureInPicture
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="w-full h-full bg-zinc-800 flex items-center justify-center">
-                        <Film className="h-4 w-4 text-zinc-500" />
-                      </div>
-                    )}
-                  </button>
-                ))}
-              </div>
-            </div>
+    <div className="flex-1 flex min-h-0 gap-3">
+      {/* Collapsible quick-pick asset sidebar (left) */}
+      <div
+        className={`flex-shrink-0 flex flex-col min-h-0 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden transition-all ${
+          quickPickOpen ? 'w-40' : 'w-9'
+        }`}
+      >
+        <div className="flex items-center justify-between px-1.5 py-1.5 flex-shrink-0">
+          {quickPickOpen && (
+            <span className="text-[10px] uppercase tracking-wide text-zinc-500 truncate">Quick pick</span>
           )}
-          {quickPickImages.length > 0 && (
-            <div className="flex-1 min-w-0">
-              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Quick pick image</div>
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                {quickPickImages.map(a => (
-                  <button
-                    key={a.id}
-                    onClick={() => pickQuickImage(a)}
-                    title={a.path.split(/[/\\]/).pop()}
-                    className={`w-24 flex-shrink-0 aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
-                      stylizedImagePath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
-                    }`}
-                  >
-                    <img src={webAssetUrl(a.path)} alt="" className="w-full h-full object-cover" />
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
+          <button
+            type="button"
+            onClick={() => setQuickPickOpen(o => !o)}
+            title={quickPickOpen ? 'Hide quick-pick assets' : 'Show quick-pick assets'}
+            className="p-1 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+          >
+            {quickPickOpen ? <ChevronLeft className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+          </button>
         </div>
-      )}
+        {quickPickOpen && (
+          <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-2 px-1.5 pb-2">
+            {quickPickVideos.length > 0 && (
+              <div className="flex flex-col gap-1">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500 px-0.5">Videos</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {quickPickVideos.map(a => (
+                    <button
+                      key={a.id}
+                      onClick={() => pickQuickVideo(a.path)}
+                      title={a.path.split(/[/\\]/).pop()}
+                      className={`aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
+                        videoPath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
+                      }`}
+                    >
+                      {/* Poster: paint the first frame with a non-playing muted video. An <img> of
+                          a video blob (bigThumbnailPath for older/stale assets) renders as a broken
+                          image icon — same fix as the GenSpace asset grid, so use the asset's own
+                          path. Only falls back to the film icon if there is no source. */}
+                      {a.path ? (
+                        <video
+                          src={webAssetUrl(a.path)}
+                          muted
+                          playsInline
+                          preload="auto"
+                          disablePictureInPicture
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <div className="w-full h-full bg-zinc-800 flex items-center justify-center">
+                          <Film className="h-3.5 w-3.5 text-zinc-500" />
+                        </div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {quickPickImages.length > 0 && (
+              <div className="flex flex-col gap-1">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500 px-0.5">Images</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {quickPickImages.map(a => (
+                    <button
+                      key={a.id}
+                      onClick={() => pickQuickImage(a)}
+                      title={a.path.split(/[/\\]/).pop()}
+                      className={`aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
+                        stylizedImagePath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
+                      }`}
+                    >
+                      <img src={webAssetUrl(a.path)} alt="" className="w-full h-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {quickPickVideos.length === 0 && quickPickImages.length === 0 && (
+              <div className="text-[10px] text-zinc-600 px-1">No assets yet</div>
+            )}
+          </div>
+        )}
+      </div>
 
+      {/* Main content column: tab bar + Image/Video views */}
+      <div className="flex-1 min-w-0 flex flex-col gap-3 min-h-0">
       {/* Unified tabbed view: Image (first-frame edit) | Video (source preview) */}
       <div className="flex-shrink-0 flex items-center gap-1 border-b border-zinc-800 pb-2">
         {tabButton('image', <Image className="h-4 w-4" />, 'Image', 'Stylize the first frame')}
@@ -586,67 +622,43 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
 
         {activeTab === 'image' && (
           <div className="h-full min-h-0 flex flex-col gap-2">
-            {/* Main UI: the extracted/stylized first frame */}
-            <div className="flex-1 min-h-0 relative rounded-xl border border-zinc-800 bg-black flex items-center justify-center overflow-hidden">
-              {isExtracting ? (
-                <div className="flex flex-col items-center gap-2 text-zinc-500">
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                  <span className="text-xs">Extracting first frame...</span>
-                </div>
-              ) : displayFramePath ? (
-                <>
-                  <img src={webAssetUrl(displayFramePath)} alt="" className="w-full h-full object-contain" />
-                  {subjectMaskB64 && (
-                    <img
-                      src={`data:image/png;base64,${subjectMaskB64}`}
-                      alt=""
-                      className="absolute inset-0 w-full h-full object-contain pointer-events-none mix-blend-screen opacity-40"
-                    />
-                  )}
-                </>
-              ) : (
-                <div className="flex flex-col items-center gap-2 text-zinc-600">
-                  <Image className="h-6 w-6" />
-                  <span className="text-[11px] px-3 text-center">Drop a video to extract its first frame</span>
-                </div>
-              )}
-              {displayFramePath && !isExtracting && (activeCandidate || stylizedImagePath) && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); if (activeCandidate) { setCandidates(prev => { const next = prev.filter(c => c.path !== activeCandidate); if (isWebPath(activeCandidate)) removeAsset(activeCandidate); return next }); setActiveCandidate(null); } else { setStylizedImagePath(null) } }}
-                  className="absolute top-1.5 right-1.5 p-1 rounded-full bg-zinc-800/80 text-zinc-400 hover:text-white"
-                  title="Clear"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              )}
-              {displayFramePath !== extractedFramePath && displayFramePath && (
-                <span className="absolute top-1.5 left-1.5 text-[10px] text-emerald-400 bg-zinc-900/70 rounded px-1.5 py-0.5">
-                  {activeCandidate && stylizedImagePath !== activeCandidate
-              ? `candidate · take ${(candidates.findIndex(t => t.path === activeCandidate) + 1) || '?'}`
-              : 'stylized'}
-                </span>
-              )}
-              {isStyling && (
-                <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
-                  <div className="flex items-center gap-2 text-zinc-200 text-sm">
-                    <Loader2 className="h-5 w-5 animate-spin" />
-                    <span>Restyling frame...</span>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Minimal footer: segmenting status + accept frame */}
-            <div className="flex-shrink-0 flex flex-col gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3">
-              <div className="flex items-center gap-2">
+            {/* Single image panel: the embedded ImageEditPanel owns the ONE image display
+                (mask overlays + Show layers / Select item(s) controls); the header + Accept
+                + kept takes wrap around it below. */}
+            <div className="flex-1 min-h-0 flex flex-col gap-2 overflow-y-auto rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3">
+              {/* Header row: status + candidate badge + clear */}
+              <div className="flex-shrink-0 flex items-center gap-2">
                 <Film className="h-4 w-4 text-zinc-400" />
                 <span className="text-xs text-zinc-300 font-medium">
-                  {isExtracting ? 'Extracting first frame...' : 'First frame'}
+                  {isExtracting ? 'Extracting first frame...' : isStyling ? 'Restyling frame...' : 'First frame'}
                 </span>
+                {displayFramePath !== extractedFramePath && displayFramePath && (
+                  <span className="text-[10px] text-emerald-400 bg-zinc-900/70 rounded px-1.5 py-0.5">
+                    {activeCandidate && stylizedImagePath !== activeCandidate
+              ? `candidate · take ${(candidates.findIndex(t => t.path === activeCandidate) + 1) || '?'}`
+              : 'stylized'}
+                  </span>
+                )}
                 <span className="ml-auto text-[10px] text-zinc-500">
                   Use the prompt bar above to describe the style
                 </span>
+                {displayFramePath && !isExtracting && (activeCandidate || stylizedImagePath) && (
+                  <button
+                    onClick={() => { if (activeCandidate) { setCandidates(prev => { const next = prev.filter(c => c.path !== activeCandidate); if (isWebPath(activeCandidate)) removeAsset(activeCandidate); return next }); setActiveCandidate(null); } else { setStylizedImagePath(null) } }}
+                    className="p-1.5 rounded-md bg-zinc-800/80 text-zinc-400 hover:text-white"
+                    title="Clear"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </div>
+
+              {isStyling && (
+                <p className="flex items-center gap-1.5 text-[11px] text-zinc-300">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  {frameEditProgress ? `Restyling frame... step ${frameEditProgress.step}/${frameEditProgress.totalSteps}` : 'Restyling frame...'}
+                </p>
+              )}
 
               {(segmentingSubject || subjectMaskB64) && (
                 <p className={segmentingSubject ? "text-[10px] text-zinc-300 flex items-center gap-1" : "text-[10px] text-emerald-400"}>
@@ -654,6 +666,21 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                 </p>
               )}
 
+              {/* The single image + masks (ImageEditPanel). The keep-subject SAM3 mask
+                  overlays the same image when present. */}
+              <ImageEditPanel
+                ref={imageEditRef}
+                imageKey={displayFramePath}
+                overlayMask={subjectMaskB64 ? `data:image/png;base64,${subjectMaskB64}` : null}
+                onEditComplete={handleImageEditComplete}
+              />
+
+              {stylingError && (
+                <p className="text-[11px] text-red-400">{stylingError}</p>
+              )}
+              {activeCandidate && stylizedImagePath !== activeCandidate && (
+                <p className="text-[10px] text-emerald-400">Each re-run rotates the seed and adds a new take below — pick one, then accept.</p>
+              )}
               {extractedFramePath && (
                 <button
                   onClick={acceptCurrent}
@@ -667,12 +694,6 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                 </button>
               )}
 
-              {stylingError && (
-                <p className="text-[11px] text-red-400">{stylingError}</p>
-              )}
-              {activeCandidate && stylizedImagePath !== activeCandidate && (
-                <p className="text-[10px] text-emerald-400">Each re-run rotates the seed and adds a new take below — pick one, then accept.</p>
-              )}
               {/* Kept first-frame candidates: rotate seed per re-run, keep every output. */}
               {candidates.length > 0 && (
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
@@ -716,18 +737,9 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                   ))}
                 </div>
               )}
-
-              {/* First-frame restyling is performed by the embedded ImageEditPanel (layered /
-                  region-selective masked editing). Driven by the main prompt bar via the
-                  imperative handle; results arrive in onEditComplete. */}
-              <ImageEditPanel
-                ref={imageEditRef}
-                imageKey={displayFramePath}
-                onEditComplete={handleImageEditComplete}
-              />
             </div>
-          </div>
-        )}
+          </div>        )}
+      </div>
       </div>
     </div>
   )

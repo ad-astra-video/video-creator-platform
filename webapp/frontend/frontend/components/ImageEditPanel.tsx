@@ -43,6 +43,9 @@ export interface ImageEditPanelProps {
   /** Called when an edit produces a new image. */
   onEditComplete?: (newImageKey: string, meta: ImageEditCompleteMeta) => void
   onActiveChange?: (info: { canEdit: boolean; editing: boolean; masked: boolean }) => void
+  /** Optional external mask (data-URL PNG) to overlay on the image alongside the
+   *  internal layer/SAM selection mask (e.g. RestylePanel's keep-subject SAM3 mask). */
+  overlayMask?: string | null
 }
 
 export interface ImageEditPanelHandle {
@@ -165,6 +168,7 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
     defaultEngine = 'qwen-edit',
     onEditComplete,
     onActiveChange,
+    overlayMask,
   },
   ref,
 ) {
@@ -428,6 +432,13 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
             {maskPreview && (
               <img
                 src={maskPreview}
+                alt=""
+                className="absolute inset-0 w-full h-full object-contain pointer-events-none mix-blend-screen opacity-40"
+              />
+            )}
+            {overlayMask && (
+              <img
+                src={overlayMask}
                 alt=""
                 className="absolute inset-0 w-full h-full object-contain pointer-events-none mix-blend-screen opacity-40"
               />
