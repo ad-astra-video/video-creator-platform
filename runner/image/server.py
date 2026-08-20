@@ -11,7 +11,15 @@ and the worker control plane over the Docker network.
 The aiohttp route layer imports cleanly WITHOUT torch/diffusers — every GPU
 dependency is reached lazily through the engine, so the routes are testable
 standalone.
+
+MULTI-ENGINE (one request per GPU at a time): the worker holds one
+``ImageInferenceEngine`` per resident CUDA device, each bound to that device
+and with its own serialization lock, so concurrent requests on DIFFERENT GPUs
+run in parallel. The live-runner's scheduler picks the GPU and forwards it via
+the ``X-Worker-Device`` header; when absent (backward compat) the last
+/load'ed device is used.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -46,14 +54,55 @@ logger = logging.getLogger(__name__)
 _MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(3 * 1024 ** 3)))
 
 # ── Global state ───────────────────────────────────────────
-engine: ImageInferenceEngine | None = None
 gpu_profile = None
 ready = False
 
-# Serializes generation: the single GPU can only run one generation at a time,
-# and with handlers dispatching to a thread pool, concurrent requests must be
-# queued rather than racing on the shared engine / CUDA stream.
-_generation_lock = asyncio.Lock()
+# MULTI-ENGINE: one ImageInferenceEngine per resident CUDA device + one lock
+# per device, so concurrent requests on DIFFERENT GPUs run in parallel (one
+# request per GPU at a time). Engines are created lazily on /load (models
+# themselves build lazily inside the engine on first generation).
+_engines: dict[int, "ImageInferenceEngine"] = {}
+_device_locks: dict[int, asyncio.Lock] = {}
+_default_device: int | None = None
+
+# FLUX.2 klein runs through the flux_edit MODULE SINGLETON (get_editor), which
+# can only live on ONE GPU at a time — so klein generation is serialized
+# GLOBALLY across devices regardless of the per-device spread. qwen-edit /
+# z-image / hidream engines are per-instance and DO spread across GPUs.
+_klein_lock = asyncio.Lock()
+
+
+def _device_lock(device: int) -> asyncio.Lock:
+    """Per-device lock (created on demand) serializing requests on that GPU."""
+    return _device_locks.setdefault(device, asyncio.Lock())
+
+
+def _resolve_device(req: web.Request) -> int:
+    """Target CUDA device for a request.
+
+    The live-runner's scheduler picks the GPU and forwards it as
+    ``X-Worker-Device``; that is authoritative. When absent (backward compat:
+    direct / single-device use) fall back to the last /load'ed device, then to
+    DEFAULT_DEVICE.
+    """
+    hdr = req.headers.get("X-Worker-Device", "")
+    if hdr.strip():
+        try:
+            return int(hdr.strip())
+        except ValueError:
+            pass
+    if _default_device is not None:
+        return _default_device
+    return DEFAULT_DEVICE
+
+
+def _engine_for(device: int) -> "ImageInferenceEngine":
+    """Return (creating on demand) the engine bound to CUDA ``device``."""
+    if device not in _engines:
+        e = ImageInferenceEngine(profile=gpu_profile)
+        e.current_device = device
+        _engines[device] = e
+    return _engines[device]
 
 
 # ── Helpers ────────────────────────────────────────────────
@@ -97,13 +146,15 @@ def _estimate_bytes(obj) -> int:
     return total
 
 
-async def _run_generation(fn, *args, **kwargs):
-    """Run a blocking engine generation off the event loop.
+async def _run_generation(fn, device: int, *args, **kwargs):
+    """Run a blocking engine generation off the event loop on ``device``.
 
-    The engine's generation methods are synchronous (GPU-bound). Dispatching to a
-    worker thread (serialized by the generation lock) keeps the asyncio heartbeat
-    responsive so the orchestrator never drops the runner."""
-    async with _generation_lock:
+    The engine's generation methods are synchronous (GPU-bound). Dispatching to
+    a worker thread (serialized by that device's lock) keeps the asyncio
+    heartbeat responsive so the orchestrator never drops the runner. Requests on
+    DIFFERENT devices use different locks and therefore run concurrently.
+    """
+    async with _device_lock(device):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, functools.partial(fn, *args, **kwargs)
@@ -113,13 +164,15 @@ async def _run_generation(fn, *args, **kwargs):
 # ── Control-plane routes (token-gated) ─────────────────────
 
 async def handle_load(req: web.Request) -> web.Response:
-    """POST /load — set the active CUDA device + ensure the engine is resident.
+    """POST /load — ensure an engine is resident for the CUDA ``device``.
 
     Reads ``device`` (int) from the body; when omitted falls back to DEFAULT_DEVICE.
-    Kept warm by the live-runner's swap policy; models themselves load lazily on
-    the first generation."""
+    The engine instance is created/kept for that device (models themselves load
+    lazily on the first generation). The live-runner's swap policy drives this
+    per card, one engine per resident GPU.
+    """
     _require_token(req)
-    global engine
+    global _default_device
     body = await req.json()
     device = body.get("device")
     if device is None:
@@ -131,20 +184,40 @@ async def handle_load(req: web.Request) -> web.Response:
     visible = _devices_visible()
     if visible > 0:
         device = max(0, min(device, visible - 1))
-    if engine is not None:
-        engine.current_device = device
-    logger.info("image-worker /load: device=%s (visible=%d)", device, visible)
+    e = _engine_for(device)
+    e.current_device = device
+    _default_device = device
+    logger.info("image-worker /load: device=%s (visible=%d, engines=%s)",
+                device, visible, sorted(_engines))
     return web.json_response({"loaded": True, "ready": ready, "device": device})
 
 
 async def handle_evict(req: web.Request) -> web.Response:
-    """POST /evict — drop all resident pipelines + free GPU memory.
+    """POST /evict — drop resident pipelines + free GPU memory.
 
-    Called by the live-runner before it swaps in another worker's model on the
-    shared GPU. The next /v1/* generation reloads lazily."""
+    ``{"device": N}`` frees only that ONE card of a multi-resident worker so the
+    copies still warm on other cards survive; no device (legacy) frees ALL
+    engines. Called by the live-runner before it swaps in another worker's model
+    on that GPU. The next /v1/* generation reloads lazily."""
     _require_token(req)
-    assert engine is not None
-    engine.free()
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    device = body.get("device")
+    if device is None:
+        for e in list(_engines.values()):
+            e.free()
+        _engines.clear()
+        _device_locks.clear()
+        logger.info("image-worker /evict: all devices freed")
+    else:
+        device = int(device)
+        e = _engines.pop(device, None)
+        if e is not None:
+            e.free()
+        _device_locks.pop(device, None)
+        logger.info("image-worker /evict: device %d freed", device)
     return web.json_response({"evicted": True})
 
 
@@ -155,11 +228,12 @@ async def handle_health(_req: web.Request) -> web.Response:
 
 
 async def handle_info(_req: web.Request) -> web.Response:
-    global engine
     profile_info = {}
     if gpu_profile is not None:
         profile_info = gpu_profile.info
-    device_in_use = engine.current_device if engine is not None else None
+    device_in_use = None
+    if _engines:
+        device_in_use = _default_device if _default_device is not None else min(_engines)
     if device_in_use is None:
         device_in_use = DEFAULT_DEVICE
     return web.json_response({
@@ -169,7 +243,10 @@ async def handle_info(_req: web.Request) -> web.Response:
         "ready": ready,
         "gpu": profile_info,
         "devices_visible": _devices_visible(),
+        # Multi-resident: the scheduler's reconcile needs the full device SET so
+        # it can mark several slots as owned by this worker.
         "device_in_use": device_in_use,
+        "devices": sorted(_engines),
     })
 
 
@@ -180,14 +257,16 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
 
     Events: accepted -> progress* (per denoise step) -> complete ({image b64}),
     or error. Mirrors ``_run_layer_sse`` so the frontend can show a thin progress
-    bar while a Qwen-Image-Edit (whole-frame or masked inpaint) runs."""
+    bar while a Qwen-Image-Edit (whole-frame or masked inpaint) runs.
+    """
     resp = web.StreamResponse(status=200, headers={
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     })
     await resp.prepare(req)
-    assert engine
+    device = _resolve_device(req)
+    e = _engine_for(device)
     prompt = str(body.get("prompt", ""))
     engine_name = str(body.get("engine", "qwen-edit")).lower()
 
@@ -227,12 +306,12 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
             asyncio.create_task, _ev("progress", {"step": step, "total_steps": t})
         )
 
-    async with _generation_lock:
+    async with _device_lock(device):
         try:
             if engine_name == "hidream":
                 img = await loop.run_in_executor(
                     None, functools.partial(
-                        engine.hidream_edit, body["image"], prompt,
+                        e.hidream_edit, body["image"], prompt,
                         seed=kw.get("seed"),
                         num_inference_steps=kw.get("num_inference_steps"),
                         quality=body.get("quality"), progress_cb=_progress,
@@ -241,7 +320,7 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
             else:
                 img = await loop.run_in_executor(
                     None, functools.partial(
-                        engine.edit_image,
+                        e.edit_image,
                         body["image"], prompt,
                         engine=engine_name,
                         mask=body.get("mask_image"),
@@ -281,7 +360,8 @@ async def handle_edit(req: web.Request) -> web.Response:
         return web.json_response({"error": "missing 'image' (base64)"}, status=400)
     if req.query.get("sse") in ("1", "true", "yes"):
         return await _run_edit_sse(req, body)
-    assert engine
+    device = _resolve_device(req)
+    e = _engine_for(device)
     image = body.get("image")
     prompt = str(body.get("prompt", ""))
     engine_name = str(body.get("engine", "qwen-edit")).lower()
@@ -310,15 +390,15 @@ async def handle_edit(req: web.Request) -> web.Response:
     from runner.image.inference import _pil_to_b64  # cheap, no torch
     if engine_name == "hidream":
         img = await _run_generation(
-            engine.hidream_edit, image, prompt,
+            e.hidream_edit, device, image, prompt,
             seed=kw.pop("seed", None),
             num_inference_steps=kw.pop("num_inference_steps", None),
             quality=body.get("quality"),
         )
     else:
         img = await _run_generation(
-            engine.edit_image,
-            image, prompt,
+            e.edit_image,
+            device, image, prompt,
             engine=engine_name,
             mask=mask,
             keep_subject=keep_subject,
@@ -370,6 +450,8 @@ async def _run_layer_sse(req: web.Request, body: dict) -> web.StreamResponse:
         "X-Accel-Buffering": "no",
     })
     await resp.prepare(req)
+    device = _resolve_device(req)
+    e = _engine_for(device)
 
     async def _ev(event: str, data: dict) -> None:
         try:
@@ -391,12 +473,11 @@ async def _run_layer_sse(req: web.Request, body: dict) -> web.StreamResponse:
             asyncio.create_task, _ev("progress", {"step": step, "total_steps": t})
         )
 
-    assert engine
-    async with _generation_lock:
+    async with _device_lock(device):
         try:
             result = await loop.run_in_executor(
                 None, functools.partial(
-                    engine.layered_decompose, body["image"], layers, resolution,
+                    e.layered_decompose, body["image"], layers, resolution,
                     preview_only, steps, _progress,
                 )
             )
@@ -442,8 +523,10 @@ async def handle_layer(req: web.Request) -> web.Response:
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
+    device = _resolve_device(req)
+    e = _engine_for(device)
     result = await _run_generation(
-        engine.layered_decompose, body["image"], layers, resolution, preview_only, steps
+        e.layered_decompose, device, body["image"], layers, resolution, preview_only, steps
     )
 
     # Reject an oversized projected response (base64 payload dominates bytes).
@@ -501,7 +584,8 @@ async def handle_image(req: web.Request) -> web.Response:
                num_inference_steps?}
     """
     body = await req.json()
-    assert engine
+    device = _resolve_device(req)
+    e = _engine_for(device)
     prompt = str(body.get("prompt", "")).strip()
     if not prompt:
         return web.json_response({"error": "missing 'prompt'"}, status=400)
@@ -520,11 +604,7 @@ async def handle_image(req: web.Request) -> web.Response:
     kw = {}
     for k in ("width", "height"):
         if body.get(k) is not None:
-            # diffusers ZImagePipeline (and other image backends) require
-            # spatial dims divisible by 16; snap to the nearest multiple so
-            # any client resolution (e.g. raw 1080p -> 1920x1080) just works
-            # instead of 500ing with "Height must be divisible by 16".
-            kw[k] = round(int(body.get(k)) / 16) * 16
+            kw[k] = body.get(k)
     # Resolve the seed: client-supplied passes through (deterministic replay);
     # otherwise mint a fresh random one so each bare request differs. Forwarded
     # to BOTH engines so the response can truthfully report which seed ran.
@@ -542,7 +622,7 @@ async def handle_image(req: web.Request) -> web.Response:
         kw.pop("num_inference_steps", None)
         kw.pop("guidance_scale", None)
         img = await _run_generation(
-            engine.hidream_image, prompt,
+            e.hidream_image, device, prompt,
             num_inference_steps=body.get("num_inference_steps"),
             guidance_scale=body.get("guidance_scale"),
             quality=body.get("quality"), progress_cb=None, **kw,
@@ -561,18 +641,12 @@ async def handle_image(req: web.Request) -> web.Response:
         # `steps` already consumes the body's num_inference_steps; don't also let
         # it ride in **kw or klein_image gets it twice (TypeError: multiple values).
         kw.pop("num_inference_steps", None)
-        img = await _run_generation(
-            engine.klein_image, prompt, num_inference_steps=steps, **kw,
-        )
+        async with _klein_lock:
+            img = await _run_generation(
+                e.klein_image, device, prompt, num_inference_steps=steps, **kw,
+            )
     else:
-        # Z-Image Turbo: explicit num_inference_steps wins; else map the
-        # client quality preset (fast|balanced|high) through the per-model
-        # map so Fast/Balanced/High select 4/8/12 instead of always 4.
-        if "num_inference_steps" not in kw:
-            q = str(body.get("quality") or "").strip().lower()
-            if q in ZIMAGE_STEP_PRESETS:
-                kw["num_inference_steps"] = ZIMAGE_STEP_PRESETS[q]
-        img = await _run_generation(engine.plain_image, prompt, **kw)
+        img = await _run_generation(e.plain_image, device, prompt, **kw)
     resp = {
         "image": _pil_to_b64(img),
         "content_type": "image/png",
@@ -581,8 +655,6 @@ async def handle_image(req: web.Request) -> web.Response:
     }
     if engine_name == "klein":
         resp["num_inference_steps"] = _image_klein_steps(body)
-    elif engine_name == "zimage" and "num_inference_steps" in kw:
-        resp["num_inference_steps"] = kw["num_inference_steps"]
     return web.json_response(resp)
 
 async def handle_style_frame(req: web.Request) -> web.Response:
@@ -597,7 +669,8 @@ async def handle_style_frame(req: web.Request) -> web.Response:
     verbatim (enhanced_prompt is omitted from the response).
     """
     body = await req.json()
-    assert engine
+    device = _resolve_device(req)
+    e = _engine_for(device)
     image = body.get("image")
     if not image:
         return web.json_response({"error": "missing 'image' (base64)"}, status=400)
@@ -628,10 +701,12 @@ async def handle_style_frame(req: web.Request) -> web.Response:
             {"error": "FLUX.2 Klein 4B not provisioned (KLEIN4B_MODEL missing)"},
             status=503,
         )
-    img = await _run_generation(
-        engine.style_frame, image, prompt + composition_hold, seed, width, height,
-        num_inference_steps=steps,
-    )
+    # klein (flux_edit singleton) serialized globally across devices.
+    async with _klein_lock:
+        img = await _run_generation(
+            e.style_frame, device, image, prompt + composition_hold, seed, width, height,
+            num_inference_steps=steps,
+        )
     return web.json_response({
         "styled_image": _pil_to_b64(img),
         "width": img.size[0],
@@ -642,19 +717,14 @@ async def handle_style_frame(req: web.Request) -> web.Response:
 # ── Lifecycle ──────────────────────────────────────────────
 
 async def on_startup(_app: web.Application) -> None:
-    global engine, gpu_profile, ready
+    global gpu_profile, ready
     # Detect GPU and build the VRAM-aware profile (reuses runner.ltx.gpu_profile,
     # which is pure-Python and builds fine even without torch/CUDA present).
     gpu_profile = build_profile(DEFAULT_DEVICE)
-    engine = ImageInferenceEngine(profile=gpu_profile)
-    if engine is not None:
-        engine.current_device = DEFAULT_DEVICE
     logger.info(
-        "image worker on GPU[%d] %s (%.1f GB VRAM, mode=%s)",
-        DEFAULT_DEVICE,
-        gpu_profile.gpu_name,
-        gpu_profile.vram_gb,
-        gpu_profile.mode,
+        "image worker on GPU[%d] %s (%.1f GB VRAM, mode=%s) — engines created "
+        "per-device on /load",
+        DEFAULT_DEVICE, gpu_profile.gpu_name, gpu_profile.vram_gb, gpu_profile.mode,
     )
     ready = True
     logger.info("image worker READY")

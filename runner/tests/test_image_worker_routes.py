@@ -94,7 +94,11 @@ async def client(monkeypatch):
     # Don't run on_startup (it builds a real ImageInferenceEngine that needs
     # torch/GPU) — we test the route layer against the fake engine only.
     app.on_startup.clear()
-    monkeypatch.setattr(image_server, "engine", engine)
+    # Multi-engine: patch _engine_for to always hand back the fake, and seed the
+    # registry / default device so /info and /load report a coherent device.
+    monkeypatch.setattr(image_server, "_engine_for", lambda device: engine)
+    monkeypatch.setattr(image_server, "_engines", {1: engine})
+    monkeypatch.setattr(image_server, "_default_device", 1)
     monkeypatch.setattr(image_server, "ready", True)
     monkeypatch.setattr(image_server, "gpu_profile", None)
     srv = TestServer(app)
@@ -104,6 +108,45 @@ async def client(monkeypatch):
         yield cli, engine
     finally:
         await cli.close()
+
+
+async def test_info_reports_resident_device_set(client):
+    """Multi-resident: /info reports the worker's resident device LIST so the
+    live-runner scheduler reconcile can mark several slots for this worker."""
+    cli, engine = client
+    r = await cli.get("/video-creator/v1/info")
+    assert r.status == 200
+    body = await r.json()
+    assert body["device_in_use"] == 1
+    assert body["devices"] == [1]
+
+
+async def test_evict_device_frees_only_that_card(client, monkeypatch):
+    """/evict with a device frees only that one engine (multi-resident); other
+    copies stay warm for other cards."""
+    cli, engine = client
+    other = FakeEngine()
+    monkeypatch.setattr(image_server, "_engines", {0: engine, 2: other})
+    r = await cli.post("/evict", json={"device": 0}, headers=_token_headers())
+    assert r.status == 200
+    body = await r.json()
+    assert body["evicted"] is True
+    assert image_server._engines == {2: other}  # card 2's engine survived
+
+
+async def test_x_worker_device_header_picks_device(client, monkeypatch):
+    """The live-runner's X-Worker-Device header routes the request to the target
+    GPU's engine; absent, it falls back to the last /load'ed device."""
+    seen = {}
+    monkeypatch.setattr(image_server, "_resolve_device",
+                        lambda req: seen.setdefault(
+                            "v", int(req.headers.get("X-Worker-Device", "0"))))
+    cli, engine = client
+    r = await cli.post("/video-creator/v1/image",
+                       json={"prompt": "a cat"},
+                       headers={"X-Worker-Device": "3"})
+    assert r.status == 200
+    assert seen["v"] == 3
 
 
 def _token_headers():
