@@ -10,7 +10,10 @@ import { useProjects } from '../contexts/ProjectContext'
 import type { GenSpaceRetakeSource } from '../contexts/ProjectContext'
 import { useAppSettings } from '../contexts/AppSettingsContext'
 import { useGeneration, GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
+import { useRunnerAvailability } from '../hooks/use-runner-availability'
+import { activeRecoveryMarkerExists } from '../lib/generation-progress-poll'
 import { setActiveGenerationOwner, hasValidBaselineId } from '../lib/generation-recovery'
+import { setBillingProjectId } from '../lib/billing-context'
 import { resolveRunner, enhancePromptViaRunner, pathToBase64 } from '../lib/direct-transport'
 import { isWebPlatform } from '../lib/livepeer-discovery'
 import { extractFrame } from '../lib/runtime/web-store'
@@ -743,10 +746,10 @@ function PromptBar({
   restyleFps,
   onRestyleModelChange,
   onRestyleFpsChange,
-    restyleEnhancePrompt,
-    onRestyleEnhancePromptChange,
     extendDirection,
   onExtendDirectionChange,
+  extendModel,
+  onExtendModelChange,
   extendSeconds,
   onExtendSecondsChange,
   extendSecondsOptions,
@@ -791,6 +794,8 @@ function PromptBar({
   buttonIcon: React.ReactNode
   extendDirection?: ExtendDirection
   onExtendDirectionChange?: (direction: ExtendDirection) => void
+  extendModel?: string
+  onExtendModelChange?: (model: string) => void
   extendSeconds?: number
   onExtendSecondsChange?: (seconds: number) => void
   extendSecondsOptions?: number[]
@@ -815,9 +820,10 @@ function PromptBar({
     imageEditEngine?: 'qwen-edit' | 'zimage'
     imageEditModel?: 'qwen-edit' | 'klein' | 'hidream'
     imageEditQuality?: 'fast' | 'balanced' | 'high'
+    imageQuality?: 'fast' | 'balanced' | 'high'
     imageEditPadding?: number
     imageModel?: 'zimage' | 'klein' | 'hidream'
-    first_frame_engine?: 'qwen-edit' | 'klein'
+    first_frame_engine?: 'qwen-edit' | 'klein' | 'hidream'
   }
   onSettingsChange: (settings: any) => void
   videoModelSpecs: VideoGenerationModelSpecItem[]
@@ -862,8 +868,6 @@ function PromptBar({
   onRestyleModelChange?: (v: 'fast' | 'regular') => void
   restyleFps?: 'auto' | 24 | 25 | 30
   onRestyleFpsChange?: (v: 'auto' | 24 | 25 | 30) => void
-  restyleEnhancePrompt?: boolean
-  onRestyleEnhancePromptChange?: (v: boolean) => void
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const audioInputRef = useRef<HTMLInputElement>(null)
@@ -1126,34 +1130,21 @@ function PromptBar({
             <SettingsDropdown
               title="FIRST-FRAME EDITOR"
               value={settings.first_frame_engine ?? 'qwen-edit'}
-              onChange={(v) => onSettingsChange({ ...settings, first_frame_engine: v as 'qwen-edit' | 'klein' })}
+              onChange={(v) => onSettingsChange({ ...settings, first_frame_engine: v as 'qwen-edit' | 'klein' | 'hidream' })}
               options={[
                 { value: 'qwen-edit', label: 'Qwen-Image-Edit' },
                 { value: 'klein', label: 'FLUX.2 klein (fast)' },
+                { value: 'hidream', label: 'HiDream-O1' },
               ]}
               trigger={
                 <>
                   <Sparkles className="h-3.5 w-3.5" />
-                  <span>{settings.first_frame_engine === 'klein' ? 'FLUX.2 klein' : 'Qwen-Edit'}</span>
+                  <span>{settings.first_frame_engine === 'klein' ? 'FLUX.2 klein' : settings.first_frame_engine === 'hidream' ? 'HiDream-O1' : 'Qwen-Edit'}</span>
                   <ChevronUp className="h-3 w-3 text-zinc-500" />
                 </>
               }
-              tooltip="Engine that styles the restyle first frame: Qwen-Image-Edit (default) or FLUX.2 klein 4B (fast alternate)"
+              tooltip="Engine that styles the restyle first frame: Qwen-Image-Edit (default), FLUX.2 klein 4B (fast alternate), or HiDream-O1"
             />
-            <div className="w-px h-4 bg-zinc-700 mx-0.5" />
-            <label
-              className="flex items-center gap-1.5 text-[11px] text-zinc-400 cursor-pointer select-none"
-              title="Run the style prompt through the worker's Gemma LLM first (enhanced before it is evicted to load FLUX.2)"
-            >
-              <input
-                type="checkbox"
-                checked={restyleEnhancePrompt ?? false}
-                onChange={(e) => onRestyleEnhancePromptChange?.(e.target.checked)}
-                className="accent-amber-400"
-              />
-              <Wand2 className="h-3 w-3 text-amber-400/80" />
-              Enhance
-            </label>
           </>
         ) : isRestyleVideo ? (
           <>
@@ -1194,19 +1185,6 @@ function PromptBar({
               }
               tooltip="Output fps: Auto matches the source video's frame rate; pick 24/25/30 to override"
             />
-            <label
-              className="flex items-center gap-1.5 text-[11px] text-zinc-400 cursor-pointer select-none"
-              title="Run the restyle prompt through the worker's Gemma LLM first (blank prompts are always auto-captioned from the source video)"
-            >
-              <input
-                type="checkbox"
-                checked={restyleEnhancePrompt ?? false}
-                onChange={(e) => onRestyleEnhancePromptChange?.(e.target.checked)}
-                className="accent-amber-400"
-              />
-              <Wand2 className="h-3 w-3 text-amber-400/80" />
-              Enhance
-            </label>
           </>
         ) : isRetake ? (
           resolutionControl ?? <div className="text-[10px] text-zinc-500 pr-2">Trim in the panel above, then retake</div>
@@ -1224,6 +1202,23 @@ function PromptBar({
                 <>
                   <MoveHorizontal className="h-3.5 w-3.5" />
                   <span>{extendDirection === 'start' ? 'At start' : 'At end'}</span>
+                  <ChevronUp className="h-3 w-3 text-zinc-500" />
+                </>
+              }
+            />
+            <div className="w-px h-4 bg-zinc-700 mx-0.5" />
+            <SettingsDropdown
+              title="MODEL"
+              value={extendModel ?? ''}
+              onChange={(v) => onExtendModelChange?.(v)}
+              options={[
+                { value: '', label: 'LTX 2.3' },
+                { value: 'ltx-2.5', label: 'LTX 2.5' },
+              ]}
+              trigger={
+                <>
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <span>{extendModel === 'ltx-2.5' ? 'LTX 2.5' : 'LTX 2.3'}</span>
                   <ChevronUp className="h-3 w-3 text-zinc-500" />
                 </>
               }
@@ -1388,26 +1383,31 @@ function PromptBar({
                 {(() => {
                   const qs = (k: 'fast' | 'balanced' | 'high') =>
                     qualityStepsFor(settings.imageModel, k)
-                  const cur = settings.imageSteps || 4
-                  const label = cur >= qs('high')
-                    ? 'High'
-                    : cur >= qs('balanced')
-                      ? 'Balanced'
-                      : 'Fast'
+                  const q = settings.imageQuality ?? 'balanced'
+                  const cap = q.charAt(0).toUpperCase() + q.slice(1)
                   return (
                     <SettingsDropdown
                       title="QUALITY"
-                      value={String(cur)}
-                      onChange={(v) => onSettingsChange({ ...settings, imageSteps: parseInt(v, 10) })}
+                      value={q}
+                      onChange={(v) => {
+                        const q2 = v as 'fast' | 'balanced' | 'high'
+                        // Thread the quality NAME to the worker (it owns the per-model
+                        // step map); keep the resolved number for the FAL fallback path.
+                        onSettingsChange({
+                          ...settings,
+                          imageQuality: q2,
+                          imageSteps: qualityStepsFor(settings.imageModel, q2),
+                        })
+                      }}
                       options={[
-                        { value: String(qs('fast')), label: 'Fast' },
-                        { value: String(qs('balanced')), label: 'Balanced' },
-                        { value: String(qs('high')), label: 'High' },
+                        { value: 'fast', label: `Fast - ${qs('fast')}` },
+                        { value: 'balanced', label: `Balanced - ${qs('balanced')}` },
+                        { value: 'high', label: `High - ${qs('high')}` },
                       ]}
                       trigger={
                         <>
                           <Sparkles className="h-3.5 w-3.5" />
-                          <span>{label}</span>
+                          <span>{cap} - {qs(q)}</span>
                         </>
                       }
                     />
@@ -1668,13 +1668,14 @@ const DEFAULT_VIDEO_SETTINGS = {
   imageEditStrength: 0.55,
   imageEditPadding: 0,
   imageSteps: IMAGE_STEPS_GENERATE,
+  imageQuality: 'balanced' as 'fast' | 'balanced' | 'high',
   // Qwen-Image-Edit is the default engine for image edits and restyle first-frames.
   imageEditEngine: 'qwen-edit' as 'qwen-edit' | 'zimage',
   // Edit models: Qwen-Image-Edit (default) | FLUX.2 klein.
   imageEditModel: 'qwen-edit' as 'qwen-edit' | 'klein' | 'hidream',
   imageEditQuality: 'balanced' as 'fast' | 'balanced' | 'high',
   imageModel: 'zimage' as 'zimage' | 'klein' | 'hidream',
-  first_frame_engine: 'qwen-edit' as 'qwen-edit' | 'klein',
+  first_frame_engine: 'qwen-edit' as 'qwen-edit' | 'klein' | 'hidream',
 }
 
 export function GenSpace() {
@@ -1776,6 +1777,15 @@ export function GenSpace() {
     resumeIfRunning,
   } = useGeneration()
 
+  // Livepeer runner availability for the Generate disable rule: the webapp Generate button
+  // must be disabled ONLY when Livepeer is enabled and no capable runner is available (and
+  // we're not still resolving one). `hasCompatibleVideoSettings` already requires runner-spec
+  // feeds non-empty, so this adds an explicit no-runner gate + the loading window.
+  const {
+    videoRunnerCount,
+    loading: runnerLoading,
+  } = useRunnerAvailability()
+
   // Locally installed LoRAs are only usable in local generation mode.
   const isLocalMode = !shouldVideoGenerateWithLtxApi
   // Enhance itself is independent of the video-generation backend — the backend enhance
@@ -1784,7 +1794,7 @@ export function GenSpace() {
   // LoRA picker is local-only), it just falls back to a generic rewrite. "retake"/"extend" have
   // no prompt input, so they're excluded.
   const enhanceAvailableForMode =
-    mode === 'video' || mode === 'ic-lora' || mode === 'image' || mode === 'extend' || mode === 'retake'
+    mode === 'video' || mode === 'ic-lora' || mode === 'image' || mode === 'extend' || mode === 'retake' || mode === 'restyle'
   // The prompt enhancer can run the local Gemma text encoder OR Gemini's hosted API — this hook
   // tracks which of those is actually available (not just which the user prefers) and picks
   // whichever provider Enhance should use. Refetched whenever the user is in a mode the button
@@ -1953,6 +1963,8 @@ export function GenSpace() {
   // Direction + seconds + resolution live here (controlled by the PromptBar), not the panel.
   const [extendDirection, setExtendDirection] = useState<ExtendDirection>('end')
   const [extendSeconds, setExtendSeconds] = useState<number>(DEFAULT_EXTEND_SECONDS)
+  // '' = LTX 2.3 (default), 'ltx-2.5' = LTX 2.5. Controls which model `extend` uses.
+  const [extendModel, setExtendModel] = useState<string>('')
   const [extendResolutionKey, setExtendResolutionKey] = useState('original')
 
   const retakeResolutionOpts = useMemo(
@@ -2039,12 +2051,6 @@ export function GenSpace() {
   const [restyleModel, setRestyleModel] = useState<'fast' | 'regular'>('fast')
   // Output fps: 'auto' (encode at the source video's fps) | 24 | 25 | 30.
   const [restyleFps, setRestyleFps] = useState<'auto' | 24 | 25 | 30>('auto')
-  // Default the restyle Enhance checkbox to match the Prompt Enhancer setting:
-  // checked when "Generate with Livepeer for prompt enhancements" is on (and a
-  // Discovery URL is configured). The user can still toggle it per-run.
-  const [restyleEnhancePrompt, setRestyleEnhancePrompt] = useState(
-    () => appSettings.livepeerPromptEnhanceEnabled === true && appSettings.hasLivepeerDiscoveryUrl === true,
-  )
   const [restyleFrameState, setRestyleFrameState] = useState<{
     extractedFramePath: string | null
     isStyling: boolean
@@ -2255,7 +2261,8 @@ export function GenSpace() {
   useEffect(() => {
     if (!isAnyLocalGenerationInFlight) return
     setActiveGenerationOwner(currentProjectId)
-    return () => setActiveGenerationOwner(null)
+    setBillingProjectId(currentProjectId)
+    return () => { setActiveGenerationOwner(null); setBillingProjectId(null) }
   }, [currentProjectId, isAnyLocalGenerationInFlight])
 
   useEffect(() => {
@@ -2272,15 +2279,10 @@ export function GenSpace() {
     if (ctx.genType === 'enhance') return
 
     void (async () => {
-      const progress = await ApiClient.getGenerationProgress()
-      if (!progress.ok) return
-      // Same identity check as the background watcher (checkAndConsumeRecovery in
-      // lib/generation-recovery.ts): the handler that starts a generation loads its pipeline —
-      // which can take many seconds, worse for image models loading checkpoint shards — BEFORE
-      // it ever reports a new id, so a poll right after remounting can still be looking at
-      // whatever the single global progress slot held before this marker was even written.
-      if (progress.data.id === ctx.baselineId) return // unchanged since before we wrote this marker — not started reporting yet
-      if (progress.data.status !== 'running') return // already past 'running' (complete/error/etc) — that's the watcher's job to persist, not ours to restore UI for
+      // The webapp has no backend generation-job row — the /api/generation/progress endpoint was
+      // removed. "Still in flight" is purely the live recovery marker (lease alive): if it's
+      // present, restore the running generation's context.
+      if (!activeRecoveryMarkerExists()) return
 
       const status = await resumeIfRunning()
       if (status !== 'running') return // finished between our two checks — again, the watcher's job now
@@ -2552,7 +2554,7 @@ export function GenSpace() {
       prompt,
       model: restyleModel,
       fps: restyleFps,
-      enhancePrompt: restyleEnhancePrompt,
+      enhancePrompt: false,
       seed: nextSeed,
     })
   }
@@ -2797,25 +2799,10 @@ export function GenSpace() {
   // "a stale, unrelated result predates this marker entirely".
   const writeRecoveryContext = async (ctx: Omit<GenerationRecoveryContext, 'projectId' | 'baselineId'>) => {
     if (!currentProjectId) return
-    // Web build: the Worker has no generation-job rows here (generations are direct-to-runner and
-    // the media path is fully browser-local), so its progress slot is always id:null — a pointless
-    // round-trip to capture a baseline that can't exist. Save the marker purely locally. The
-    // desktop build (real backend job slot) still captures the baseline id so its recovery watcher
-    // can tell a not-yet-started generation from a stale unrelated one.
-    let baselineId: string | null = null
-    if (!isWebPlatform()) {
-      const before = await ApiClient.getGenerationProgress()
-      if (!before.ok) {
-        // Fail closed: a failed fetch is indistinguishable from a legitimate idle baseline
-        // (both would otherwise write baselineId: null), but if a prior generation is still
-        // sticky-complete with a real id, that null baseline lets the very first recovery tick
-        // mistake the old generation's result for this one's. No marker means this generation
-        // just isn't recoverable if the user navigates away mid-flight — safer than misimporting.
-        logger.error(`Skipping recovery marker: failed to fetch baseline generation id (${before.error})`)
-        return
-      }
-      baselineId = before.data.id ?? null
-    }
+    // The webapp has no backend generation-job row — the /api/generation/progress endpoint was
+    // removed, so there is no server baseline id to capture. Save the marker purely locally with
+    // a null baseline.
+    const baselineId: string | null = null
     logger.info(`Writing recovery marker for ${currentProjectId} (genType=${ctx.genType ?? 'video'}, baselineId=${baselineId})`)
     localStorage.setItem(
       GENERATION_RECOVERY_KEY,
@@ -2895,6 +2882,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     if (isEnhancingPrompt) return
     setIsEnhancingPrompt(true)
     setEnhancePromptError(null)
+    try {
 
     // Recovery marker so a reload mid-enhance can reconnect to the still-running backend call
     // (see the mount effect below) instead of silently losing the result.
@@ -3009,6 +2997,15 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     logger.info('Enhance request succeeded, clearing recovery marker')
     localStorage.removeItem(GENERATION_RECOVERY_KEY)
     applyEnhanceResult(sourcePrompt, result.data.enhancedPrompt)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Enhance failed unexpectedly'
+      setEnhancePromptError(msg)
+      logger.error(`Enhance threw: ${msg}`)
+      // Marker stays for mount-recovery to reconcile after a reload; the finally below
+      // guarantees the button never sticks in the Enhancing... state on a throw.
+    } finally {
+      setIsEnhancingPrompt(false)
+    }
   }, [isEnhancingPrompt, mode, selectedLoras, selectedIcLoraId, icLoraCondType, inputImage, extendInput, extendDirection, retakeInput, enhanceProvider, applyEnhanceResult, writeRecoveryContext])
 
   const handleEnhancePrompt = useCallback(() => {
@@ -3058,57 +3055,12 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     let cancelled = false
     const poll = async () => {
       if (cancelled) return
-      const result = await ApiClient.getGenerationProgress()
-      if (cancelled) return
-      if (!result.ok) {
-        setTimeout(poll, 2000)
-        return
-      }
-
-      // The server's own "nothing running" signal: no reservation, no active generation. If the
-      // marker was written but the backend never actually started a matching generation (e.g.
-      // reload raced the request, or the backend restarted before picking it up), this is what
-      // proves it — no need to guess from id comparisons.
-      if (result.data.status === 'idle') {
-        logger.warn(`Enhance recovery for ${ctx.projectId}: server reports idle, no generation ever started — dropping stale marker`)
-        localStorage.removeItem(GENERATION_RECOVERY_KEY)
-        setIsEnhancingPrompt(false)
-        return
-      }
-
-      const observedId = result.data.id
-
-      // Same identity confirmation as checkAndConsumeRecovery (lib/generation-recovery.ts): the
-      // enhance endpoint's own pipeline/provider setup can take a moment before it ever reports
-      // a new id, so an unconfirmed poll can still be looking at whatever the single global
-      // progress slot held before this marker was even written — trusting that blindly can
-      // misapply a stale, unrelated result (even a video path) as an "enhanced prompt".
-      if (ctx.generationId == null) {
-        if (observedId === ctx.baselineId) {
-          setTimeout(poll, 2000)
-          return
-        }
-        ctx = { ...ctx, generationId: observedId ?? undefined }
-        localStorage.setItem(GENERATION_RECOVERY_KEY, JSON.stringify(ctx))
-      } else if (observedId !== ctx.generationId) {
-        // A different generation superseded ours before we ever saw it finish.
-        logger.warn(`Enhance recovery: id changed from ${ctx.generationId} to ${observedId} before we saw it finish — dropping marker`)
-        localStorage.removeItem(GENERATION_RECOVERY_KEY)
-        setIsEnhancingPrompt(false)
-        return
-      }
-
-      if (result.data.status === 'running') {
-        setTimeout(poll, 2000)
-        return
-      }
-
-      logger.info(`Enhance recovery: generation ${ctx.generationId} settled with status=${result.data.status}, clearing marker`)
+      // The webapp has no backend generation-job row — the /api/generation/progress endpoint was
+      // removed, so there is no enhance job to reconnect to or result to recover: a reloaded tab's
+      // direct-rail enhance result is gone. Recognize the orphaned 'enhance' marker and clean it
+      // up instead of waiting on a server that isn't there.
       localStorage.removeItem(GENERATION_RECOVERY_KEY)
       setIsEnhancingPrompt(false)
-      if (result.data.status === 'complete' && typeof result.data.result === 'string') {
-        applyEnhanceResult(ctx.prompt, result.data.result)
-      }
     }
     void poll()
     return () => { cancelled = true }
@@ -3224,7 +3176,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         // stylized frame is accepted (Video tab / after Accept).
         const started = await restylePanelRef.current?.restyleFrame({
           prompt,
-          enhance: restyleEnhancePrompt,
+          enhance: false,
           engine: settings.first_frame_engine ?? 'qwen-edit',
         })
         if (!started) return
@@ -3238,7 +3190,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         prompt,
         model: restyleModel,
         fps: restyleFps,
-        enhancePrompt: restyleEnhancePrompt,
+        enhancePrompt: false,
         seed: restyleSeed,
       })
       return
@@ -3261,6 +3213,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         duration: extendSeconds,
         prompt,
         mode: extendDirection,
+        model: extendModel,
         resolution: resolveResolution(extendResolutionOpts, extendResolutionKey),
       })
       return
@@ -3296,6 +3249,8 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         imageEditStrength: settings.imageEditStrength,
         imageEditEngine: settings.imageEditEngine,
         imageModel: settings.imageModel ?? 'zimage',
+        imageQuality: settings.imageQuality ?? 'balanced',
+        imageEditQuality: settings.imageEditQuality ?? 'balanced',
       }
       await writeRecoveryContext({ prompt, settings: imageSettings, genType: 'image', inputImageUrl: editSource ?? undefined })
       generateImage(prompt, imageSettings, editSource)
@@ -3436,6 +3391,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     setPrompt('')
     setExtendDirection('end')
     setExtendSeconds(DEFAULT_EXTEND_SECONDS)
+    setExtendModel('')
     setExtendResolutionKey('original')
     setExtendInitial({
       videoPath: videoAsset.path,
@@ -3457,6 +3413,13 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   const isExtendMode = mode === 'extend'
   const isIcLoraMode = mode === 'ic-lora'
   const isRestyleMode = mode === 'restyle'
+  // Livepeer video is the webapp's ONLY video backend: when it is enabled (a Discovery URL is
+  // configured) and discovery has settled with no capable runner, the Generate button must be
+  // disabled — "disabled only when there are no runners available when Livepeer is enabled".
+  // While still resolving (loading) we keep it disabled too so a click can't race discovery.
+  const noRunnerVideo = appSettings.hasLivepeerDiscoveryUrl === true
+    && videoRunnerCount === 0
+    && !runnerLoading
   const hasCompatibleVideoSettings = mode !== 'video' || (
     !isLoadingVideoGenerationModelSpecs
     && videoModelSpecs.length > 0
@@ -3465,6 +3428,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       modelSpecs: videoModelSpecs,
       hasAudio: Boolean(inputAudio),
     }).hasCompatibleOptions
+    && !noRunnerVideo
   )
   const canSubmit = !isOtherGenerationRunning && (isRetakeMode
     ? retakeInput.ready && !!retakeInput.videoPath && !isRetaking
@@ -3955,10 +3919,10 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           onRestyleModelChange={setRestyleModel}
           restyleFps={restyleFps}
           onRestyleFpsChange={setRestyleFps}
-          restyleEnhancePrompt={restyleEnhancePrompt}
-          onRestyleEnhancePromptChange={setRestyleEnhancePrompt}
           extendDirection={extendDirection}
           onExtendDirectionChange={setExtendDirection}
+          extendModel={extendModel}
+          onExtendModelChange={setExtendModel}
           extendSeconds={extendSeconds}
           onExtendSecondsChange={setExtendSeconds}
           extendSecondsOptions={extendSecondsOptions}

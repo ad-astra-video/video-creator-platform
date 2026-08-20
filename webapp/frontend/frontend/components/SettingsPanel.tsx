@@ -32,6 +32,8 @@ export interface GenerationSettings {
   imageResolution: string
   imageAspectRatio: string
   imageSteps: number
+  imageQuality?: 'fast' | 'balanced' | 'high'
+  imageEditQuality?: 'fast' | 'balanced' | 'high'
   variations?: number  // Number of image variations to generate
   imageEditStrength?: number  // Denoising strength when editing an existing image
   imageEditEngine?: 'qwen-edit' | 'zimage'  // Image-edit engine: Qwen-Image-Edit (default) | Z-Image keep-subject

@@ -64,6 +64,7 @@ export const generationParamsSchema = z.object({
   cameraMotion: z.string(),
   imageAspectRatio: z.string().optional(),
   imageSteps: z.number().optional(),
+  imageQuality: z.enum(['fast', 'balanced', 'high']).optional(),
   imageEditStrength: z.number().optional(),
   // Image-edit engine: Qwen-Image-Edit (default) | Z-Image masked keep-subject.
   imageEditEngine: z.enum(['qwen-edit', 'zimage']).optional(),
@@ -74,8 +75,8 @@ export const generationParamsSchema = z.object({
   // Seed used by the runner for this image, echoed back and persisted so the
   // generation is reproducible / regenerable with the same input.
   seed: z.number().optional(),
-  // Restyle first-frame engine: Qwen-Image-Edit (default) | FLUX.2 klein (fast).
-  first_frame_engine: z.enum(['qwen-edit', 'klein']).optional(),
+  // Restyle first-frame engine: Qwen-Image-Edit (default) | FLUX.2 klein (fast) | HiDream-O1.
+  first_frame_engine: z.enum(['qwen-edit', 'klein', 'hidream']).optional(),
   inputImageUrl: z.string().optional(),
   inputAudioUrl: z.string().optional(),
   retakeVideoPath: z.string().optional(),

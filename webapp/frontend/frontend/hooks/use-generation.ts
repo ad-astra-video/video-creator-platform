@@ -25,6 +25,19 @@ export const GENERATION_RECOVERY_KEY = 'ltx-generation-recovery'
 export const GENERATION_RECOVERY_TS_KEY = 'ltx-generation-recovery-ts'
 export const GENERATION_RECOVERY_LEASE_MS = 10 * 60 * 1000
 
+// The web build injects a stub electronAPI (main.tsx -> createWebElectronAPI) whose
+// platform is 'web'; the desktop has no such element. Same detection the global
+// generation-lock and livepeer-discovery use. On web there is no local backend slot and
+// no direct rail after a reload, so a leftover recovery marker can never correspond to a
+// genuinely-running job — it must never be treated as one (see resumeIfRunning).
+function isWebPlatform(): boolean {
+  try {
+    return (window as unknown as { electronAPI?: { platform?: string } }).electronAPI?.platform === 'web'
+  } catch {
+    return false
+  }
+}
+
 export interface GenerationRecoveryContext {
   projectId: string
   prompt: string
@@ -177,6 +190,20 @@ export function useGeneration(): UseGenerationReturn {
     // (a reloaded tab's direct-rail result is gone). The only in-flight signal is the local
     // recovery marker: if its lease is live, treat the generation as still running and restore
     // a generic generating state; the owning flow clears the marker on completion.
+    if (isWebPlatform()) {
+      // WEB: no local backend slot AND the direct-rail SSE is lost on reload — nothing can be
+      // resumed. A leftover recovery marker (a generation whose process died before its finally,
+      // or that finished while this tab was closed) is therefore NOT proof a job is still
+      // running. Treating it as such would wedge isGenerating/'Generating...' and disable the
+      // Generate button forever even though a runner is available — exactly the generation lock
+      // the webapp must not have. Clear the marker and report none so a new generation starts
+      // immediately; a stale marker self-heals on the next mount.
+      clearRecoveryPolling()
+      localStorage.removeItem(GENERATION_RECOVERY_KEY)
+      localStorage.removeItem(GENERATION_RECOVERY_TS_KEY)
+      setState(prev => ({ ...prev, isGenerating: false, statusMessage: '' }))
+      return 'none'
+    }
     if (activeRecoveryMarkerExists()) {
       setState(prev => ({ ...prev, isGenerating: true, progress: 0, statusMessage: 'Generating...' }))
       return 'running'
@@ -444,16 +471,18 @@ export function useGeneration(): UseGenerationReturn {
                 image,
                 engine,
                 seed: imageSeed,
-                num_inference_steps: numSteps,
+                quality: settings.imageEditQuality ?? 'balanced',
                 strength: settings.imageEditStrength ?? 0.6,
                 keepSubject: false,
               }
             } else {
+              // Worker owns the per-model Fast/Balanced/High -> step map; send the
+              // quality NAME so Z-Image/Klein/HiDream each get their own step count.
               imageBody = {
                 prompt: finalPrompt,
                 width: dims.width,
                 height: dims.height,
-                num_inference_steps: numSteps,
+                quality: settings.imageQuality ?? 'balanced',
                 numImages,
                 seed: imageSeed,
                 engine,
