@@ -74,6 +74,10 @@ export interface RunnerDto {
   excluded: boolean
   gpu?: { name?: string; vram_mb?: number } | null
   price_info?: { price?: number; currency?: string; unit?: string } | null
+  /** Advertised concurrency capacity (runner GPU count) and its current usage, when the runner sends them. */
+  capacity?: number
+  capacityUsed?: number
+  capacityAvailable?: number
   capabilities?: Array<{ id: string; label: string }>
   models?: string[]
 }

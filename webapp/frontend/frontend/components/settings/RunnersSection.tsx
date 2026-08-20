@@ -4,7 +4,7 @@ import { ApiClient } from '../../lib/api-client'
 import { useAppSettings } from '../../contexts/AppSettingsContext'
 import { isWebPlatform, discoverRunners } from '../../lib/livepeer-discovery'
 import { getEthUsd, weiToUsd } from '../../lib/ethPrice'
-import { estimateRunnerCapacity } from '../../lib/runner-availability'
+import { runnerCapacity } from '../../lib/runner-availability'
 import { Button } from '../ui/button'
 
 interface RunnerCap {
@@ -17,6 +17,9 @@ interface ProviderDto {
   url: string
   status: string
   gpu?: { name?: string; vram_mb?: number } | null
+  capacity?: number
+  capacityUsed?: number
+  capacityAvailable?: number
   price_info?: { price?: number; currency?: string; unit?: string; usdPerSec?: number; pricePerUnit?: number; pixelsPerUnit?: number } | null
   selected: boolean
   excluded: boolean
@@ -153,6 +156,12 @@ export function RunnersSection() {
     void refresh()
   }, [refresh])
 
+  // Keep capacity/availability live: re-poll the discovery every 30s while mounted.
+  useEffect(() => {
+    const iv = setInterval(() => { void refresh() }, 30000)
+    return () => clearInterval(iv)
+  }, [refresh])
+
   const demo = providers.length > 0 && providers.every(p => p.demo)
   const excludedCount = providers.filter(isExcluded).length
 
@@ -211,7 +220,9 @@ export function RunnersSection() {
           {providers.map(p => {
             const ex = isExcluded(p)
             const vramMb = p.gpu?.vram_mb
-            const estCapacity = estimateRunnerCapacity(vramMb, p.models ?? [])
+            const hasAdvertisedCapacity = typeof p.capacity === 'number' || typeof p.capacityAvailable === 'number'
+            const cap = runnerCapacity({ capacity: p.capacity, capacityUsed: p.capacityUsed, capacityAvailable: p.capacityAvailable, vramMb, modelIds: p.models ?? [] })
+            const capacityInUse = hasAdvertisedCapacity && typeof p.capacityUsed === 'number' ? p.capacityUsed : null
             return (
               <div key={p.runner_id} className={`rounded-lg bg-zinc-800/50 p-3 space-y-2 ${ex ? 'opacity-55' : ''}`}>
                 <div className="flex items-center justify-between gap-2">
@@ -266,8 +277,11 @@ export function RunnersSection() {
                   ) : (
                     <span>VRAM unknown</span>
                   )}
-                  {estCapacity != null && (
-                    <span className="text-emerald-400/90">· ~{estCapacity} concurrent (est.)</span>
+                  {cap != null && (
+                    <span className={hasAdvertisedCapacity ? 'text-emerald-400' : 'text-emerald-400/90'}>
+                      {hasAdvertisedCapacity ? `· ${cap} concurrent` : `· ~${cap} concurrent (est.)`}
+                      {capacityInUse != null && cap > 0 ? ` · ${capacityInUse} in use` : ''}
+                    </span>
                   )}
                 </div>
 

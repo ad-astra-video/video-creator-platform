@@ -163,6 +163,13 @@ function normalizeRunner(raw: Record<string, unknown>): DiscoveredRunner {
   const models = Array.isArray(meta.models) ? (meta.models as unknown[]).map(String) : undefined
   const modelSpecs = Array.isArray(meta.model_specs) ? (meta.model_specs as unknown[]) : undefined
 
+  // Advertised concurrency capacity (e.g. capacity=3 from GPU count). Kept when the runner
+  // sends them so the UI can show real capacity instead of a VRAM guess.
+  const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+  const capacity = num(raw.capacity)
+  const capacityUsed = num(raw.capacity_used)
+  const capacityAvailable = num(raw.capacity_available)
+
   return {
     runner_id: id,
     url,
@@ -174,6 +181,9 @@ function normalizeRunner(raw: Record<string, unknown>): DiscoveredRunner {
     capabilities: caps.map((t) => ({ id: t, label: TASK_LABELS[t] ?? t })),
     ...(models && models.length ? { models } : {}),
     ...(modelSpecs !== undefined ? { modelSpecs } : {}),
+    ...(capacity !== undefined ? { capacity } : {}),
+    ...(capacityUsed !== undefined ? { capacityUsed } : {}),
+    ...(capacityAvailable !== undefined ? { capacityAvailable } : {}),
   }
 }
 

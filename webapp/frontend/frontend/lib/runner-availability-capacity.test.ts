@@ -3,6 +3,7 @@ import {
   RUNNER_MODEL_FOOTPRINT_MB,
   largestModelFootprintMb,
   estimateRunnerCapacity,
+  runnerCapacity,
 } from './runner-availability'
 
 describe('largestModelFootprintMb', () => {
@@ -19,6 +20,26 @@ describe('largestModelFootprintMb', () => {
   it('returns null when no model is recognized', () => {
     expect(largestModelFootprintMb(['unknown-model', 'foo'])).toBeNull()
     expect(largestModelFootprintMb([])).toBeNull()
+  })
+})
+
+describe('runnerCapacity', () => {
+  it('prefers the advertised capacity_available over any estimate', () => {
+    expect(runnerCapacity({ capacity: 3, capacityAvailable: 3, vramMb: 24576, modelIds: ['z-image'] })).toBe(3)
+  })
+
+  it('reflects current usage via capacity_available', () => {
+    expect(runnerCapacity({ capacity: 3, capacityAvailable: 1, vramMb: 24576, modelIds: ['z-image'] })).toBe(1)
+  })
+
+  it('falls back to raw capacity when available is absent', () => {
+    expect(runnerCapacity({ capacity: 3, vramMb: 24576, modelIds: ['z-image'] })).toBe(3)
+  })
+
+  it('falls back to the VRAM estimate only when no capacity is advertised', () => {
+    expect(runnerCapacity({ vramMb: 24576, modelIds: ['z-image'] })).toBe(1)
+    expect(runnerCapacity({ vramMb: 24576, modelIds: ['unknown'] })).toBeNull()
+    expect(runnerCapacity({})).toBeNull()
   })
 })
 

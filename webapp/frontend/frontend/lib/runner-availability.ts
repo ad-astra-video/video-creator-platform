@@ -103,3 +103,23 @@ export function estimateRunnerCapacity(vramMb: number | undefined, modelIds: str
   const n = Math.floor(usable / largest)
   return n >= 1 ? n : null
 }
+
+/**
+ * The runnner's effective capacity for display. Prefers the ADVERTISED capacity the runner
+ * actually reports (available slots first, then raw capacity), and only falls back to the VRAM
+ * estimate when the runner advertises neither. `capacityAvailable` reflects current usage, so it
+ * drops as generations are dispatched — the honest, live number.
+ */
+export interface RunnerCapacityInput {
+  capacity?: number
+  capacityUsed?: number
+  capacityAvailable?: number
+  vramMb?: number
+  modelIds?: string[]
+}
+
+export function runnerCapacity(v: RunnerCapacityInput): number | null {
+  if (typeof v.capacityAvailable === 'number' && v.capacityAvailable >= 0) return v.capacityAvailable
+  if (typeof v.capacity === 'number' && v.capacity >= 0) return v.capacity
+  return estimateRunnerCapacity(v.vramMb, v.modelIds ?? [])
+}
