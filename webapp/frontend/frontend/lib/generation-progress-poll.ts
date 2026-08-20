@@ -1,27 +1,19 @@
-import { ApiClient } from './api-client'
 import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY, GENERATION_RECOVERY_LEASE_MS, type GenerationRecoveryContext } from '../hooks/use-generation'
 
-type ProgressResult = Awaited<ReturnType<typeof ApiClient.getGenerationProgress>>
-type Listener = (result: ProgressResult) => void
-
-// In the serverless webapp the Cloudflare Worker has NO generation-job rows (browser WS/HTTP
-// generations never write one to D1), so GET /api/generation/progress is a pointless keep-alive
-// ping the Worker can't answer meaningfully. Resolve it from browser-local state instead: the
-// GENERATION_RECOVERY_KEY marker in localStorage IS the "generation in flight" signal. The
-// desktop/Electron build (which has a real backend jobs row) keeps the network call.
-function isWebPlatform(): boolean {
-  try {
-    return (window as unknown as { electronAPI?: { platform?: string } }).electronAPI?.platform === 'web'
-  } catch {
-    return false
-  }
+// The webapp has NO backend generation-job rows (browser WS/HTTP generations never write one),
+// so the GET /api/generation/progress endpoint has been REMOVED entirely from the webapp — there
+// is no server progress to poll. Generation progress is resolved purely from browser-local
+// state: the GENERATION_RECOVERY_KEY marker in localStorage IS the "generation in flight" signal.
+export interface GenerationProgress {
+  ok: true
+  data: { id: null; status: 'running' | 'idle'; progress: number; phase: string; result: undefined }
 }
+type Listener = (result: GenerationProgress) => void
 
 // Returns the in-flight generation marker ONLY if its lease is still live. A marker written by
 // a pre-lease build has no timestamp (or one that's expired because the owning tab died without
 // settling) — both are stale by definition and are purged here, so a leaked marker can never
-// permanently wedge the global generation lock (previously every Generate button greyed until
-// someone manually removed the localStorage key).
+// permanently wedge the global generation lock.
 function activeRecoveryMarker(): GenerationRecoveryContext | null {
   const raw = localStorage.getItem(GENERATION_RECOVERY_KEY)
   if (!raw) return null
@@ -41,7 +33,7 @@ function activeRecoveryMarker(): GenerationRecoveryContext | null {
 }
 
 // Refresh the lease while a generation is genuinely in flight, so a legitimately long job isn't
-// released early; on a crash the tab stops polling and the lease naturally expires.
+// released early; on a crash the poll stops and the lease naturally expires.
 function touchLease(): void {
   if (!localStorage.getItem(GENERATION_RECOVERY_KEY)) return
   localStorage.setItem(GENERATION_RECOVERY_TS_KEY, String(Date.now()))
@@ -51,12 +43,11 @@ export function activeRecoveryMarkerExists(): boolean {
   return activeRecoveryMarker() != null
 }
 
-function browserLocalProgress(): ProgressResult {
-  const hasMarker = activeRecoveryMarkerExists()
+function browserLocalProgress(): GenerationProgress {
   return {
     ok: true,
-    data: { id: null, status: hasMarker ? 'running' : 'idle', progress: 0, phase: '', result: undefined },
-  } as unknown as ProgressResult
+    data: { id: null, status: activeRecoveryMarkerExists() ? 'running' : 'idle', progress: 0, phase: '', result: undefined },
+  }
 }
 
 const POLL_INTERVAL_MS = 3000
@@ -64,39 +55,25 @@ const MARKER_CHECK_INTERVAL_MS = 3000
 
 const listeners = new Set<Listener>()
 let interval: ReturnType<typeof setInterval> | null = null
-let lastResult: ProgressResult | null = null
-let pollInFlight = false
+let lastResult: GenerationProgress | null = null
 
-async function poll(): Promise<void> {
-  // getGenerationProgress can be slow under the exact event-loop-starvation this PR exists to
-  // handle — without this guard, a slow response plus this interval's next tick queues a second
-  // overlapping request, and whichever resolves last "wins" regardless of which was actually
-  // more recent, dispatching stale results out of order.
-  if (pollInFlight) return
-  pollInFlight = true
-  try {
-    let result: ProgressResult
-    if (isWebPlatform()) {
-      touchLease()
-      result = browserLocalProgress()
-    } else {
-      result = await ApiClient.getGenerationProgress()
-    }
-    lastResult = result
-    listeners.forEach(listener => listener(result))
-  } finally {
-    pollInFlight = false
-  }
+// Purely local poll: no async I/O and no network — just re-reads the recovery-marker lease and
+// notifies listeners with the running/idle snapshot.
+function poll(): void {
+  touchLease()
+  const result = browserLocalProgress()
+  lastResult = result
+  listeners.forEach(listener => listener(result))
 }
 
 // The global generation lock and the background recovery watcher both need the same
 // generation-progress poll while mounted together (any project open); sharing one interval
-// instead of one per subscriber halves that network chatter.
+// instead of one per subscriber keeps this cheap.
 export function subscribeToGenerationProgress(listener: Listener): () => void {
   listeners.add(listener)
   if (lastResult) listener(lastResult)
   if (!interval) {
-    void poll()
+    poll()
     interval = setInterval(poll, POLL_INTERVAL_MS)
   }
   return () => {
@@ -116,11 +93,11 @@ export function subscribeToGenerationProgress(listener: Listener): () => void {
 // recovery marker into localStorage BEFORE it starts, in this same renderer process — so no
 // marker anywhere is proof nothing here could be running, checkable with a local read instead of
 // a network call. Gates the shared poll on that: idle app (no generation ever started, or one
-// that already finished and was consumed) costs zero network calls, not just at startup but for
-// the whole session, since this re-checks on the same cadence as the poll it gates.
+// that already finished and was consumed) costs nothing for the whole session, since this
+// re-checks on the same cadence as the poll it gates.
 export function subscribeWhileGenerationMayBeActive(listener: Listener): () => void {
   let unsubscribe: (() => void) | null = null
-  let latest: ProgressResult | null = null
+  let latest: GenerationProgress | null = null
   const trackingListener: Listener = result => {
     latest = result
     listener(result)

@@ -1,4 +1,4 @@
-import { ApiClient } from './api-client'
+import type { GenerationProgress } from './generation-progress-poll'
 import { GENERATION_RECOVERY_KEY, type GenerationRecoveryContext } from '../hooks/use-generation'
 import { builtinRecoveryImporters } from './generation-recovery-importers'
 import type { Asset } from '../types/project-model'
@@ -44,8 +44,8 @@ export function setActiveGenerationOwner(projectId: string | null): void {
 // subscribeToGenerationProgress) instead of fetching its own, so mounting both doesn't double
 // the network chatter.
 export async function checkAndConsumeRecovery(
-  progress: Awaited<ReturnType<typeof ApiClient.getGenerationProgress>>,
-  api: RecoveryImporterApi,
+  progress: GenerationProgress,
+  _api: RecoveryImporterApi,
 ): Promise<void> {
   const saved = localStorage.getItem(GENERATION_RECOVERY_KEY)
   if (!saved) return
@@ -93,15 +93,9 @@ export async function checkAndConsumeRecovery(
 
   if (status === 'running') return // still going — check again next tick
 
-  if (status === 'complete' && progress.data.result != null) {
-    try {
-      await importer(ctx, progress.data.result, api)
-    } catch {
-      // Leave the marker in place so the next tick (or that project's own mount effect) can
-      // retry — a failed copy/import must not silently drop the result.
-      return
-    }
-  }
-
+  // The webapp has no backend generation-job row (the /api/generation/progress endpoint was
+  // removed), so local progress never reports a server 'complete' with a persisted result to
+  // import — the owning GenSpace clears the marker on its own settle; a leaked marker here is
+  // purged by the lease on read.
   localStorage.removeItem(GENERATION_RECOVERY_KEY)
 }
