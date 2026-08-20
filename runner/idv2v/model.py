@@ -213,6 +213,18 @@ class ModelManager:
             logger.info("Evicting ID-V2V pipeline (freeing GPU/CPU memory)")
         self._pipe = None
         if torch.cuda.is_available():
+            # Block until all in-flight kernels on this GPU drain before we drop
+            # the caches: a kernel that is still queued after the model tensors
+            # are freed and empty_cache() runs can re-pin VRAM up front, so the
+            # card never actually returns to the pool even though _pipe is None
+            # and the caches were emptied. Synchronizing first guarantees the
+            # freed memory is genuinely reclaimable. Wrapped in try/except so it
+            # works whether self.device is an int index or a cuda:N device
+            # string (torch.cuda.synchronize accepts either).
+            try:
+                torch.cuda.synchronize(self.device)
+            except Exception:
+                pass
             gc.collect()
             torch.cuda.empty_cache()
 

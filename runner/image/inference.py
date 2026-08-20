@@ -646,6 +646,15 @@ class ImageInferenceEngine:
         except Exception:
             pass
         with self._model_lock:
+            # Drain any in-flight kernels on this engine's GPU FIRST so their
+            # allocations are returned before we drop the pipelines and flush
+            # the caching allocator. Without the synchronize, a still-running
+            # stream can hold VRAM even after empty_cache (context not cleared).
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize(self.current_device)
+                except Exception:
+                    torch.cuda.synchronize()
             self._qwen_edit = None
             self._qwen_edit_inpaint = None
             self._qwen_layered = None

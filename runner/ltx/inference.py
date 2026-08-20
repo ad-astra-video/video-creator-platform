@@ -401,8 +401,25 @@ class VideoCreatorInferenceEngine:
     # ------------------------------------------------------------------
 
     def _free_vram(self) -> None:
-        """Release cached GPU memory so a fresh model load has room."""
+        """Release cached GPU memory so a fresh model load has room.
+
+        First drain any in-flight kernels on the target GPU with
+        torch.cuda.synchronize() so they cannot keep VRAM allocated after the
+        pipeline objects are dropped, then force a Python GC pass and release
+        PyTorch's cached memory blocks back to the driver.
+        """
         if self._device.type == "cuda":
+            try:
+                # Pass the device index when available so we synchronize the
+                # exact GPU the engine targets; a bare device (e.g. cuda with
+                # no explicit index) synchronizes its default stream too.
+                if self._device.index is not None:
+                    torch.cuda.synchronize(self._device.index)
+                else:
+                    torch.cuda.synchronize(self._device)
+            except Exception:  # pragma: no cover - best-effort guard
+                # synchronize is best-effort; never block the eviction on it.
+                logger.warning("Could not synchronize CUDA before freeing VRAM", exc_info=True)
             gc.collect()
             torch.cuda.empty_cache()
 

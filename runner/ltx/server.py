@@ -231,15 +231,29 @@ async def handle_load(req: web.Request) -> web.Response:
         "loaded": True, "ready": ready, "device": engine.device_index})
 
 
-async def handle_evict(_req: web.Request) -> web.Response:
+async def handle_evict(req: web.Request) -> web.Response:
     """POST /evict — drop all resident pipelines + free GPU memory.
 
     Called by the live-runner before it swaps in another worker's model on the
     shared GPU. The next /v1/* generation reloads lazily.
+
+    Like handle_load, an optional JSON body may carry ``{"device": N}``, but
+    the ltx-worker is SINGLE-ENGINE today (one global engine owns one card), so
+    ``device`` is parsed and intentionally ignored — freeing the resident card
+    is the only action. Guarded with ``if engine is not None`` (rather than an
+    assert) so a double /evict is a harmless no-op instead of a 500.
     """
-    _require_token(_req)
-    assert engine is not None
-    engine.free()
+    _require_token(req)
+    global engine
+    body = {}
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    # Accepted for request/response symmetry with /load; unused (single-engine).
+    _ = body.get("device")
+    if engine is not None:
+        engine.free()
     return web.json_response({"evicted": True})
 
 
