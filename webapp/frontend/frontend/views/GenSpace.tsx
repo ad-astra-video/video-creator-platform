@@ -36,6 +36,7 @@ import type { ICLoraConditioningType } from '../components/ICLoraPanel'
 import type { Asset } from '../types/project-model'
 import { GenerationErrorDialog } from '../components/GenerationErrorDialog'
 import { addVisualAssetToProject } from '../lib/asset-copy'
+import { useGenerationTasks } from '../contexts/GenerationTaskContext'
 import { pathToFileUrl } from '../lib/file-url'
 import {
   areVideoGenerationSettingsEquivalent,
@@ -1697,6 +1698,8 @@ export function GenSpace() {
     setGenSpaceIcLoraSource,
     setPendingIcLoraUpdate,
   } = useProjects()
+  const { trackGeneration, generationCompleted, generationFailed } = useGenerationTasks()
+  const genTaskIdRef = useRef<string | null>(null)
   const currentProjectId = activeProject?.id ?? null
   const { shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, forceApiGenerations, settings: appSettings } = useAppSettings()
   const {
@@ -2382,9 +2385,17 @@ export function GenSpace() {
           }],
           activeTakeIndex: 0,
         })
+        if (genTaskIdRef.current) {
+          generationCompleted(genTaskIdRef.current, lastPrompt || 'Video generation', videoPath)
+          genTaskIdRef.current = null
+        }
         reset()
       } catch (err) {
         persistedVideoKeyRef.current = null
+        if (genTaskIdRef.current) {
+          generationFailed(genTaskIdRef.current, lastPrompt || 'Video generation', err instanceof Error ? err.message : String(err))
+          genTaskIdRef.current = null
+        }
         logger.error(`Failed to persist generated video asset: ${err}`)
       }
     })()
@@ -3281,6 +3292,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         inputImageUrl: imagePath ?? undefined,
         inputAudioUrl: audioPath ?? undefined,
       })
+      genTaskIdRef.current = trackGeneration({ label: prompt || 'Video generation', kind: 'video', projectId: currentProjectId })
       generate(prompt, imagePath, genSettings, audioPath)
     }
   }
