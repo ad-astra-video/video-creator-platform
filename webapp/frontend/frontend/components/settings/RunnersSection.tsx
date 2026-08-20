@@ -4,6 +4,7 @@ import { ApiClient } from '../../lib/api-client'
 import { useAppSettings } from '../../contexts/AppSettingsContext'
 import { isWebPlatform, discoverRunners } from '../../lib/livepeer-discovery'
 import { getEthUsd, weiToUsd } from '../../lib/ethPrice'
+import { estimateRunnerCapacity } from '../../lib/runner-availability'
 import { Button } from '../ui/button'
 
 interface RunnerCap {
@@ -209,6 +210,8 @@ export function RunnersSection() {
           )}
           {providers.map(p => {
             const ex = isExcluded(p)
+            const vramMb = p.gpu?.vram_mb
+            const estCapacity = estimateRunnerCapacity(vramMb, p.models ?? [])
             return (
               <div key={p.runner_id} className={`rounded-lg bg-zinc-800/50 p-3 space-y-2 ${ex ? 'opacity-55' : ''}`}>
                 <div className="flex items-center justify-between gap-2">
@@ -254,6 +257,18 @@ export function RunnersSection() {
                 <div className="flex items-center gap-2 text-xs text-zinc-300">
                   <DollarSign className="h-3.5 w-3.5 text-green-400 flex-shrink-0" />
                   {p.price_info ? formatPrice(p.price_info, ethUsd) ?? 'Pricing not advertised' : 'Pricing not advertised'}
+                </div>
+
+                <div className="flex items-center gap-2 text-xs text-zinc-400">
+                  <span className="font-medium text-zinc-300">Capacity:</span>
+                  {vramMb ? (
+                    <span className="text-zinc-300">{Math.round(vramMb / 1024)} GB VRAM</span>
+                  ) : (
+                    <span>VRAM unknown</span>
+                  )}
+                  {estCapacity != null && (
+                    <span className="text-emerald-400/90">· ~{estCapacity} concurrent (est.)</span>
+                  )}
                 </div>
 
                 {(p.capabilities?.length ?? 0) > 0 && (

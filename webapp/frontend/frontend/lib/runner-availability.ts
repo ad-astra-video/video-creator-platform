@@ -46,3 +46,60 @@ export function countCapableRunners(
     isRunnerCapable(runner, requiredCaps, isFetchable) ? count + 1 : count
   ), 0)
 }
+
+// ---------------------------------------------------------------------------
+// Possible-capacity estimation (pure, best-effort).
+//
+// A runner advertises its GPU VRAM (`gpu.vram_mb`) and the model(s) it can run. From those we
+// can estimate how many concurrent generations it could host in VRAM. This is an ESTIMATE only:
+// it assumes a single device budget and that the whole model must be resident at once, both of
+// which the real runner may not match (offloading, multiple GPUs, per-request streaming). It is
+// intentionally conservative and always labeled "(est.)" in the UI — never presented as fact.
+// ---------------------------------------------------------------------------
+
+/**
+ * Approximate resident-VRAM footprint (in MiB) for the remote generated-video/image models the
+ * app can send to a runner. Kept here (not inferred) because the runner only advertises model id
+ * strings, not their memory cost. Values are rough 2026 figures from this stack's own GPU
+ * measurements and should be tuned/expanded as reality changes. Unknown ids return null so the
+ * caller can fall back to showing raw VRAM instead of a fabricated number.
+ */
+export const RUNNER_MODEL_FOOTPRINT_MB: Record<string, number> = {
+  ltx: 20480, // LTX-2 video, ~bf16/fp8 resident
+  'ltx-2b': 20480,
+  'ltx-2b-video': 20480,
+  hidream: 18432, // hidream 8B image
+  'qwen-edit': 30720, // Qwen-Image-Edit fp8
+  'qwen-image-edit': 30720,
+  'z-image': 13312, // Z-Image turbo
+  'zimage': 13312,
+  klein: 13312, // FLUX.2 klein 4B
+  'flux-klein': 13312,
+  'flux.2-klein': 13312,
+}
+
+const VRAM_OVERHEAD_RATIO = 0.9 // leave headroom for activations / KV / transient frames
+
+/** Largest known footprint among `modelIds`, in MiB. null when none are known. */
+export function largestModelFootprintMb(modelIds: string[]): number | null {
+  let max: number | null = null
+  for (const m of modelIds) {
+    const f = RUNNER_MODEL_FOOTPRINT_MB[m.trim().toLowerCase()]
+    if (f != null && (max == null || f > max)) max = f
+  }
+  return max
+}
+
+/**
+ * Estimate how many concurrent generations `vramMb` could host for the given `modelIds`, using
+ * the LARGEST advertised model as the worst case. Returns null when VRAM is unknown or no known
+ * model footprint matched (caller should then show raw VRAM only, not a guess).
+ */
+export function estimateRunnerCapacity(vramMb: number | undefined, modelIds: string[]): number | null {
+  if (vramMb == null || vramMb <= 0) return null
+  const largest = largestModelFootprintMb(modelIds)
+  if (largest == null || largest <= 0) return null
+  const usable = vramMb * VRAM_OVERHEAD_RATIO
+  const n = Math.floor(usable / largest)
+  return n >= 1 ? n : null
+}
