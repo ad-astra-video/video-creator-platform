@@ -655,6 +655,9 @@ async function attemptInference(
       // Some orchestrators accept directly (free runner / already-paid session). Return as-is.
       return probe
     } else if (probe.status === 401 || probe.status === 403) {
+      // Runner rejected the payer address — a signer-address payment error. Drop the
+      // Worker's cached address (fire-and-forget) so the next attempt re-fetches fresh.
+      void ApiClient.invalidateSignerAddress()
       throw new Error('Runner rejected the payer address (401/403)')
     } else {
       // Not a 402 challenge and not OK — surface the body for the caller (e.g. 4xx validation).

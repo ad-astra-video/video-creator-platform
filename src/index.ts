@@ -26,7 +26,7 @@ import { resolveUserBalance } from "./balance";
 import { sendCodeEmail } from "./recovery";
 import { createCheckoutSession, verifyWebhook } from "./stripe";
 import type { Env } from "./types";
-import { getPayerAddress, getSignerProxy, handleAuthorize } from "./signer";
+import { getPayerAddress, getSignerProxy, handleAuthorize, invalidatePayerAddress } from "./signer";
 import {
   err,
   generateRecoveryCode,
@@ -131,6 +131,9 @@ async function handle(request: Request, env: Env): Promise<Response> {
       // Payment rail + identity:
       if (method === "POST" && path === "/sign-ticket") return await handleSignTicket(request, env, uid);
       if (method === "GET" && path === "/signer/address") return await getPayerAddress(env, uid);
+      // Invalidate the cached payer address after a payment/signer-address error so
+      // the next /signer/address re-fetches fresh (the address is otherwise cached ~30m).
+      if (method === "POST" && path === "/signer/address/invalidate") { invalidatePayerAddress(uid); return ok({ ok: true }); }
       if (method === "POST" && path === "/link-email") return await postLinkEmail(request, env, uid);
 
       return err("Not found", 404);

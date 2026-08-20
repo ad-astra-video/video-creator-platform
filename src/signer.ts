@@ -131,7 +131,25 @@ export async function getSignerProxy(env: Env) {
 // GET /signer/address — the payer/broadcaster address the browser sends as
 // `Livepeer-Payer-Address` so the orchestrator issues the right challenge.
 // ---------------------------------------------------------------------------
+// The address is stable per user (their broadcaster address on the signer), so
+// we cache it in-memory keyed by externalUserId and REUSE it instead of minting
+// a fresh `sign:job` JWT + hitting the DMZ /sign-orchestrator-info on EVERY paid
+// generation. The cache is only bypassed/refreshed when a payment error occurs
+// (invalidatePayerAddress) or after the TTL safety net. Module-level Map (not
+// WeakMap-keyed by Env) so it persists across requests within the isolate.
+const PAYER_ADDR_TTL_MS = 30 * 60_000;
+const _payerAddrCache = new Map<string, { address: string; fetchedAt: number }>();
+
+/** Drop a user's cached payer address so the next /signer/address re-fetches fresh. */
+export function invalidatePayerAddress(externalUserId: string): void {
+  _payerAddrCache.delete(externalUserId);
+}
+
 export async function getPayerAddress(env: Env, externalUserId: string): Promise<Response> {
+  const cached = _payerAddrCache.get(externalUserId);
+  if (cached && Date.now() - cached.fetchedAt < PAYER_ADDR_TTL_MS) {
+    return ok({ address: cached.address });
+  }
   let signerBase: string;
   try {
     signerBase = (await resolveRemoteSignerUrl(env)).replace(/\/+$/, "");
@@ -155,6 +173,7 @@ export async function getPayerAddress(env: Env, externalUserId: string): Promise
     }
     const data = (await res.json()) as { address?: string; signature?: string };
     if (!data.address) return err("signer returned no address", 502);
+    _payerAddrCache.set(externalUserId, { address: data.address, fetchedAt: Date.now() });
     return ok({ address: data.address });
   } catch (e) {
     return err(`signer address error: ${(e as Error).message}`, 502);

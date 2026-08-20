@@ -588,6 +588,16 @@ export class ApiClient {
     }
   }
 
+  /** POST /signer/address/invalidate — drop the Worker's cached payer address after a
+   *  payment/signer-address error so the next GET /signer/address re-fetches fresh. */
+  static async invalidateSignerAddress(): Promise<void> {
+    try {
+      await backendFetch('/signer/address/invalidate', { method: 'POST' })
+    } catch {
+      // best-effort; a stale cache is harmless (bounded by the 30m TTL)
+    }
+  }
+
   /** POST /sign-ticket — Worker proxies the PymtHouse DMZ; returns { payment, segCreds, state }. */
   static async signTicket(body: {
     /** The orchestrator's opaque payment_params from the 402 challenge. */
