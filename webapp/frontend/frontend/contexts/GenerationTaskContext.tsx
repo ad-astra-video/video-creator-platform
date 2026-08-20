@@ -12,17 +12,18 @@
 // On success the manager is the SOLE place that persists the output (addVisualAssetToProject →
 // disk copy + thumbnails via the web electronAPI shim, then addAsset into the project model), so
 // navigating away can never drop the save, and there is exactly one asset per completed task.
+//
+// Completion is surfaced only through the persistent task list (no toasts): a task is marked
+// completed/error and the user clears rows from the bottom-right panel as they please.
 
-import React, { createContext, useCallback, useContext, useMemo, useReducer, useRef, useState } from 'react'
+import React, { createContext, useCallback, useContext, useMemo, useReducer, useRef } from 'react'
 import { useProjects } from './ProjectContext'
 import { addVisualAssetToProject } from '../lib/asset-copy'
 import {
   type GenerationKind,
   type GenerationTask,
-  type TaskToast,
   generationTaskReducer,
   makeId,
-  TOAST_TTL_MS,
 } from '../lib/generation-tasks'
 import { isWebPath } from '../lib/runtime/web-store'
 import { logger } from '../lib/logger'
@@ -47,17 +48,15 @@ export interface SubmitGenerationInput {
 
 interface GenerationTaskContextType {
   tasks: GenerationTask[]
-  toasts: TaskToast[]
   runningCount: number
   submitGenerationTask: (input: SubmitGenerationInput) => string
   // result-tracking API for callers that keep driving their own transport (e.g. GenSpace's
-  // existing use-generation) but want the output in the task list + a completion toast.
+  // existing use-generation) but want the output in the task list.
   trackGeneration: (input: { label: string; kind: GenerationKind; projectId?: string | null }) => string
   generationCompleted: (id: string, label: string, assetKey: string) => void
   generationFailed: (id: string, label: string, error: string) => void
   clearTask: (id: string) => void
   clearCompleted: () => void
-  dismissToast: (id: string) => void
 }
 
 const GenerationTaskContext = createContext<GenerationTaskContextType | null>(null)
@@ -65,16 +64,7 @@ const GenerationTaskContext = createContext<GenerationTaskContextType | null>(nu
 export function GenerationTaskProvider({ children }: { children: React.ReactNode }) {
   const { addAsset } = useProjects()
   const [tasks, dispatch] = useReducer(generationTaskReducer, [])
-  const [toasts, setToasts] = useState<TaskToast[]>([])
   const nextTasksRef = useRef<Map<string, SubmitGenerationInput['run']>>(new Map())
-
-  const pushToast = useCallback((message: string, tone: TaskToast['tone']) => {
-    const id = makeId('toast')
-    setToasts(prev => [...prev, { id, message, tone, createdAt: Date.now() }].slice(-6))
-    setTimeout(() => {
-      setToasts(prev => prev.filter(t => t.id !== id))
-    }, TOAST_TTL_MS)
-  }, [])
 
   const persistCompleted = useCallback(
     async (assetKey: string, projectId: string | null, kind: GenerationKind, prompt: string | undefined) => {
@@ -124,17 +114,15 @@ export function GenerationTaskProvider({ children }: { children: React.ReactNode
           if (!isWebPath(assetKey)) throw new Error('generation returned an invalid asset reference')
           await persistCompleted(assetKey, projectId, kind, undefined)
           dispatch({ type: 'COMPLETE', id, at: Date.now(), assetKey })
-          pushToast(`${input.label} done`, 'success')
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e)
           dispatch({ type: 'FAIL', id, at: Date.now(), error: msg })
-          pushToast(`${input.label} failed: ${msg}`, 'error')
         }
       })()
 
       return id
     },
-    [persistCompleted, pushToast],
+    [persistCompleted],
   )
 
   const trackGeneration = useCallback(
@@ -150,31 +138,22 @@ export function GenerationTaskProvider({ children }: { children: React.ReactNode
     [],
   )
 
-  const generationCompleted = useCallback(
-    (id: string, label: string, assetKey: string) => {
-      dispatch({ type: 'COMPLETE', id, at: Date.now(), assetKey })
-      pushToast(`${label} done`, 'success')
-    },
-    [pushToast],
-  )
+  const generationCompleted = useCallback((id: string, _label: string, assetKey: string) => {
+    dispatch({ type: 'COMPLETE', id, at: Date.now(), assetKey })
+  }, [])
 
-  const generationFailed = useCallback(
-    (id: string, label: string, error: string) => {
-      dispatch({ type: 'FAIL', id, at: Date.now(), error })
-      pushToast(`${label} failed: ${error}`, 'error')
-    },
-    [pushToast],
-  )
+  const generationFailed = useCallback((id: string, _label: string, error: string) => {
+    dispatch({ type: 'FAIL', id, at: Date.now(), error })
+  }, [])
 
   const clearTask = useCallback((id: string) => dispatch({ type: 'REMOVE', id }), [])
   const clearCompleted = useCallback(() => dispatch({ type: 'CLEAR_COMPLETED' }), [])
-  const dismissToast = useCallback((id: string) => setToasts(prev => prev.filter(t => t.id !== id)), [])
 
   const running = useMemo(() => tasks.filter(t => t.status === 'running' || t.status === 'queued').length, [tasks])
 
   const value = useMemo<GenerationTaskContextType>(
-    () => ({ tasks, toasts, runningCount: running, submitGenerationTask, trackGeneration, generationCompleted, generationFailed, clearTask, clearCompleted, dismissToast }),
-    [tasks, toasts, running, submitGenerationTask, trackGeneration, generationCompleted, generationFailed, clearTask, clearCompleted, dismissToast],
+    () => ({ tasks, runningCount: running, submitGenerationTask, trackGeneration, generationCompleted, generationFailed, clearTask, clearCompleted }),
+    [tasks, running, submitGenerationTask, trackGeneration, generationCompleted, generationFailed, clearTask, clearCompleted],
   )
 
   return <GenerationTaskContext.Provider value={value}>{children}</GenerationTaskContext.Provider>
@@ -185,4 +164,3 @@ export function useGenerationTasks(): GenerationTaskContextType {
   if (!ctx) throw new Error('useGenerationTasks must be used within a GenerationTaskProvider')
   return ctx
 }
-

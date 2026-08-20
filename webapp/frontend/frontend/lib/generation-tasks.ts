@@ -19,17 +19,8 @@ export interface GenerationTask {
   completedAt?: number
 }
 
-export interface TaskToast {
-  id: string
-  message: string
-  tone: 'success' | 'error' | 'info'
-  createdAt: number
-}
-
 /** Cap the on-screen task list so a long burst can't pin unbounded memory. */
 export const MAX_TASKS = 100
-/** Auto-dismiss a toast after this many ms. */
-export const TOAST_TTL_MS = 6500
 
 export function makeId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
