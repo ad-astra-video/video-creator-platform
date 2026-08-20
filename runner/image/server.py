@@ -565,6 +565,13 @@ async def handle_image(req: web.Request) -> web.Response:
             engine.klein_image, prompt, num_inference_steps=steps, **kw,
         )
     else:
+        # Z-Image Turbo: explicit num_inference_steps wins; else map the
+        # client quality preset (fast|balanced|high) through the per-model
+        # map so Fast/Balanced/High select 4/8/12 instead of always 4.
+        if "num_inference_steps" not in kw:
+            q = str(body.get("quality") or "").strip().lower()
+            if q in ZIMAGE_STEP_PRESETS:
+                kw["num_inference_steps"] = ZIMAGE_STEP_PRESETS[q]
         img = await _run_generation(engine.plain_image, prompt, **kw)
     resp = {
         "image": _pil_to_b64(img),
@@ -574,6 +581,8 @@ async def handle_image(req: web.Request) -> web.Response:
     }
     if engine_name == "klein":
         resp["num_inference_steps"] = _image_klein_steps(body)
+    elif engine_name == "zimage" and "num_inference_steps" in kw:
+        resp["num_inference_steps"] = kw["num_inference_steps"]
     return web.json_response(resp)
 
 async def handle_style_frame(req: web.Request) -> web.Response:
