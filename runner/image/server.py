@@ -520,7 +520,11 @@ async def handle_image(req: web.Request) -> web.Response:
     kw = {}
     for k in ("width", "height"):
         if body.get(k) is not None:
-            kw[k] = body.get(k)
+            # diffusers ZImagePipeline (and other image backends) require
+            # spatial dims divisible by 16; snap to the nearest multiple so
+            # any client resolution (e.g. raw 1080p -> 1920x1080) just works
+            # instead of 500ing with "Height must be divisible by 16".
+            kw[k] = round(int(body.get(k)) / 16) * 16
     # Resolve the seed: client-supplied passes through (deterministic replay);
     # otherwise mint a fresh random one so each bare request differs. Forwarded
     # to BOTH engines so the response can truthfully report which seed ran.
