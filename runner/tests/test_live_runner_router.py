@@ -549,7 +549,7 @@ def test_reconcile_drops_stale_residency_and_reloads_pinned():
         # which records BOTH _resident and _pinned_loaded.
         await w.ensure("gemma", device=0)
         assert t.order == ["load:gemma"]
-        assert w._resident == {"gemma": 0}
+        assert w._resident == {"gemma": {0}}
         assert "gemma" in w._pinned_loaded
         # idle-backfill ensure is a no-op while residency is believed fresh
         await w.ensure("gemma", device=0)
@@ -573,7 +573,7 @@ def test_reconcile_drops_stale_residency_and_reloads_device():
         w = ResidentWorkerManager(transport=t, workers={"gemma": "gemma"})
         await w.ensure("gemma", device=0)
         assert t.order == ["load:gemma"]
-        assert w._resident == {"gemma": 0}
+        assert w._resident == {"gemma": {0}}
         # idle-backfill ensure is a no-op (resident on that device)
         await w.ensure("gemma", device=0)
         assert t.order == ["load:gemma"]
@@ -597,7 +597,7 @@ def test_reconcile_keeps_residency_when_healthy():
         assert t.order == ["load:gemma"]
         await w.check_health()
         assert "gemma" in w._pinned_loaded
-        assert w._resident == {"gemma": 0}   # still resident -> no reload
+        assert w._resident == {"gemma": {0}}   # still resident -> no reload
         await w.ensure("gemma", device=0)
         assert t.order == ["load:gemma"]
     asyncio.run(_t())
