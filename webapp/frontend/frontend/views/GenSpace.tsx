@@ -1700,6 +1700,7 @@ export function GenSpace() {
   } = useProjects()
   const { trackGeneration, generationCompleted, generationFailed } = useGenerationTasks()
   const genTaskIdRef = useRef<string | null>(null)
+  const genImageTaskIdRef = useRef<string | null>(null)
   const currentProjectId = activeProject?.id ?? null
   const { shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, forceApiGenerations, settings: appSettings } = useAppSettings()
   const {
@@ -2793,8 +2794,16 @@ export function GenSpace() {
             activeTakeIndex: 0,
           })
         }
+        if (genImageTaskIdRef.current) {
+          generationCompleted(genImageTaskIdRef.current, lastPrompt || 'Image generation', imagePaths[imagePaths.length - 1] ?? imagePaths[0])
+          genImageTaskIdRef.current = null
+        }
         reset()
       } catch (err) {
+        if (genImageTaskIdRef.current) {
+          generationFailed(genImageTaskIdRef.current, lastPrompt || 'Image generation', err instanceof Error ? err.message : String(err))
+          genImageTaskIdRef.current = null
+        }
         logger.error(`Failed to persist generated image asset(s): ${err}`)
       } finally {
         addingImagesRef.current = false
@@ -3264,6 +3273,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         imageEditQuality: settings.imageEditQuality ?? 'balanced',
       }
       await writeRecoveryContext({ prompt, settings: imageSettings, genType: 'image', inputImageUrl: editSource ?? undefined })
+      genImageTaskIdRef.current = trackGeneration({ label: prompt || 'Image generation', kind: 'image', projectId: currentProjectId })
       generateImage(prompt, imageSettings, editSource)
     } else {
       // Generate video (t2v if no image/audio, i2v if image, a2v if audio)
