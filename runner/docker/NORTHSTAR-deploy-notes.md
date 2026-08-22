@@ -22,25 +22,31 @@ All images built on the Windows host and pushed to `adastravideo/video-creator:<
   Fixed at deploy: vendored `RIFE_HDv3.py` eagerly constructs `EPE()`/`SOBEL()` -> added minimal
   no-op nn.Module stubs in `runner/vp/rife/model/loss.py` (keeps torchvision out of runtime).
 
-## BLOCKED: FlashVSR upscale — isolated venv required
-FlashVSR's diffsynth fork (OpenImagingLab/FlashVSR `setup.py` name=diffsynth 1.1.7) pins a
-conflicting toolchain vs the vp-worker cu128 image:
+## RESOLVED: FlashVSR upscale runs on Blackwell (sm120) — no isolated venv needed
+The "blocked" analysis was wrong about needing a separate cu124 venv. FlashVSR works in the
+vp-worker's own cu128 image:
 
-- pins `torch==2.6.0+cu124` / `torchvision==0.21.0+cu124` / `torchaudio==2.6.0+cu124`
-- pins `transformers==4.46.2`, `numpy==1.26.4`, `peft==0.16.0`, `accelerate==1.8.1`, `safetensors==0.5.3`
-- imports a NON-PyPI package: `from block_sparse_attn import block_sparse_attn_func`
-  (custom CUDA attention kernel from the diffsynth/FlashVSR toolchain — must be built,
-  not on PyPI).
+* FlashVSR's diffsynth fork (OpenImagingLab/FlashVSR `setup.py` name=diffsynth 1.1.7) supports
+  **sm_120 on CUDA >= 12.8** — the mit-han-lab **Block-Sparse-Attention** CUDA kernel, built from
+  source with `TORCH_CUDA_ARCH_LIST=12.0 MAX_JOBS=2` (MAX_JOBS=2 avoids the OOM seen at -j9),
+  compiles for Blackwell. It is NOT on PyPI — must be `git clone` + `setup.py install`.
+* diffsynth was pip-installed `--no-deps`, so its real runtime deps had to be pinned explicitly:
+  `transformers==4.46.2` (newer 5.x moved `PretrainedConfig` out of `transformers.modeling_utils`),
+  `sentencepiece==0.2.0`, `accelerate`, `ftfy`, `protobuf`, `huggingface_hub`, `safetensors`,
+  `modelscope`, `einops`, `omegaconf`, `matplotlib`, `pandas`, `peft`, `pytorch-lightning`,
+  `torchsde`, `datasets`.
+* torch's compiled extensions need `LD_LIBRARY_PATH` to include `torch/lib` (libc10.so) at import.
+* `FlashVSRTinyPipeline.init_cross_kv()` loads an aux `posi_prompt.pth` from a CWD-relative path;
+  we pass it explicitly from `FLASHVSR_ROOT` (baked `/opt/flashvsr_prompt` fallback).
+* Pipeline needs enough frames: the streaming loop iterates `(num_frames-1)//8-2` — a tiny
+  input yields 0 chunks. Verified with 40 frames.
 
-It cannot share the vp-worker image (cu128 torch + transformers 5.x). Fix = mirror the Bernini
-pattern: a dedicated **isolated FlashVSR venv** (`FLASHVSR_VENV_PY`, python-3.11) with a cu124
-torch + the pinned deps + a built `block_sparse_attn`, and have `flashvsr_post.FlashVsrUpscaler`
-shell out to that venv (subprocess) instead of importing diffsynth in-process.
+**Measured on-box (RTX 5090, compute_120)**: 40fr @ 320x240 -> 37fr @ **896x1280 (4x)** uint8,
+**3.5s** (pipeline build 5.6s, 3 streaming chunks through the sm120 kernel).
+All baked into `runner/docker/vp-worker.Dockerfile` (rebuild + push + pull to deploy).
 
 ## Remaining (honest)
-1. **FlashVSR**: build the isolated cu124 venv (torch 2.6.0+cu124 + diffsynth fork deps +
-   block_sparse_attn) inside the vp-worker image; subprocess-dispatch the upscale rail to it.
-2. **Bernini / wan-worker generation calibration**: load the 26 GB model + run a real t2v/v2v/r2v
+1. **Bernini / wan-worker generation calibration**: load the 26 GB model + run a real t2v/v2v/r2v
    job (routing is proven; the actual model-load inference run is the heavyweight test).
-3. **Frontend api-client/UI** (`references[]`, r2v bar, EditVideoPanel, PostProcessControls):
+2. **Frontend api-client/UI** (`references[]`, r2v bar, EditVideoPanel, PostProcessControls):
    blocked on regenerating the backend OpenAPI spec before the typed api-client calls can land.
