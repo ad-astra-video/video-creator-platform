@@ -42,7 +42,8 @@ RUN git clone --depth 1 "${FLASHVSR_REPO}" /opt/flashvsr \
 
 # Runtime deps for the rails (RIFE + FlashVSR + ffmpeg wrapper).
 RUN pip install --no-cache-dir \
-    numpy einops omegaconf opencv-python-headless Pillow tqdm imageio \
+    numpy einops omegaconf huggingface_hub safetensors \
+    opencv-python-headless Pillow tqdm imageio \
     imageio-ffmpeg aiohttp
 
 # Worker source (runner/vp + the vendored flashvsr_utils + runner/idv2v for
