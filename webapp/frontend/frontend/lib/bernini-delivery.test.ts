@@ -5,8 +5,11 @@ import {
   berniniFpsOptions,
   berniniResolutionOptions,
   berniniPostFor,
+  berniniRunnerT2VBody,
+  berniniDeliveryLabel,
   BERNINI_NATIVE_FPS,
   BERNINI_NATIVE_RESOLUTION,
+  type BerniniDeliveryTarget,
 } from './bernini-delivery'
 
 describe('berniniDeliveryMatrix', () => {
@@ -75,5 +78,60 @@ describe('berniniPostFor', () => {
       fps_boost: { target_fps: 30, mode: 'preserve_motion' },
       upscale: { scale: 4, final: '1080' },
     })
+  })
+})
+
+describe('berniniDeliveryLabel', () => {
+  it('renders a compact resolution-fps label', () => {
+    expect(berniniDeliveryLabel({ engine: 'bernini-1.3b', resolution: '1080p', fps: 24, duration: 3 }))
+      .toBe('1080p · 24fps')
+  })
+})
+
+describe('berniniRunnerT2VBody', () => {
+  const base: BerniniDeliveryTarget = {
+    engine: 'bernini-1.3b',
+    resolution: '480p',
+    fps: 16,
+    duration: 3,
+  }
+
+  it('native target: renders at native 480p@16 with no post', () => {
+    const body = berniniRunnerT2VBody('a red fox', base)
+    expect(body).toMatchObject({
+      prompt: 'a red fox',
+      model: 'bernini-1.3b',
+      resolution: '480p',
+      fps: 16,
+      num_frames: 48,
+    })
+    expect(body.post).toBeUndefined()
+  })
+
+  it('above-native target: carries the delivery post payload', () => {
+    const body = berniniRunnerT2VBody('a red fox', {
+      ...base,
+      resolution: '1080p',
+      fps: 30,
+    })
+    expect(body.post).toEqual({
+      fps_boost: { target_fps: 30, mode: 'preserve_motion' },
+      upscale: { scale: 4, final: '1080' },
+    })
+  })
+
+  it('raw-4x upscales 4x with final raw and no ffmpeg', () => {
+    const body = berniniRunnerT2VBody('a red fox', { ...base, resolution: 'raw-4x' })
+    expect(body.post).toEqual({ upscale: { scale: 4, final: 'raw' } })
+  })
+
+  it('honors negative prompt and seed when provided', () => {
+    const body = berniniRunnerT2VBody('a red fox', base, { negativePrompt: 'blurry', seed: 42 })
+    expect(body.negative_prompt).toBe('blurry')
+    expect(body.seed).toBe(42)
+  })
+
+  it('computes num_frames from duration at native fps', () => {
+    expect(berniniRunnerT2VBody('x', { ...base, duration: 5 }).num_frames).toBe(80)
   })
 })

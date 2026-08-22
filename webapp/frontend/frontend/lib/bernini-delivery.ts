@@ -134,3 +134,47 @@ export function berniniPostFor(d: { resolution: string; fps: number }): BerniniP
   if (final) payload.upscale = { scale: 4, final }
   return payload
 }
+
+/** The delivery target the frontend will request for a Bernini video job. */
+export interface BerniniDeliveryTarget {
+  engine: BerniniEngine
+  resolution: BerniniResolution
+  fps: number
+  /** Duration in seconds at native (post rails never extend duration). */
+  duration: number
+}
+
+/** Rendered-form human label for a delivery target, e.g. "1080p · 24fps". */
+export function berniniDeliveryLabel(d: BerniniDeliveryTarget): string {
+  return `${d.resolution} · ${d.fps}fps`
+}
+
+/**
+ * Compose the EXACT body to POST to the runner's `bernini-t2v` rail from a delivery
+ * target. The runner renders natively at 480p@16fps; every above-native target carries
+ * `post` (the fps_boost / upscale payload, byte-identical to the vp-worker /process body)
+ * so the live-runner orchestrates the post chain after the render. Native -> no `post`.
+ */
+export function berniniRunnerT2VBody(
+  prompt: string,
+  target: BerniniDeliveryTarget,
+  opts?: { negativePrompt?: string; seed?: number },
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    prompt,
+    // The engine id the frontend advertises; the backend (build_pipeline) dispatches
+    // on model_type to the BerniniRendererPipeline (1.3B) — see runner/idv2v.
+    model: target.engine,
+    // Native render request; above-native comes from the post rails, not the renderer.
+    resolution: BERNINI_NATIVE_RESOLUTION,
+    fps: BERNINI_NATIVE_FPS,
+    num_frames: target.duration * BERNINI_NATIVE_FPS,
+  }
+  if (opts?.negativePrompt) body.negative_prompt = opts.negativePrompt
+  if (opts?.seed !== undefined) body.seed = opts.seed
+  const post = berniniPostFor(target)
+  if (Object.keys(post).length > 0) {
+    body.post = post
+  }
+  return body
+}
