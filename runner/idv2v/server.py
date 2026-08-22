@@ -29,6 +29,8 @@ from aiohttp import web
 from . import config
 from . import run as run_mod
 from . import gemma_forward
+from . import bernini_io
+from . import bernini as bernini_mod
 from .model import ModelManager, health_check
 
 logger = logging.getLogger("video_creator.runner.idv2v.server")
@@ -232,7 +234,8 @@ async def handle_info(request: web.Request) -> web.Response:
     return web.json_response({
         "runner_id": "",
         "app": "idv2v",
-        "capabilities": ["restyle", "sam3", "prompt-enhance"],
+        "capabilities": ["restyle", "sam3", "prompt-enhance",
+                          "bernini-t2v", "bernini-v2v", "bernini-r2v"],
         "ready": model is not None,
         "gpu": _gpu_info(),
         "device_in_use": _device_index(),
@@ -437,6 +440,109 @@ async def handle_progress(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Bernini (wan-worker t2v / v2v / r2v)
+# ---------------------------------------------------------------------------
+
+_BERNINI_TASKS = {"t2v", "v2v", "r2v"}
+
+
+async def handle_bernini(request: web.Request) -> web.Response:
+    """Run a Bernini generation/edit job (native 480p/16 @ max 848px).
+
+    Dispatched by the ``{task}`` path segment (t2v / v2v / r2v). Body JSON:
+
+        t2v : {prompt, num_frames?, fps?, num_inference_steps?, seed?, height?, width?}
+        v2v : {prompt, video: <base64> (or list), ...}
+        r2v : {prompt, images: [<base64>...], ...}
+
+    The frontend decides the engine (berini vs ltx vs idv2v); this backend
+    is strictly route-based — the task name IS the intent. The worker renders
+    at native resolution; delivery above native goes through the vp-worker
+    post rails orchestrated by the live-runner.
+    """
+    _require_token(request)
+    task = request.match_info.get("task", "")
+    if task not in _BERNINI_TASKS:
+        return web.json_response({"error": f"unsupported Bernini task '{task}'"},
+                                 status=404)
+    if not config.bernini_enabled():
+        return web.json_response(
+            {"error": "Bernini weights not provisioned (BERNINI_ROOT missing)"},
+            status=503)
+
+    job_id = request.query.get("job_id") or uuid.uuid4().hex[:12]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return web.json_response({"error": "missing 'prompt'"}, status=400)
+
+    manager = await bernini_mod.get_manager(device=None)
+    run_mod.set_progress(job_id, 0.02, "bernini", "decoding media")
+    with bernini_io.tmpdir_context() as tmpdir:
+        media = bernini_io.decode_source_media(body, tmpdir)
+        if task == "v2v" and not media.get("video"):
+            return web.json_response(
+                {"error": "v2v requires 'video' (base64)"}, status=400)
+        if task == "r2v" and not media.get("images"):
+            return web.json_response(
+                {"error": "r2v requires 'images' (base64 list)"}, status=400)
+
+        out_path = os.path.join(tmpdir, "output.mp4")
+        job: dict = {
+            "prompt": prompt,
+            "output": out_path,
+            "task_name": task,
+            **media,
+        }
+        for k in ("num_frames", "max_image_size", "height", "width",
+                  "num_inference_steps", "fps", "seed", "guidance_mode",
+                  "omega_vid", "omega_img", "omega_txt", "omega_scale",
+                  "flow_shift", "eta", "momentum", "system_prompt"):
+            if body.get(k) is not None:
+                job[k] = body[k]
+
+        run_mod.set_progress(job_id, 0.05, "bernini", "generating")
+        try:
+            result = await asyncio.wait_for(
+                manager.generate(job), timeout=900)
+        except bernini_mod.BerniniError as exc:
+            run_mod.set_progress(job_id, -1, "failed", str(exc))
+            return web.json_response({"error": str(exc), "job_id": job_id},
+                                     status=500)
+
+        run_mod.set_progress(job_id, 0.97, "bernini", "encoding")
+        try:
+            out_b64 = bernini_io.encode_video_b64(out_path)
+        except Exception as exc:  # noqa: BLE001
+            run_mod.set_progress(job_id, -1, "failed", str(exc))
+            return web.json_response(
+                {"error": f"output encode failed: {exc}", "job_id": job_id},
+                status=500)
+
+        run_mod.set_progress(job_id, 1.0, "complete", "done")
+        return web.json_response({
+            "job_id": job_id,
+            "task": task,
+            "model": manager.model,
+            "output_video": out_b64,
+            "frames": result.get("frames"),
+            "resolution": f"{body.get('width', 848)}x{body.get('height', 480)}",
+            "fps": body.get("fps", config.BERNINI_NATIVE_FPS),
+        })
+
+
+async def handle_bernini_evict(request: web.Request) -> web.Response:
+    """Evict the resident Bernini subprocess (frees its GPU)."""
+    _require_token(request)
+    await bernini_mod.evict_manager()
+    return web.json_response({"evicted": True})
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -582,6 +688,17 @@ def create_app() -> web.Application:
     # worker historically served /v1/restyle only, which made restyle
     # 404 via the live-runner. Register both so it works either way.
     app.router.add_post("/video-creator/v1/restyle", handle_restyle)
+    # Bernini rail (wan-worker): t2v / v2v / r2v, both raw + proxied paths.
+    app.router.add_post("/v1/t2v", handle_bernini)
+    app.router.add_post("/video-creator/v1/t2v", handle_bernini)
+    app.router.add_post("/v2v", handle_bernini)
+    app.router.add_post("/v1/v2v", handle_bernini)
+    app.router.add_post("/video-creator/v1/v2v", handle_bernini)
+    app.router.add_post("/r2v", handle_bernini)
+    app.router.add_post("/v1/r2v", handle_bernini)
+    app.router.add_post("/video-creator/v1/r2v", handle_bernini)
+    app.router.add_post("/v1/bernini/evict", handle_bernini_evict)
+    app.router.add_post("/video-creator/v1/bernini/evict", handle_bernini_evict)
     app.router.add_get("/progress/{job_id}", handle_progress)
     app.router.add_get("/video-creator/v1/progress/{job_id}", handle_progress)
     app.router.add_post("/v1/sam3", handle_sam3)
