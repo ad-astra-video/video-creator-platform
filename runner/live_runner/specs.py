@@ -178,4 +178,17 @@ def build_model_specs(vram_mb: int) -> list[dict]:
                 # matrix here as a duplicate would push the heartbeat metadata over its cap.
             },
         },
+        {
+            # Bernini is a selectable T2V engine on the wan-worker (NOT an LTX
+            # variant). Advertised as a minimal marker (display_name + native
+            # 480p/16 hint) so it surfaces in the model picker WITHOUT a matrix;
+            # the frontend (lib/bernini-delivery.ts) derives Bernini's full
+            # resolution/fps/duration grid from its native 480p@16 + the RIFE /
+            # FlashVSR post rails (never the LTX alias). Kept lean for the
+            # go-livepeer 1024-byte heartbeat metadata cap.
+            "pipeline": "bernini-1.3b",
+            "spec": {
+                "display_name": "Bernini 1.3B",
+            },
+        },
     ]

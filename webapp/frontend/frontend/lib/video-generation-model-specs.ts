@@ -150,6 +150,12 @@ function inheritLimitsFromFast(
   const fastLimits = fast.spec.supported_resolutions_durations
   return modelSpecs.map((item) => {
     if (item.pipeline === 'fast') return item
+    // Bernini is a distinct engine (native 480p @ 16fps) delivered through the
+    // RIFE / FlashVSR post rails — its options come from lib/bernini-delivery.ts,
+    // NEVER from the LTX-2.3 limits alias. Leave it marker-only (no matrix) so
+    // the runner heartbeat metadata stays lean and the picker treats it as its
+    // own selectable T2V model.
+    if (item.pipeline?.startsWith('bernini')) return item
     if (item.spec.supported_resolutions_durations) return item
     return { ...item, spec: { ...item.spec, supported_resolutions_durations: fastLimits } }
   })
