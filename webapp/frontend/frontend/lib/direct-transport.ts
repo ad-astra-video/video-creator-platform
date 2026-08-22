@@ -61,6 +61,17 @@ const TASK_ENDPOINTS: Record<string, string> = {
   'ic-lora:extract-conditioning': '/video-creator/v1/extract-conditioning',
   edit: '/video-creator/v1/edit',
   layer: '/video-creator/v1/layer',
+  // Bernini generation/edit rails (wan-worker, engine id `idv2v`) — mirror the
+  // live-runner ROUTES table additions so the browser POSTs to the right worker.
+  'bernini-t2v': '/video-creator/v1/bernini-t2v',
+  'bernini-v2v': '/video-creator/v1/bernini-v2v',
+  'bernini-r2v': '/video-creator/v1/bernini-r2v',
+  // Post-process rails (vp-worker) — RIFE fps-boost + FlashVSR upscale + ffmpeg,
+  // used for Bernini delivery targets above native (480p@16).
+  'process': '/video-creator/v1/process',
+  'fps-boost': '/video-creator/v1/fps-boost',
+  'upscale': '/video-creator/v1/upscale',
+  'ffmpeg': '/video-creator/v1/ffmpeg',
 }
 export function endpointForTask(type: string): string {
   return TASK_ENDPOINTS[type] || `/video-creator/v1/${type}`

@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { readSSEStream } from './sse-stream'
+import { endpointForTask } from './direct-transport'
 
 /**
  * Fake ReadableStreamDefaultReader that mirrors the REAL browser semantics the
@@ -124,5 +125,24 @@ describe('readSSEStream', () => {
     const err = events.find(([e]) => e === 'error')
     expect(err).toBeDefined()
     expect(String(err![1])).toMatch(/timed out/i)
+  })
+})
+
+describe('endpointForTask — Bernini + post rails', () => {
+  it('maps Bernini generation/edit tasks to the wan-worker rails', () => {
+    expect(endpointForTask('bernini-t2v')).toBe('/video-creator/v1/bernini-t2v')
+    expect(endpointForTask('bernini-v2v')).toBe('/video-creator/v1/bernini-v2v')
+    expect(endpointForTask('bernini-r2v')).toBe('/video-creator/v1/bernini-r2v')
+  })
+
+  it('maps post-process tasks to the vp-worker rails', () => {
+    expect(endpointForTask('process')).toBe('/video-creator/v1/process')
+    expect(endpointForTask('fps-boost')).toBe('/video-creator/v1/fps-boost')
+    expect(endpointForTask('upscale')).toBe('/video-creator/v1/upscale')
+    expect(endpointForTask('ffmpeg')).toBe('/video-creator/v1/ffmpeg')
+  })
+
+  it('falls back to the /video-creator/v1/{task} convention for unknown tasks', () => {
+    expect(endpointForTask('some-new-task')).toBe('/video-creator/v1/some-new-task')
   })
 })
