@@ -114,7 +114,9 @@ export function berniniResolutionOptions(
 }
 
 export interface BerniniPostPayload {
-  fps_boost?: { target: number; mode: FpsBoostMode }
+  // Contract matches the vp-worker /process body: fps_boost.target_fps (renamed
+  // from `target` so the frontend payload is byte-identical to the worker body).
+  fps_boost?: { target_fps: number; mode: FpsBoostMode }
   upscale?: { scale: 4; final: UpscaleFinal }
 }
 
@@ -126,7 +128,7 @@ export interface BerniniPostPayload {
 export function berniniPostFor(d: { resolution: string; fps: number }): BerniniPostPayload {
   const payload: BerniniPostPayload = {}
   if (d.fps > BERNINI_NATIVE_FPS) {
-    payload.fps_boost = { target: d.fps, mode: 'preserve_motion' }
+    payload.fps_boost = { target_fps: d.fps, mode: 'preserve_motion' }
   }
   const final = FINAL_BY_RESOLUTION[d.resolution as BerniniResolution]
   if (final) payload.upscale = { scale: 4, final }

@@ -62,7 +62,7 @@ describe('berniniPostFor', () => {
   })
   it('fps-only boost sets preserve_motion target', () => {
     expect(berniniPostFor({ resolution: '480p', fps: 30 })).toEqual({
-      fps_boost: { target: 30, mode: 'preserve_motion' },
+      fps_boost: { target_fps: 30, mode: 'preserve_motion' },
     })
   })
   it('raw-4x attaches upscale with final raw and no ffmpeg requirement', () => {
@@ -72,7 +72,7 @@ describe('berniniPostFor', () => {
   })
   it('1080p @ 30 combines fps_boost + upscale final 1080', () => {
     expect(berniniPostFor({ resolution: '1080p', fps: 30 })).toEqual({
-      fps_boost: { target: 30, mode: 'preserve_motion' },
+      fps_boost: { target_fps: 30, mode: 'preserve_motion' },
       upscale: { scale: 4, final: '1080' },
     })
   })
