@@ -433,6 +433,10 @@ def create_app() -> web.Application:
     app = web.Application(client_max_size=config.MAX_BODY_BYTES)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/info", handle_info)
+    # Namespaced aliases match every other worker + the compose healthcheck +
+    # live-runner probing, which hit the /video-creator/v1/ prefixed paths.
+    app.router.add_get("/video-creator/v1/health", handle_health)
+    app.router.add_get("/video-creator/v1/info", handle_info)
     for ep, h in [("/process", handle_process), ("/fps-boost", handle_fps_boost),
                   ("/upscale", handle_upscale), ("/ffmpeg", handle_ffmpeg),
                   ("/sam3", handle_sam3), ("/sam3-image", handle_sam3_image)]:
