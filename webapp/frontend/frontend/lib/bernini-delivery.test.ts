@@ -7,6 +7,7 @@ import {
   berniniPostFor,
   berniniRunnerT2VBody,
   berniniDeliveryLabel,
+  berniniTaskFor,
   BERNINI_NATIVE_FPS,
   BERNINI_NATIVE_RESOLUTION,
   type BerniniDeliveryTarget,
@@ -133,5 +134,13 @@ describe('berniniRunnerT2VBody', () => {
 
   it('computes num_frames from duration at native fps', () => {
     expect(berniniRunnerT2VBody('x', { ...base, duration: 5 }).num_frames).toBe(80)
+  })
+})
+
+describe('berniniTaskFor', () => {
+  it('maps each operation to its bernini-* runner task and capability', () => {
+    expect(berniniTaskFor('t2v')).toEqual({ task: 'bernini-t2v', capability: 'bernini-t2v' })
+    expect(berniniTaskFor('v2v')).toEqual({ task: 'bernini-v2v', capability: 'bernini-v2v' })
+    expect(berniniTaskFor('r2v')).toEqual({ task: 'bernini-r2v', capability: 'bernini-r2v' })
   })
 })

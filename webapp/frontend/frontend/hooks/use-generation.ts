@@ -15,6 +15,18 @@ import {
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
 import { withGenerationActive } from '../lib/generation-active'
 import { useAppSettings } from '../contexts/AppSettingsContext'
+import {
+  berniniRunnerT2VBody,
+  berniniTaskFor,
+  BERNINI_NATIVE_FPS,
+  type BerniniEngine,
+  type BerniniResolution,
+} from '../lib/bernini-delivery'
+
+/** True when a GenerationSettings.model is a Bernini engine id. */
+function isBerniniModel(model: string): model is BerniniEngine {
+  return model === 'bernini-1.3b' || model === 'bernini-14b'
+}
 
 
 export const GENERATION_RECOVERY_KEY = 'ltx-generation-recovery'
@@ -281,9 +293,66 @@ export function useGeneration(): UseGenerationReturn {
         // DIRECT transport: resolve a capable runner (Worker discovery) and do the Livepeer
         // payment handshake + read the resulting media from the runner response.
         if (useDirectTransport) {
-          // Route by conditioning: a start image attached => image-to-video (runner /i2v with the
-          // image bytes), no image => plain t2v. The image MUST be sent as base64 bytes — a remote
-          // worker can't resolve a browser web:// or blob: path, so never send the path for i2v.
+          // ── Bernini rail: when the user picks a Bernini engine, route to the
+          //    wan-worker /video-creator/v1/bernini-t2v rail. Native 480p@16 render;
+          //    above-native delivery is requested via the `post` payload the
+          //    live-runner orchestrates on the vp-worker (/process). The runner (not
+          //    the frontend) decides the upstream engine from `model`.
+          if (isBerniniModel(settings.model)) {
+            const engine: BerniniEngine = settings.model
+            const spec = berniniTaskFor('t2v')
+            const runner = await resolveRunner([spec.capability])
+            if (!runner) {
+              throw new Error('No available Livepeer runner for Bernini video generation')
+            }
+            const target = {
+              engine,
+              resolution: (body.resolution ?? '480p') as BerniniResolution,
+              fps: typeof body.fps === 'number' ? (body.fps as number) : BERNINI_NATIVE_FPS,
+              duration: Math.min(Math.max(typeof body.duration === 'number' ? (body.duration as number) : 3, 1), 5),
+            }
+            const res = await postRunnerTaskWithTicketSSE(
+              runner,
+              spec.task,
+              {
+                ...berniniRunnerT2VBody(prompt, target, {
+                  negativePrompt: (settings as { negativePrompt?: string }).negativePrompt,
+                }),
+                jobId: makeJobId(),
+              },
+              {
+                signal: abortController.signal,
+                onProgress: (ev) => {
+                  if (!shouldApplyPollingUpdates) return
+                  let displayProgress = 0
+                  if (ev.stage === 'generating' && typeof ev.progress === 'number') {
+                    displayProgress = Math.min(Math.round(ev.progress * 95), 95)
+                  }
+                  setState(prev => ({ ...prev, progress: displayProgress, statusMessage: ev.message || 'Generating...' }))
+                },
+              },
+            )
+            shouldApplyPollingUpdates = false
+            if (!res.mediaBlob) {
+              throw new Error(res.payload?.error ? String(res.payload.error) : 'Runner returned no media')
+            }
+            const objectUrl = URL.createObjectURL(res.mediaBlob)
+            setState({
+              isGenerating: false,
+              progress: 100,
+              statusMessage: 'Complete!',
+              videoPath: objectUrl,
+              imagePath: null,
+              imagePaths: [],
+              error: null,
+            })
+            return
+          }
+
+          // ── Generic (LTX) video rail: route by conditioning — a start image attached
+          //    => image-to-video (runner /i2v with the image bytes), no image => t2v.
+          //    The image MUST be sent as base64 bytes — a remote worker can't resolve a
+          //    browser web:// or blob: path, so never send the path for i2v.
           const isI2V = !!imagePath
           const runner = await resolveRunner(isI2V ? ['i2v'] : ['t2v'])
           if (!runner) {

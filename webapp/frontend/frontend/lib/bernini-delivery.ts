@@ -149,6 +149,26 @@ export function berniniDeliveryLabel(d: BerniniDeliveryTarget): string {
   return `${d.resolution} · ${d.fps}fps`
 }
 
+/** A Bernini video operation (what the user asked for). */
+export type BerniniOperation = 't2v' | 'v2v' | 'r2v'
+
+export interface BerniniTaskSpec {
+  /** Runner task string the browser POSTs to (endpointForTask -> /video-creator/v1/...). */
+  task: string
+  /** The runner `capabilities[].id` a capable runner must advertise (resolveRunner). */
+  capability: string
+}
+
+/**
+ * Map a Bernini operation to the runner task + capability the browser must target.
+ * Mirrors the live-runner ROUTES / capability advertisement (wan-worker). This is the
+ * whole "engine decides -> backend route-based" resolution the plan requires.
+ */
+export function berniniTaskFor(op: BerniniOperation): BerniniTaskSpec {
+  const key = `bernini-${op}`
+  return { task: key, capability: key }
+}
+
 /**
  * Compose the EXACT body to POST to the runner's `bernini-t2v` rail from a delivery
  * target. The runner renders natively at 480p@16fps; every above-native target carries

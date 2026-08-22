@@ -20,7 +20,7 @@ export interface LoraSelection {
 }
 
 export interface GenerationSettings {
-  model: 'fast' | 'pro' | 'ltx-2.5'
+  model: 'fast' | 'pro' | 'ltx-2.5' | 'bernini-1.3b' | 'bernini-14b'
   duration: number
   videoResolution: string
   fps: number
@@ -38,6 +38,9 @@ export interface GenerationSettings {
   imageEditStrength?: number  // Denoising strength when editing an existing image
   imageEditEngine?: 'qwen-edit' | 'zimage'  // Image-edit engine: Qwen-Image-Edit (default) | Z-Image keep-subject
   imageModel?: 'zimage' | 'klein' | 'hidream'  // T2I: Z-Image Turbo | FLUX.2 Klein 4B | HiDream-O1
+  // Bernini delivery (native 480p@16 render; above-native via the post rails).
+  fpsBoostTarget?: number  // Desired delivery fps (>16 => RIFE fps-boost)
+  upscaleFinal?: '1080' | '1440' | 'raw'  // Desired delivery resolution (=> FlashVSR + ffmpeg)
 }
 
 interface SettingsPanelProps {
