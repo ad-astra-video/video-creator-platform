@@ -56,7 +56,39 @@ source-of-truth for a from-scratch build (bake the deps + kernel build + LD_LIBR
 pinned transformers 4.46.2), but a stable engine box (or CI) is needed to build it reliably.
 
 ## Remaining (honest)
-1. **Bernini / wan-worker generation calibration**: load the 26 GB model + run a real t2v/v2v/r2v
-   job (routing is proven; the actual model-load inference run is the heavyweight test).
-2. **Frontend api-client/UI** (`references[]`, r2v bar, EditVideoPanel, PostProcessControls):
+1. **Frontend api-client/UI** (`references[]`, r2v bar, EditVideoPanel, PostProcessControls):
    blocked on regenerating the backend OpenAPI spec before the typed api-client calls can land.
+
+## RESOLVED: Bernini 1.3B generation calibrated on-box (t2v/v2v/r2v all render)
+The isolated `/opt/bernini/venv` was MISSING deps the deployed image never installed
+(pyproject pins torch 2.7.1 / python>=3.11 but the image builds py3.10 venv). Fixed in the
+RUNNING container (not yet in any image — bake into wan-worker.Dockerfile next build):
+- pip installed into the venv: `diffusers==0.35.2`, `accelerate==0.34.2`, `torchvision`,
+  `decord`, `scipy`, `ftfy`, `tqdm`, `ninja`, plus `tokenizers>=0.22` and `huggingface-hub<1.0`
+  (transformers 4.57.3 needs <1.0).
+- **veomni shim**: `veomni/*` minimal package dropped into the venv site-packages
+  (`utils.logging`/`utils.constants`/`utils.device`/`utils.import_utils` +
+  `distributed.parallel_state`/`sequence_parallel`) — the full VeOmni needs python>=3.11 and is
+  distributed-training only; our 1.3B renderer path only touches these at import.
+- **`modeling_qwen2_5_vl.py` fa2/fa3 guard**: replaced the module-level
+  `raise ValueError(...)` with `flash_attn_func=None` — the Qwen2.5-VL BerniniModel (which needs
+  flash-attn) is never instantiated by the 1.3B renderer (it runs the Wan DiT via SDPA). Deferred:
+  only the unused vit path would fail; our path is clear.
+- **`.pth`** in the venv site-packages pointing at `/opt/bernini/src` so `import bernini`
+  resolves for the manager-spawned CLI regardless of CWD/PYTHONPATH.
+
+**Measured on-box (RTX 5090, device cuda:1, Bernini-R-1.3B-Diffusers) — all native 848x480@16fps,
+33 frames:**
+- **t2v** "a red fox running through snow..." : pipeline build ~2-6s, 30 steps @ ~1.22s/it =
+  **47.3s**, output 1.9 MB MP4.
+- **v2v** "make it snowing heavily, keep the fox" (source = t2v clip): 30 steps @ ~3.25s/it =
+  **110.5s**, motion-preserved.
+- **r2v** (2 reference images): 30 steps @ ~2.9s/it = **98s**.
+- VRAM peak ~1.5-2 GB (1.3B is very light).
+
+**STILL PENDING (honest): the HTTP rail E2E** — the server route `/video-creator/v1/t2v` ->
+`BerniniManager` -> spawned `bernini_cli.py` subprocess JSONL round-trip was not completed: the
+direct CLI+subprocess path is proven (venv imports, CLI stays resident awaiting JSONL, and the
+same `build_pipeline` call rendered all three tasks), but hitting the live server endpoint in one
+job was not resolved before the box's Komodo shell wedged. Next step: restart wan-worker cleanly
+and `curl` the real `/v1/t2v` once.
