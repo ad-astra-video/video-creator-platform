@@ -43,7 +43,17 @@ vp-worker's own cu128 image:
 
 **Measured on-box (RTX 5090, compute_120)**: 40fr @ 320x240 -> 37fr @ **896x1280 (4x)** uint8,
 **3.5s** (pipeline build 5.6s, 3 streaming chunks through the sm120 kernel).
-All baked into `runner/docker/vp-worker.Dockerfile` (rebuild + push + pull to deploy).
+Through the live server rails (committed image `adastravideo/video-creator:vp-worker-flashvsr`):
+  `/upscale` -> 1280x896, 37fr in **4.4s**; combined `/process` (RIFE 24fps + FlashVSR 4x +
+  ffmpeg) -> 1280x896, 93fr@24fps in **10.2s**.
+
+### Deploy note: reproducibility
+The Windows Docker Desktop engine `EOF`s mid-build on this image's long kernel compile, so the
+deployed image was produced by `docker commit` of the running, verified vp-worker container
+(kernel .so + deps + patched module baked into the FS), tagged `vp-worker-flashvsr`, and pushed
+from `.151` (which has Hub auth). The Dockerfile (`runner/docker/vp-worker.Dockerfile`) is the
+source-of-truth for a from-scratch build (bake the deps + kernel build + LD_LIBRARY_PATH +
+pinned transformers 4.46.2), but a stable engine box (or CI) is needed to build it reliably.
 
 ## Remaining (honest)
 1. **Bernini / wan-worker generation calibration**: load the 26 GB model + run a real t2v/v2v/r2v
