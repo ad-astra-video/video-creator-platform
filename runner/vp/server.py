@@ -65,6 +65,21 @@ def _require_token(request: web.Request) -> None:
         raise web.HTTPForbidden(reason="missing/mismatched X-Worker-Token")
 
 
+async def handle_load(_req: web.Request) -> web.Response:
+    """No-op /load: vp-worker is intentionally NOT device-aware (low-VRAM, runs
+    on whatever GPU the scheduler hands it; rails load lazily on first use).
+    The live-runner's GPU scheduler calls /load before every dispatch, so we
+    must ACK it even though there's nothing to preload — otherwise the acquire
+    flow fails with a 404 and routing to this worker breaks."""
+    return web.json_response({"status": "loaded", "loaded": True, "device": ""})
+
+
+async def handle_evict(_req: web.Request) -> web.Response:
+    return web.json_response({"status": "evicted"})
+
+
+
+
 def _b64write(data: str, path: str) -> None:
     with open(path, "wb") as fh:
         fh.write(base64.b64decode(data))
@@ -433,6 +448,10 @@ def create_app() -> web.Application:
     app = web.Application(client_max_size=config.MAX_BODY_BYTES)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/info", handle_info)
+    app.router.add_post("/load", handle_load)
+    app.router.add_post("/evict", handle_evict)
+    app.router.add_post("/video-creator/v1/load", handle_load)
+    app.router.add_post("/video-creator/v1/evict", handle_evict)
     # Namespaced aliases match every other worker + the compose healthcheck +
     # live-runner probing, which hit the /video-creator/v1/ prefixed paths.
     app.router.add_get("/video-creator/v1/health", handle_health)
