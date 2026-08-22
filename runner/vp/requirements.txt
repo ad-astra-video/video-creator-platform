@@ -1,0 +1,17 @@
+# vp-worker runtime (isolated venv on the GPU box). RIFE + FlashVSR share this
+# venv; FlashVSR also needs the diffsynth source tree (pip-installed) + the
+# vendored flashvsr_utils (already in-repo).
+numpy
+torch>=2.3
+aiohttp
+einops
+imageio
+imageio-ffmpeg
+opencv-python-headless
+Pillow
+tqdm
+# FlashVSR diffsynth backend (the OpenImagingLab/FlashVSR repo's own diffsynth).
+# See Dockerfile: git clone the FlashVSR repo and pip-install its diffsynth, or
+# pip install diffsynth (the released package) — either provides
+# ModelManager + FlashVSRTinyPipeline.
+# diffsynth
