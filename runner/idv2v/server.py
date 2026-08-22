@@ -446,6 +446,17 @@ async def handle_progress(request: web.Request) -> web.Response:
 _BERNINI_TASKS = {"t2v", "v2v", "r2v"}
 
 
+def _berni_task_from_path(path: str) -> str:
+    """Map a request path to a Bernini task id (t2v/v2v/r2v) or ''."""
+    seg = path.rstrip("/").rsplit("/", 1)[-1]
+    if seg in _BERNINI_TASKS:
+        return seg
+    if seg.startswith("bernini-"):
+        maybe = seg[len("bernini-"):]
+        return maybe if maybe in _BERNINI_TASKS else ""
+    return ""
+
+
 async def handle_bernini(request: web.Request) -> web.Response:
     """Run a Bernini generation/edit job (native 480p/16 @ max 848px).
 
@@ -461,7 +472,12 @@ async def handle_bernini(request: web.Request) -> web.Response:
     post rails orchestrated by the live-runner.
     """
     _require_token(request)
-    task = request.match_info.get("task", "")
+    # Routes are STATIC paths (aiohttp match_info has no {task} placeholder),
+    # so derive the task from the request path. Handles every alias:
+    #   /v1/t2v            -> t2v
+    #   /video-creator/v1/t2v -> t2v
+    #   /video-creator/v1/bernini-t2v -> t2v  (live-runner ROUTES id)
+    task = _berni_task_from_path(request.path)
     if task not in _BERNINI_TASKS:
         return web.json_response({"error": f"unsupported Bernini task '{task}'"},
                                  status=404)
@@ -697,8 +713,13 @@ def create_app() -> web.Application:
     app.router.add_post("/r2v", handle_bernini)
     app.router.add_post("/v1/r2v", handle_bernini)
     app.router.add_post("/video-creator/v1/r2v", handle_bernini)
+    # Live-runner ROUTES ids (bernini-* — endpoint name reaches the worker as-is).
+    app.router.add_post("/video-creator/v1/bernini-t2v", handle_bernini)
+    app.router.add_post("/video-creator/v1/bernini-v2v", handle_bernini)
+    app.router.add_post("/video-creator/v1/bernini-r2v", handle_bernini)
     app.router.add_post("/v1/bernini/evict", handle_bernini_evict)
     app.router.add_post("/video-creator/v1/bernini/evict", handle_bernini_evict)
+    app.router.add_post("/video-creator/v1/bernini-evict", handle_bernini_evict)
     app.router.add_get("/progress/{job_id}", handle_progress)
     app.router.add_get("/video-creator/v1/progress/{job_id}", handle_progress)
     app.router.add_post("/v1/sam3", handle_sam3)

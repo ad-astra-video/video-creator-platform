@@ -14,7 +14,7 @@ PRICE_UNIT = os.environ.get("PRICE_UNIT", "fixed")
 PRICE_CURRENCY = (os.environ.get("PRICE_CURRENCY", "usd") or "usd").strip().lower()
 GPU_NAME = os.environ.get("GPU_NAME", "RTX 5090")
 # GPU VRAM is DETECTED at runtime from the GPU-visible workers (see server.py
-# _poll_worker_gpu_info), NOT read from an env var (user-mandated 2026-08).
+# _detect_ltx_vram_mb), NOT read from an env var (user-mandated 2026-08).
 # This is a conservative fallback used only until runtime detection succeeds.
 DEFAULT_VRAM_MB = 32768
 HEARTBEAT_INTERVAL_S = float(os.environ.get("HEARTBEAT_INTERVAL_S", "5"))
@@ -24,6 +24,8 @@ LTX_WORKER_URL = os.environ.get("LTX_WORKER_URL", "http://ltx-worker:8991")
 IDV2V_WORKER_URL = os.environ.get("IDV2V_WORKER_URL", "http://idv2v-worker:8992")
 GEMMA_WORKER_URL = os.environ.get("GEMMA_WORKER_URL", "http://gemma-worker:8993")
 IMAGE_WORKER_URL = os.environ.get("IMAGE_WORKER_URL", "http://image-worker:8994")
+WAN_WORKER_URL = os.environ.get("WAN_WORKER_URL", "http://wan-worker:8992")
+VP_WORKER_URL = os.environ.get("VP_WORKER_URL", "http://vp-worker:8995")
 
 # Plan B — GPU concurrency scheduler (one task -> one GPU, concurrent across GPUs).
 # -----------------------------------------------------------------------------
@@ -77,7 +79,9 @@ def worker_token() -> str:
 # Worker -> service-URL table (used by routing).
 WORKERS = {
     "ltx-worker": LTX_WORKER_URL,
-    "idv2v-worker": IDV2V_WORKER_URL,
+    "idv2v-worker": IDV2V_WORKER_URL,  # legacy alias (same box before rename)
+    "wan-worker": WAN_WORKER_URL,
     "gemma-worker": GEMMA_WORKER_URL,
     "image-worker": IMAGE_WORKER_URL,
+    "vp-worker": VP_WORKER_URL,
 }

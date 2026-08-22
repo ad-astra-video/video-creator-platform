@@ -38,17 +38,32 @@ ROUTES = {
     "restyle": "idv2v-worker",
     "style-frame": "image-worker",
     "sam3": "idv2v-worker",
+    # Bernini rail on the wan-worker (the idv2v worker renamed). Distinct
+    # endpoint ids keep the frontend's engine choice explicit and the backend
+    # strictly route-based (no goal-intent logic server-side).
+    "bernini-t2v": "wan-worker",
+    "bernini-v2v": "wan-worker",
+    "bernini-r2v": "wan-worker",
+    "bernini-evict": "wan-worker",
+    # Video-processing-worker post rails (orchestrated by the live-runner as a
+    # combined /process stage after any render).
+    "process": "vp-worker",
+    "fps-boost": "vp-worker",
+    "upscale": "vp-worker",
+    "ffmpeg": "vp-worker",
 }
 
 # Routing capability ids advertised for the platform (each maps 1:1 via ROUTES
 # to the worker container that serves it). `qwen-image-edit` is deliberately
 # NOT here: it was an engine label, not a route. Available image MODELS are
 # advertised separately (see MODELS) so consumers can tell z-image / flux /
-# qwen apart without a per-engine capability entry.
+# qwen apart without a per-engine capability entry. Bernini shows up as its own
+# capability ids (not folded into t2v/v2v which are LTX-owned in Generate).
 CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", "layer",
                        "sam3", "extend", "retake", "prompt-enhance",
                        "suggest-gap-prompt", "chat", "suggest-layers", "extract-conditioning",
-                       "ic-lora-generate"})
+                       "ic-lora-generate", "bernini-t2v", "bernini-v2v",
+                       "bernini-r2v", "process", "fps-boost", "upscale", "ffmpeg"})
 
 # Image models the image-worker can serve, by id. Consumed by the frontend to
 # label models (z-image = Z-Image, flux = FLUX.2 klein 4B, qwen = Qwen-Image-Edit,
