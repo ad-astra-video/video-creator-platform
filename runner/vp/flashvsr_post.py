@@ -160,7 +160,19 @@ class FlashVsrUpscaler:
                 torch.load(tc_path, map_location="cpu"), strict=False)
         pipe.to(self.device)
         pipe.enable_vram_management(num_persistent_param_in_dit=None)
-        pipe.init_cross_kv()
+        # init_cross_kv loads an aux posi-prompt tensor from a CWD-relative path
+        # by default (../../examples/...); pass it explicitly from FLASHVSR_ROOT
+        # so we're not dependent on the process working directory.
+        prompt_path = os.path.join(self.root, "posi_prompt.pth")
+        if not os.path.exists(prompt_path):
+            # Baked fallback shipped inside the image (not the /models volume).
+            prompt_path = os.environ.get(
+                "FLASHVSR_PROMPT_TENSOR",
+                "/opt/flashvsr_prompt/posi_prompt.pth")
+        ctx = None
+        if os.path.exists(prompt_path):
+            ctx = torch.load(prompt_path, map_location=self.device)
+        pipe.init_cross_kv(context_tensor=ctx)
         pipe.load_models_to_device(["dit", "vae"])
         self._pipe = pipe
         logger.info("FlashVSR v1.1 tiny upscaler ready (device=%s, scale=%s)",
