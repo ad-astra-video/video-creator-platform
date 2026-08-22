@@ -56,7 +56,7 @@ class BerniniManager:
                  root: Optional[str] = None, guidance: str = "rv2v"):
         self.model = model
         self.resolve_model = model  # config.resolve_model(model)
-        self.device = device or config.BERNINI_GPU_DEVICE or config.GPU_DEVICE
+        self.device = device or config.BERNINI_GPU_DEVICE or config.GPU_DEVICE or "cuda:0"
         self.venv_py = venv_py or config.BERNINI_VENV_PY
         self.root = root or config.bernini_root(model)
         self.guidance = guidance

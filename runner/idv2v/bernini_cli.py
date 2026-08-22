@@ -48,10 +48,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from typing import Optional
 
 import torch
+
+# --- Bernini source must be importable. The manager spawns us with the runner
+# --- dir as sys.path[0] (which contains runner's own `bernini.py` manager, NOT
+# --- the ByteDance package), so force the real source dir onto the path first.
+_BERNINI_SRC = os.environ.get("BERNINI_SRC", "/opt/bernini/src")
+if _BERNINI_SRC and sys.path[:1] != [_BERNINI_SRC]:
+    sys.path.insert(0, _BERNINI_SRC)
 
 from bernini.cli import (
     build_pipeline,
