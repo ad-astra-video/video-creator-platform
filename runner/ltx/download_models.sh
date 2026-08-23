@@ -11,6 +11,7 @@
 #   <MODELS_DIR>/upscaler/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
 #   <MODELS_DIR>/z-image/Z-Image-Turbo/
 #   <MODELS_DIR>/processors/{dpt-hybrid-midas, yolox_l.torchscript.pt, dw-ll_ucoco_384_bs5.torchscript.pt}
+#   <MODELS_DIR>/loras/vbvr-video-reasoning/lora.safetensors   (VBVR LTX-2.3 LoRA)
 #
 # Usage:
 #   export HUGGING_FACE_HUB_TOKEN=hf_...
@@ -69,6 +70,18 @@ huggingface-cli download --token "$HF_TOKEN" \
 huggingface-cli download --token "$HF_TOKEN" \
     "hr16/DWPose-TorchScript-BatchSize5" "dw-ll_ucoco_384_bs5.torchscript.pt" \
     --local-dir "$MODELS_DIR/processors"
+
+echo ">>> [6/6] VBVR Video-Reasoning LoRA (LTX-2.3, ad-astra-video/LTX-Loras)"
+# Lands at <MODELS_DIR>/loras/vbvr-video-reasoning/lora.safetensors so the ltx-worker's
+# LoraCache sees it as already-cached (cache key = <LORA_CACHE_DIR>/<lora_id>/<filename>).
+mkdir -p "$MODELS_DIR/loras/vbvr-video-reasoning"
+VBVR_TMP="$MODELS_DIR/loras/.vbvr-staging"
+rm -rf "$VBVR_TMP" && mkdir -p "$VBVR_TMP"
+huggingface-cli download --token "$HF_TOKEN" \
+    "ad-astra-video/LTX-Loras" "2.3/vbvr/lora.safetensors" \
+    --local-dir "$VBVR_TMP"
+mv "$VBVR_TMP/2.3/vbvr/lora.safetensors" "$MODELS_DIR/loras/vbvr-video-reasoning/lora.safetensors"
+rm -rf "$VBVR_TMP"
 
 echo ">>> Done. LTX models at $MODELS_DIR"
 du -sh "$MODELS_DIR/checkpoint" "$MODELS_DIR/gemma" "$MODELS_DIR/z-image" 2>/dev/null || true
