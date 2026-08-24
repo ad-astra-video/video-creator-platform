@@ -71,9 +71,9 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
     height = int(body.get("height", 720))
     # Cap generation resolution so the fp8 DiT + activations fit the 31 GB
     # GPU (720p/81fr does not fit this box). This worker emits its output at
-    # whatever resolution it generates; the LTX spatial upscaler is a separate
-    # live-runner stage (gated by IDV2V_SKIP_UPSCALE, currently disabled on
-    # deployment). Default max side 640 (360p for a 720p source).
+    # whatever resolution it generates; the LTX spatial upscaler has been
+    # removed from the restyle path. Default max side 640 (360p for a 720p
+    # source).
     gen_max_side = int(os.environ.get("IDV2V_GEN_MAX_SIDE", "640"))
     _sc = gen_max_side / max(width, height) if max(width, height) > gen_max_side else 1.0
     width = max(256, int(round(width * _sc) // 16 * 16))

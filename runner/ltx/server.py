@@ -704,43 +704,6 @@ async def _run_extend_sse(req: web.Request, prompt: str, video_base64: str,
     return resp
 
 
-async def handle_upscale(req: web.Request) -> web.Response:
-    """POST /video-creator/v1/upscale — upscale a finished video to a target
-    resolution with the LTX-2.3 spatial upsampler (the 480->720 step in the
-    restyle chain: ID-V2V generates at a box-fitting resolution, this restores
-    full output resolution)."""
-    body = await req.json()
-    assert engine
-    video_base64 = body["video_base64"]
-    width = int(body.get("width", 1280))
-    height = int(body.get("height", 720))
-    fps = body.get("fps", 24)
-
-    tmp_in = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_in.write(base64.b64decode(video_base64))
-    tmp_in.close()
-    tmp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_out.close()
-    try:
-        await _run_generation(
-            engine.upscale_video,
-            video_path=tmp_in.name,
-            output_path=tmp_out.name,
-            target_width=width,
-            target_height=height,
-            fps=fps,
-        )
-        b64 = _read_file_b64(tmp_out.name)
-        return web.json_response({
-            "video_base64": b64,
-            "content_type": "video/mp4",
-            "generation_id": uuid.uuid4().hex[:8],
-        })
-    finally:
-        os.unlink(tmp_in.name)
-        os.unlink(tmp_out.name)
-
-
 async def handle_retake(req: web.Request) -> web.Response:
     """POST /video-creator/v1/retake — regenerate a video segment with new prompt."""
     body = await req.json()
@@ -1187,7 +1150,6 @@ def create_app() -> web.Application:
     app.router.add_post(f"{p}/image", handle_image)
     app.router.add_post(f"{p}/edit", handle_edit)
     app.router.add_post(f"{p}/extend", handle_extend)
-    app.router.add_post(f"{p}/upscale", handle_upscale)
     app.router.add_post(f"{p}/retake", handle_retake)
     app.router.add_post(f"{p}/prompt-enhance", handle_prompt_enhance)
     app.router.add_post(f"{p}/suggest-gap-prompt", handle_suggest_gap_prompt)

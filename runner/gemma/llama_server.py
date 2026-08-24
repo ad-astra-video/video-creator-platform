@@ -82,7 +82,8 @@ async def ensure_running() -> None:
             # content — that natively-populated field is what the worker returns.
             "--reasoning", "on",
             "--reasoning-format", "deepseek",
-            "--log-format", "json",
+            # NOTE: no `--log-format` — removed from llama-server upstream CLI
+            # (a master-branch build rejects the arg and exits at startup).
             "--log-file", "/tmp/llama-server.log",
         ]
         if config.GEMMA_MMPROJ:

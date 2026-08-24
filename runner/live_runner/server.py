@@ -27,6 +27,7 @@ from livepeer_gateway.live_runner import (
 
 from . import config
 from .routing import CAPABILITIES, MODELS, ROUTES, candidate_workers, proxy, proxy_worker_sse
+from . import postchain
 from .scheduler import GPUScheduler, QueueTimeout
 from .specs import build_model_specs
 from .swap import HttpWorkerTransport, ResidentWorkerManager
@@ -34,12 +35,12 @@ from .swap import HttpWorkerTransport, ResidentWorkerManager
 logger = logging.getLogger("video_creator.runner.live_runner.server")
 
 _max_body = int(os.environ.get("MAX_BODY_BYTES", "3000000000"))
-_SKIP_UPSCALE = os.environ.get("IDV2V_SKIP_UPSCALE", "").lower() in ("1", "true", "yes")
 
 # Global state
 _session: aiohttp.ClientSession | None = None
 _worker_manager: ResidentWorkerManager | None = None
 _registration = None
+_registration_task: asyncio.Task | None = None
 _ready = False
 _scheduler: GPUScheduler | None = None  # Plan B — one task -> one GPU, concurrent across GPUs
 _in_flight = 0        # active request counter (idle-backfill gate)
@@ -64,7 +65,7 @@ def _device_for(worker: str, gpu: int) -> int | None:
 
 # Advertised model-spec metadata (resolution/fps/duration) for the Livepeer
 # video pipelines. Built from the GPU's ACTUAL VRAM detected at runtime from the
-# GPU-visible workers (_poll_worker_gpu_info) and rebuilt if that VRAM changes.
+# GPU-visible workers (_detect_ltx_vram_mb) and rebuilt if that VRAM changes.
 # Detection can't run at import time, so we start from the conservative fallback
 # and the first startup/heartbeat pass corrects it. (user-mandated 2026-08: use
 # the real GPU VRAM, not the GPU_VRAM_MB env var.)
@@ -96,29 +97,20 @@ async def _fetch_worker_info(session: aiohttp.ClientSession, worker_url: str) ->
         return None
 
 
-async def _poll_worker_gpu_info(session: aiohttp.ClientSession) -> tuple[dict, int | None]:
-    """Poll every configured worker's /info (polled at startup + each heartbeat).
+async def _detect_ltx_vram_mb(session: aiohttp.ClientSession) -> int | None:
+    """Detect the create (ltx) worker's total GPU VRAM from its /info.
 
-    Returns ``(gpu_meta, ltx_vram_mb)``:
-      * gpu_meta — SHORTHAND per-worker GPU summary ``{short_name: vram_mb}``
-        (e.g. ``{"ltx": 32153, "idv2v": 32153, "gemma": 32153}``), folded into the
-        advertised heartbeat metadata. Integer MiB only (no name/cc) so the JSON
-        stays far under go-livepeer's 1024-byte metadata cap. The Worker control
-        plane never reads ``meta.gpu`` — it's informational — so terse keys are safe.
-      * ltx_vram_mb — the create (ltx) worker's total VRAM, which drives the
-        video-create resolution/duration specs.
+    Drives the video-create resolution/duration specs (``_MODEL_SPECS``). The
+    per-worker GPU map used to be advertised in heartbeat metadata but was
+    removed to stay under go-livepeer's 1024-byte metadata cap — nothing read
+    it, so we only fetch the ltx worker's VRAM now.
     """
-    gpu_meta: dict = {}
-    ltx_vram_mb: int | None = None
-    for name, url in config.WORKERS.items():
-        info = await _fetch_worker_info(session, url)
-        g = (info or {}).get("gpu") or {}
-        vram_gb = g.get("vram_gb")
-        vram_mb = int(float(vram_gb) * 1024) if vram_gb else None
-        gpu_meta[name.split("-", 1)[0]] = vram_mb  # ltx-worker -> ltx
-        if name == "ltx-worker" and vram_gb:
-            ltx_vram_mb = vram_mb
-    return gpu_meta, ltx_vram_mb
+    info = await _fetch_worker_info(session, config.WORKERS["ltx-worker"])
+    g = (info or {}).get("gpu") or {}
+    vram_gb = g.get("vram_gb")
+    if not vram_gb:
+        return None
+    return int(float(vram_gb) * 1024)
 
 
 def _apply_detected_vram(vram_mb: int) -> None:
@@ -238,20 +230,17 @@ async def _client_stage(info: dict):
 
 
 async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Response:
-    """Restyle = idv2v generation at a GPU-fitting resolution (capped ~480), then
-    LTX spatial upscaler restores the requested output resolution.
+    """Restyle = idv2v generation, returned at its native resolution.
 
     The response keeps the downstream contract: ``output_video`` base64 +
-    ``resolution``. A flag and the pre-upscale resolution are included so the
-    desktop can tell a chained (upscaled) result from a native one.
+    ``resolution``. ``upscaled`` is always false — the LTX spatial upscaler has
+    been removed from the restyle path, so the result is the native id-v2v
+    output.
 
     When ``progress_cb`` is supplied (SSE transport), the idv2v leg runs as a
     background task and its REAL per-step progress is polled from the worker's
-    ``/progress/{job_id}`` and forwarded through the callback, and the upscale
-    leg emits keep-alive text stages -- so the connection stays alive and the
-    client sees live generation progress (fixes the Cloudflare-tunnel timeout
-    that a silent multi-minute request was hitting). Without it the plain HTTP
-    path returns the single JSON response unchanged.
+    ``/progress/{job_id}`` and forwarded through the callback. Without it the
+    plain HTTP path returns the single JSON response unchanged.
     """
     headers = {"X-Worker-Token": token}
     idv2v_base = config.WORKERS["idv2v-worker"]
@@ -317,65 +306,14 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
     if not out_b64:
         return web.json_response(data, status=502)
 
-    if _SKIP_UPSCALE:
-        # Diagnostic A/B: return the native idv2v output without the LTX
-        # spatial upscale, to check whether the upscaler causes flicker.
-        return web.json_response({
-            "output_video": out_b64,
-            "frames_generated": data.get("frames_generated"),
-            "resolution": data.get("resolution"),
-            "gen_resolution": data.get("resolution"),
-            "upscaled": False,
-            "video_caption": data.get("video_caption"),
-            "enhanced_prompt": data.get("enhanced_prompt"),
-            "used_prompt": data.get("used_prompt"),
-        })
-
-    # 2) LTX spatial upscale to the requested target resolution (keep-alive).
-    target_w = max(16, int(body.get("width", 1280)))
-    target_h = max(16, int(body.get("height", 720)))
-    up_body = {"video_base64": out_b64, "width": target_w, "height": target_h,
-               "fps": body.get("fps", 24)}
-    ltx_base = config.WORKERS["ltx-worker"]
-    ltx_gpu = await _scheduler.acquire("ltx-worker")
-    await wm.ensure("ltx-worker", device=_device_for("ltx-worker", ltx_gpu))
-
-    async def _upscale():
-        async with session.post(f"{ltx_base}/video-creator/v1/upscale",
-                                json=up_body, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r2:
-            if r2.status >= 400:
-                return {"_error": (await r2.read())[:500].decode("utf-8", "replace")}
-            return await r2.json()
-
-    utask = asyncio.create_task(_upscale())
-    try:
-        while not utask.done():
-            await _send({"stage": "upscaling",
-                         "message": "Upscaling to full resolution...", "progress": None})
-            try:
-                await asyncio.wait_for(asyncio.shield(utask), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        up = utask.result()
-        if up.get("_error"):
-            return web.Response(status=502, text=up["_error"],
-                                content_type="application/json", charset="utf-8")
-    except Exception as exc:
-        logger.exception("restyle upscale failed")
-        return web.Response(status=500, text=str(exc),
-                            content_type="application/json", charset="utf-8")
-
-    await _scheduler.release("ltx-worker", ltx_gpu)
-    up_b64 = up.get("video_base64")
-    if not up_b64:
-        return web.json_response(up, status=502)
+    # Restyle returns the native id-v2v output. The LTX spatial upscaler has been
+    # removed from the restyle path.
     return web.json_response({
-        "output_video": up_b64,
+        "output_video": out_b64,
         "frames_generated": data.get("frames_generated"),
-        "resolution": f"{target_w}x{target_h}",
+        "resolution": data.get("resolution"),
         "gen_resolution": data.get("resolution"),
-        "upscaled": True,
+        "upscaled": False,
         "video_caption": data.get("video_caption"),
         "enhanced_prompt": data.get("enhanced_prompt"),
         "used_prompt": data.get("used_prompt"),
@@ -388,8 +326,8 @@ async def handle_ws(req: web.Request) -> web.Response:
     The client opens a WS through the orchestrator to /video-creator/v1/ws and
     sends {"type":"<endpoint>","request_id":...,"body":{...}} where <endpoint>
     is any live-runner task (t2v, i2v, image, edit, extend, retake, prompt-enhance,
-    ic-lora-generate, extract-conditioning, suggest-gap-prompt, restyle, sam3,
-    upscale). The runner routes to the right worker and streams progress events
+    ic-lora-generate, extract-conditioning, suggest-gap-prompt, restyle, sam3). The
+    runner routes to the right worker and streams progress events
     and finally the result media over the socket — so long jobs don't hit the
     frontend's HTTP timeout and the client gets live progress.
 
@@ -461,11 +399,12 @@ async def handle_ws(req: web.Request) -> web.Response:
 
 
 async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) -> None:
-    """Run idv2v then ltx upscale, streaming progress over the WS.
+    """Run idv2v restyle, streaming progress over the WS. Returns the native
+    output (the LTX spatial upscaler has been removed from the restyle path).
 
     Progress semantics:
       - Text updates at each process step (preprocessing / generating /
-        decoding / upscaling / finalizing).
+        decoding / finalizing).
       - A numeric ``progress`` is sent ONLY for genuine backbone inference
         iterations (per idv2v denoise step, real 0..1 from the worker). Every
         other stage is text-only (progress = None) — no fabricated %.
@@ -548,70 +487,15 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
         return
 
     await _scheduler.release("idv2v-worker", idv2v_gpu)
-    if _SKIP_UPSCALE:
-        # Diagnostic A/B: return the native idv2v output without the LTX
-        # spatial upscale, to check whether the upscaler causes flicker.
-        payload = {
-            "output_video": data["output_video"],
-            "frames_generated": data.get("frames_generated"),
-            "resolution": data.get("resolution"),
-            "gen_resolution": data.get("resolution"),
-            "upscaled": False,
-            "job_id": job_id,
-            "video_caption": data.get("video_caption"),
-            "enhanced_prompt": data.get("enhanced_prompt"),
-            "used_prompt": data.get("used_prompt"),
-        }
-        if not ws.closed:
-            await ws.send_json({"type": "complete", "request_id": request_id,
-                                "job_id": job_id, "payload": payload})
-        return
 
-    # LTX upscale (text-only stage; keep-alive so the socket stays alive).
-    target_w = max(16, int(body.get("width", 1280)))
-    target_h = max(16, int(body.get("height", 720)))
-    ltx_base = config.WORKERS["ltx-worker"]
-    ltx_gpu = await _scheduler.acquire("ltx-worker")
-    await wm.ensure("ltx-worker", device=_device_for("ltx-worker", ltx_gpu))
-    up_body = {"video_base64": data["output_video"], "width": target_w, "height": target_h,
-               "fps": body.get("fps", 24)}
-
-    async def _upscale():
-        async with session.post(f"{ltx_base}/video-creator/v1/upscale",
-                                json=up_body, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r2:
-            if r2.status >= 400:
-                return {"_error": (await r2.read())[:500].decode("utf-8", "replace")}
-            return await r2.json()
-
-    utask = asyncio.create_task(_upscale())
-    try:
-        while not utask.done():
-            await _send({"stage": "upscaling", "message": "Upscaling to full resolution...",
-                         "progress": None})
-            try:
-                await asyncio.wait_for(asyncio.shield(utask), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        up = utask.result()
-        if up.get("_error") or not up.get("video_base64"):
-            err = up.get("_error") or "upscale produced no video"
-            if not ws.closed:
-                await ws.send_json({"type": "error", "request_id": request_id, "error": err})
-            return
-        up_b64 = up["video_base64"]
-    except Exception as exc:
-        if not ws.closed:
-            await ws.send_json({"type": "error", "request_id": request_id, "error": str(exc)})
-        return
-
-    await _scheduler.release("ltx-worker", ltx_gpu)
+    # Restyle returns the native id-v2v output. The LTX spatial upscaler has been
+    # removed from the restyle path.
     payload = {
-        "output_video": up_b64,
+        "output_video": data["output_video"],
         "frames_generated": data.get("frames_generated"),
-        "resolution": f"{target_w}x{target_h}",
+        "resolution": data.get("resolution"),
         "gen_resolution": data.get("resolution"),
-        "upscaled": True,
+        "upscaled": False,
         "job_id": job_id,
         "video_caption": data.get("video_caption"),
         "enhanced_prompt": data.get("enhanced_prompt"),
@@ -708,8 +592,16 @@ async def handle_generic(req: web.Request) -> web.Response:
                 # Restyle chain acquires/releases its own GPUs (idv2v then ltx).
                 return await _restyle_chain(wm, session, token, body)
             try:
-                return await _with_gpu(_scheduler, wm, session, token,
-                                       worker, endpoint, body)
+                render = await _with_gpu(_scheduler, wm, session, token,
+                                         worker, endpoint, body)
+                # Post-chain: if the client asked for RIFE/upscale, hand the
+                # render output to the vp-worker /process stage (only when the
+                # render succeeded with a video). Returns the combined result.
+                if render.status < 400:
+                    posted = await postchain.apply(session, token, endpoint, body, render)
+                    if posted is not None:
+                        return posted
+                return render
             except QueueTimeout as exc:
                 return web.json_response({"error": str(exc)}, status=503)
         finally:
@@ -866,8 +758,85 @@ async def _reconcile_from_live_workers() -> None:
                 sorted(w_info), _scheduler.status()["gpus"])
 
 
+_REGISTRATION_BACKOFF_BASE = 5.0   # seconds; doubled per failed attempt
+_REGISTRATION_BACKOFF_MAX = 120.0  # per-wait cap once backoff is exhausted
+
+
+def _retry_after_from(exc: BaseException) -> float | None:
+    """Pull go-livepeer/Cloudflare `retry_after` (seconds) out of an HTTP
+    error body, if the gateway surfaced it as JSON."""
+    body = getattr(exc, "body", None)
+    if not isinstance(body, str) or not body:
+        return None
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    ra = data.get("retry_after") if isinstance(data, dict) else None
+    if isinstance(ra, (int, float)) and ra > 0:
+        return float(ra)
+    return None
+
+
+async def _register_with_retry() -> None:
+    """Register with the orchestrator, retrying on ANY failure so a transient
+    go-livepeer/Cloudflare 502 (or the local orchestrator still warming up past
+    its healthcheck) never crashes the whole stack. Honors the gateway's
+    ``retry_after`` when present, else exponential backoff capped at
+    ``_REGISTRATION_BACKOFF_MAX``. Runs in a background task: the HTTP server
+    comes up immediately (/health responds, so dependant workers start) and
+    registration completes the moment the orchestrator accepts it."""
+    global _registration
+    delay = _REGISTRATION_BACKOFF_BASE
+    attempt = 0
+    while True:
+        attempt += 1
+        gpu = LiveRunnerGPU(name=config.GPU_NAME,
+                            vram_mb=_gpu_vram_mb or config.DEFAULT_VRAM_MB)
+        try:
+            reg = await register_runner(
+                config.ORCHESTRATOR_URL,
+                secret=config.ORCHESTRATOR_SECRET,
+                runner_url=config.RUNNER_URL,
+                app=config.APP_ID,
+                mode="single-shot",
+                price=config.PRICE,
+                unit=config.PRICE_UNIT,
+                currency=config.PRICE_CURRENCY,
+                capacity=config.GPU_COUNT,
+                gpu=gpu,
+                label="restyle",
+                metadata=json.dumps({
+                    "capabilities": CAPABILITIES,
+                    "gpu_count": config.GPU_COUNT,
+                    "model_specs": _MODEL_SPECS,
+                    "models": MODELS,
+                    "ltx_up": False,
+                    "idv2v_up": False,
+                    "warm": None,
+                }, separators=(",", ":")),
+                heartbeat_interval_s=config.HEARTBEAT_INTERVAL_S,
+            )
+        except Exception as exc:
+            wait = _retry_after_from(exc)
+            if wait is None:
+                wait = min(delay, _REGISTRATION_BACKOFF_MAX)
+                delay = min(delay * 2, _REGISTRATION_BACKOFF_MAX)
+            logger.warning(
+                "orchestrator registration attempt %d failed (%s: %s); "
+                "retrying in %.0fs", attempt, type(exc).__name__, exc, wait)
+            await asyncio.sleep(wait)
+            continue
+        # NOTE: register_runner's .start() already sent the first heartbeat and
+        # spawned its own heartbeat loop — do NOT call .start() again (we'd
+        # duplicate the initial heartbeat and double the heartbeat loop).
+        _registration = reg
+        logger.info("Registered live-runner %s (app=%s)", reg.runner_id, config.APP_ID)
+        return
+
+
 async def on_startup(_app: web.Application) -> None:
-    global _session, _worker_manager, _registration, _ready, _scheduler
+    global _session, _worker_manager, _registration, _ready, _scheduler, _registration_task
     _session = aiohttp.ClientSession()
     _worker_manager = ResidentWorkerManager(
         transport=HttpWorkerTransport(_session, config.worker_token()),
@@ -892,41 +861,16 @@ async def on_startup(_app: web.Application) -> None:
     # first heartbeat already advertises specs for the actual card (not the env
     # default). Falls back to DEFAULT_VRAM_MB if the worker isn't up yet -- the
     # heartbeat loop will correct it as soon as detection succeeds.
-    gpu_meta, ltx_vram = await _poll_worker_gpu_info(_session)
+    ltx_vram = await _detect_ltx_vram_mb(_session)
     if ltx_vram:
         _apply_detected_vram(ltx_vram)
-    gpu = LiveRunnerGPU(name=config.GPU_NAME, vram_mb=_gpu_vram_mb or config.DEFAULT_VRAM_MB)
-    _registration = await register_runner(
-        config.ORCHESTRATOR_URL,
-        secret=config.ORCHESTRATOR_SECRET,
-        runner_url=config.RUNNER_URL,
-        app=config.APP_ID,
-        mode="single-shot",
-        price=config.PRICE,
-        unit=config.PRICE_UNIT,
-        currency=config.PRICE_CURRENCY,
-        # Advertise capacity = GPU count so the orchestrator allocates concurrent
-        # inputs that the scheduler spreads across all cards (default 1 would
-        # only ever let ONE generation through, wasting the multi-GPU scheduler).
-        capacity=config.GPU_COUNT,
-        gpu=gpu,
-        label="restyle",
-        metadata=json.dumps({
-            "capabilities": CAPABILITIES,
-            "gpu_count": config.GPU_COUNT,
-            "model_specs": _MODEL_SPECS,
-            "models": MODELS,
-            "gpu": gpu_meta,
-            "ltx_up": False,
-            "idv2v_up": False,
-            "warm": None,
-        }),
-        heartbeat_interval_s=config.HEARTBEAT_INTERVAL_S,
-    )
-    # NOTE: `main`'s register_runner already calls .start() (returns a started
-    # registration) — do NOT call .start() again or we'd duplicate the initial
-    # heartbeat and spawn a second heartbeat loop.
-    logger.info("Registered live-runner %s (app=%s)", _registration.runner_id, config.APP_ID)
+    # Register in the BACKGROUND with retry/backoff so a transient orchestrator
+    # 502 (or the local go-livepeer still warming up past its healthcheck)
+    # never crashes the whole stack: the HTTP server comes up immediately
+    # (/health responds, so dependant workers start), and registration
+    # completes the moment the orchestrator accepts it. Consumers of
+    # _registration already tolerate None while it's still pending.
+    _registration_task = asyncio.create_task(_register_with_retry())
 
     # Refresh heartbeat metadata each beat from the swap policy + live worker /health.
     asyncio.create_task(_refresh_metadata_loop())
@@ -976,7 +920,7 @@ async def _refresh_metadata_loop() -> None:
             if _worker_manager is not None and _registration is not None:
                 # Keep advertised specs in sync with the actual GPU VRAM in case
                 # the worker came up after startup (or its VRAM changed).
-                gpu_meta, ltx_vram = await _poll_worker_gpu_info(_session)
+                ltx_vram = await _detect_ltx_vram_mb(_session)
                 if ltx_vram:
                     _apply_detected_vram(ltx_vram)
                 # Plan B: reconcile the advisory GPU map from each worker's
@@ -992,18 +936,27 @@ async def _refresh_metadata_loop() -> None:
                 meta["capabilities"] = CAPABILITIES
                 meta["model_specs"] = _MODEL_SPECS
                 meta["models"] = MODELS
-                meta["gpu"] = gpu_meta
                 # The registration is an in-process object owned by this runner;
                 # set its payload metadata so the next heartbeat advertises the
                 # current warm-model + worker up/down status. (No SDK change needed.)
-                _registration._metadata = json.dumps(meta)
+                _registration._metadata = json.dumps(meta, separators=(",", ":"))
         except Exception:
             logger.warning("metadata refresh failed", exc_info=True)
         await asyncio.sleep(config.HEARTBEAT_INTERVAL_S)
 
 
 async def on_cleanup(_app: web.Application) -> None:
-    global _registration, _session
+    global _registration, _session, _registration_task
+    task = _registration_task
+    _registration_task = None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("registration task raised during shutdown", exc_info=True)
     if _registration is not None:
         try:
             await _registration.close()

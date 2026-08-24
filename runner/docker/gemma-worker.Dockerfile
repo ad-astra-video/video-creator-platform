@@ -77,7 +77,19 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
       -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -L/usr/local/cuda/lib64/stubs" && \
     cmake --build build --config Release -j${BUILD_JOBS} --target llama-server && \
     install -m 0755 build/bin/llama-server /usr/local/bin/llama-server && \
+    # llama-server is a thin launcher that loads libllama-server-impl.so + the
+    # ggml/mtmd .so sets. Copy EVERY build/bin shared-lib artifact (the *.so*
+    # glob catches the versioned NAMEs as well: *.so alone only copies the
+    # dangling dev symlink, not the real .so.0 payload, and an explicit
+    # libllama*/libggml* list misses libmtmd). Missing any of these kills the
+    # launcher at exec with "...: cannot open shared object file".
+    cp -a build/bin/*.so* /usr/local/bin/ && \
     rm -rf /tmp/llama.cpp
+
+# llama-server's launcher has NO $ORIGIN rpath and looks only on the loader's
+# default search path — so export the dir the .so set was copied into, or it
+# dies at exec with "libllama-server-impl.so: cannot open shared object file".
+ENV LD_LIBRARY_PATH="/usr/local/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Vulkan loader bump. Ubuntu 24.04's libvulkan1 is 1.3.275, but the host
 # NVIDIA 580 driver's Vulkan ICD advertises API 1.4.312; the 1.3 loader cannot
