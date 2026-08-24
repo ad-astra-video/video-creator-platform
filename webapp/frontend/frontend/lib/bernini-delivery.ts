@@ -198,3 +198,54 @@ export function berniniRunnerT2VBody(
   }
   return body
 }
+
+/**
+ * Motion-preserving Bernini video edit (v2v). Mirrors t2v body construction but adds
+ * the source clip the worker edits in place (skip the FLUX.2 first-frame accept).
+ */
+export function berniniRunnerV2VBody(
+  prompt: string,
+  sourceVideo: string,
+  target: BerniniDeliveryTarget,
+  opts?: { negativePrompt?: string; seed?: number },
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    ...berniniRunnerT2VBody(prompt, target, opts),
+    source_video: sourceVideo,
+  }
+  return body
+}
+
+/**
+ * Reference-image → video (r2v, 1.3B). `references` are base64-encoded reference
+ * images; the worker conditions the edit on them (multi-reference native to 1.3B).
+ */
+export function berniniRunnerR2VBody(
+  prompt: string,
+  references: string[],
+  target: BerniniDeliveryTarget,
+  opts?: { negativePrompt?: string; seed?: number },
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    ...berniniRunnerT2VBody(prompt, target, opts),
+    references,
+  }
+  return body
+}
+
+/**
+ * The vp-worker `/process` combined post body derived from a delivery target's rails.
+ * Produced independently of the render payload so a caller can post-process an
+ * EXISTING clip (Edit Video / standalone Process) without re-rendering.
+ */
+export interface BerniniProcessPayload {
+  fps_boost?: { target_fps: number; mode: FpsBoostMode }
+  upscale?: { scale: 4; final: UpscaleFinal }
+}
+
+export function berniniProcessFor(target: {
+  resolution: BerniniResolution
+  fps: number
+}): BerniniProcessPayload {
+  return berniniPostFor(target) as BerniniProcessPayload
+}

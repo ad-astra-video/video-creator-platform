@@ -38,6 +38,16 @@ const TASK_LABELS: Record<string, string> = {
   edit: 'Masked Edit',
   'extract-conditioning': 'Extract Conditioning',
   chat: 'Chat',
+  // Bernini generate/edit rails (wan-worker) — surfaced as their own capability
+  // labels so the runners list / capability chips read as friendly text instead
+  // of the raw ids.
+  'bernini-t2v': 'Bernini Text-to-Video',
+  'bernini-v2v': 'Bernini Video Edit',
+  'bernini-r2v': 'Bernini Reference Video',
+  process: 'Video Processing',
+  'fps-boost': 'FPS Boost',
+  upscale: 'Upscale',
+  ffmpeg: 'FFmpeg',
 }
 
 /** Price shape used by the runners list UI (superset of the selection-only RunnerDto.price_info). */

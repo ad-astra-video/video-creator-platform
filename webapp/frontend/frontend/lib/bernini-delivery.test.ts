@@ -6,6 +6,9 @@ import {
   berniniResolutionOptions,
   berniniPostFor,
   berniniRunnerT2VBody,
+  berniniRunnerV2VBody,
+  berniniRunnerR2VBody,
+  berniniProcessFor,
   berniniDeliveryLabel,
   berniniTaskFor,
   BERNINI_NATIVE_FPS,
@@ -142,5 +145,59 @@ describe('berniniTaskFor', () => {
     expect(berniniTaskFor('t2v')).toEqual({ task: 'bernini-t2v', capability: 'bernini-t2v' })
     expect(berniniTaskFor('v2v')).toEqual({ task: 'bernini-v2v', capability: 'bernini-v2v' })
     expect(berniniTaskFor('r2v')).toEqual({ task: 'bernini-r2v', capability: 'bernini-r2v' })
+  })
+})
+
+describe('berniniRunnerV2VBody', () => {
+  const base: BerniniDeliveryTarget = { engine: 'bernini-1.3b', resolution: '480p', fps: 16, duration: 3 }
+
+  it('adds source_video to the t2v body at native delivery', () => {
+    const body = berniniRunnerV2VBody('make it sunset', 'AAABase64VideoAA', base)
+    expect(body.source_video).toBe('AAABase64VideoAA')
+    expect(body.resolution).toBe('480p')
+    expect(body.fps).toBe(16)
+    expect(body.post).toBeUndefined()
+  })
+
+  it('carries the post payload for above-native delivery', () => {
+    const body = berniniRunnerV2VBody('make it sunset', 'AAABase64VideoAA', { ...base, resolution: '1080p', fps: 30 })
+    expect(body.post).toEqual({
+      fps_boost: { target_fps: 30, mode: 'preserve_motion' },
+      upscale: { scale: 4, final: '1080' },
+    })
+  })
+})
+
+describe('berniniRunnerR2VBody', () => {
+  const base: BerniniDeliveryTarget = { engine: 'bernini-1.3b', resolution: '480p', fps: 16, duration: 3 }
+
+  it('attaches reference images under references[]', () => {
+    const refs = ['ref1base64', 'ref2base64']
+    const body = berniniRunnerR2VBody('compose around these', refs, base)
+    expect(body.references).toEqual(refs)
+  })
+
+  it('still renders natively and honors seed', () => {
+    const body = berniniRunnerR2VBody('compose', ['ref'], { ...base, duration: 5 }, { seed: 7 })
+    expect(body.references).toEqual(['ref'])
+    expect(body.num_frames).toBe(80)
+    expect(body.seed).toBe(7)
+  })
+})
+
+describe('berniniProcessFor', () => {
+  it('native delivery => empty process payload', () => {
+    expect(berniniProcessFor({ resolution: '480p', fps: 16 })).toEqual({})
+  })
+  it('derives the vp-worker /process post body from a delivery target', () => {
+    expect(berniniProcessFor({ resolution: '1440p', fps: 60 })).toEqual({
+      fps_boost: { target_fps: 60, mode: 'preserve_motion' },
+      upscale: { scale: 4, final: '1440' },
+    })
+  })
+  it('raw-4x => upscale with final raw only', () => {
+    expect(berniniProcessFor({ resolution: 'raw-4x', fps: 16 })).toEqual({
+      upscale: { scale: 4, final: 'raw' },
+    })
   })
 })

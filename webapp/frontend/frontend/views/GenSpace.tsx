@@ -53,6 +53,8 @@ import { RetakePanel } from '../components/RetakePanel'
 import { ExtendPanel } from '../components/ExtendPanel'
 import { RestylePanel } from '../components/RestylePanel'
 import type { RestylePanelHandle } from '../components/RestylePanel'
+import { EditVideoPanel } from '../components/EditVideoPanel'
+import type { EditVideoPanelHandle } from '../components/EditVideoPanel'
 import { ImageEditPanel } from '../components/ImageEditPanel'
 import type { ImageEditCompleteMeta, ImageEditPanelHandle } from '../components/ImageEditPanel'
 import { ICLoraPanel, CONDITIONING_TYPES } from '../components/ICLoraPanel'
@@ -76,6 +78,7 @@ function AssetCard({
   onExtend,
   onIcLora,
   onRestyle,
+  onEditVideo,
   onToggleFavorite
 }: {
   asset: Asset
@@ -88,6 +91,7 @@ function AssetCard({
   onExtend?: (asset: Asset) => void
   onIcLora?: (asset: Asset) => void
   onRestyle?: (asset: Asset) => void
+  onEditVideo?: (asset: Asset) => void
   onToggleFavorite?: () => void
 }) {
   const hoverVideoRef = useRef<HTMLVideoElement>(null)
@@ -114,6 +118,7 @@ function AssetCard({
     ...(asset.type === 'video' && onExtend ? [{ key: 'extend', label: 'Extend', icon: <MoveHorizontal className="h-3.5 w-3.5" />, run: () => onExtend(asset) }] : []),
     ...(asset.type === 'video' && onIcLora ? [{ key: 'ic-lora', label: 'IC-LoRA', icon: <Sparkles className="h-3.5 w-3.5" />, run: () => onIcLora(asset) }] : []),
     ...(asset.type === 'video' && onRestyle ? [{ key: 'restyle', label: 'Restyle', icon: <Wand2 className="h-3.5 w-3.5" />, run: () => onRestyle(asset) }] : []),
+    ...(asset.type === 'video' && onEditVideo ? [{ key: 'edit', label: 'Edit Video', icon: <MoveHorizontal className="h-3.5 w-3.5" />, run: () => onEditVideo(asset) }] : []),
   ]
 
   useEffect(() => {
@@ -711,7 +716,7 @@ function CustomLoraField({ value, onChange }: {
   )
 }
 
-type GenSpaceMode = 'image' | 'video' | 'retake' | 'extend' | 'ic-lora' | 'restyle'
+type GenSpaceMode = 'image' | 'video' | 'retake' | 'extend' | 'ic-lora' | 'restyle' | 'edit'
 
 // Resolve a selected resolution option key to {width,height}, or undefined for "original"
 // (backend then uses the source resolution).
@@ -987,6 +992,8 @@ function PromptBar({
     }
   }
 
+  const masterTask: 'generate' | 'edit' = mode === 'edit' ? 'edit' : 'generate'
+
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-visible relative">
       {/* Thin image-edit progress bar pinned to the top of the prompt bar. */}
@@ -998,6 +1005,37 @@ function PromptBar({
           />
         </div>
       )}
+      {/* Master task switcher: Generate | Edit. Prominent top-level task selector. */}
+      <div className="flex items-center gap-0.5 px-1.5 pt-1.5">
+        <div className="flex items-center gap-0.5 rounded-lg bg-zinc-950/70 border border-zinc-800 p-0.5">
+          <button
+            type="button"
+            onClick={() => { if (mode === 'edit') onModeChange('video') }}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-semibold transition-colors ${
+              masterTask === 'generate' ? 'bg-white text-black' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
+            }`}
+          >
+            <Video className="h-3.5 w-3.5" />
+            Generate
+          </button>
+          <button
+            type="button"
+            onClick={() => onModeChange('edit')}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-semibold transition-colors ${
+              masterTask === 'edit' ? 'bg-white text-black' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
+            }`}
+          >
+            <Wand2 className="h-3.5 w-3.5" />
+            Edit
+          </button>
+        </div>
+        {masterTask === 'edit' && (
+          <span className="text-[10px] text-zinc-500 ml-1">
+            Edit a source video — v2v (motion-preserving) or r2v (reference-guided)
+          </span>
+        )}
+      </div>
+
       {/* Top row: Image ref | Prompt | Generate */}
       <div className="flex items-start">
         {/* Input image drop zone — video mode (I2V) or image mode (edit source) */}
@@ -1099,6 +1137,9 @@ function PromptBar({
       
       {/* Bottom row: Mode selector + Settings */}
       <div className="flex items-center gap-0.5 px-1.5 py-1.5 border-t border-zinc-800/60 text-xs text-zinc-400">
+        {mode === 'edit' && <div className="flex-1" />}
+        {mode !== 'edit' && (
+          <>
         {/* Mode dropdown */}
         <SettingsDropdown
           title="MODE"
@@ -1109,7 +1150,7 @@ function PromptBar({
             { value: 'video', label: 'Generate Videos', icon: <Video className="h-4 w-4" /> },
             { value: 'retake', label: 'Retake', icon: <Scissors className="h-4 w-4" /> },
             { value: 'restyle', label: 'Restyle', icon: <Wand2 className="h-4 w-4" /> },
-            { value: 'extend', label: 'Extend', icon: <MoveHorizontal className="h-4 w-4" /> },
+            { value: 'extend', label: 'Extend', icon: <MoveHorizontal className="h-3.5 w-3.5" /> },
             ...(canUseIcLora ? [{ value: 'ic-lora', label: 'IC-LoRA', icon: <Sparkles className="h-4 w-4" /> }] : []),
           ]}
           trigger={
@@ -1581,6 +1622,9 @@ function PromptBar({
                 />
               )}
             </div>
+          </>
+        )}
+
           </>
         )}
 
@@ -2078,6 +2122,14 @@ export function GenSpace() {
   // take thumbnail so the returned video can actually be watched (plays with controls
   // in a modal, with prev/next across takes) instead of just being silently selected.
   const [restylePreviewAttemptId, setRestylePreviewAttemptId] = useState<string | null>(null)
+
+  // Edit Video (Bernini v2v/r2v rail) state — source video + imperative handle driven
+  // by the main prompt bar (mirrors the restyle panel pattern).
+  const editVideoPanelRef = useRef<EditVideoPanelHandle>(null)
+  const [editVideoInitial, setEditVideoInitial] = useState<{
+    videoPath: string | null
+  }>({ videoPath: null })
+  const [editVideoPanelKey, setEditVideoPanelKey] = useState(0)
 
   const [retakeInitial, setRetakeInitial] = useState<{
     videoPath: string | null
@@ -3189,6 +3241,14 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       return
     }
 
+    if (mode === 'edit') {
+      if (!editVideoInitial.videoPath) return
+      setPrompt(prompt)
+      await writeRecoveryContext({ prompt })
+      await editVideoPanelRef.current?.runEdit(prompt)
+      return
+    }
+
     if (mode === 'restyle') {
       if (restyleTab === 'image') {
         // First step of the restyle workflow: restyle the first frame from the main
@@ -3408,6 +3468,15 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     setRestylePanelKey((prev) => prev + 1)
   }
 
+  // Edit Video (Bernini v2v/r2v): switch to the Edit Video master-task panel seeded
+  // with the selected video as its source.
+  const handleEditVideo = (videoAsset: Asset) => {
+    setMode('edit')
+    setPrompt('')
+    setEditVideoInitial({ videoPath: videoAsset.path })
+    setEditVideoPanelKey((prev) => prev + 1)
+  }
+
   const handleExtend = (videoAsset: Asset) => {
     setMode('extend')
     setPrompt('')
@@ -3431,6 +3500,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     setIcLoraPanelKey((prev) => prev + 1)
   }
 
+  const isEditMode = mode === 'edit'
   const isRetakeMode = mode === 'retake'
   const isExtendMode = mode === 'extend'
   const isIcLoraMode = mode === 'ic-lora'
@@ -3452,7 +3522,9 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     }).hasCompatibleOptions
     && !noRunnerVideo
   )
-  const canSubmit = !isOtherGenerationRunning && (isRetakeMode
+  const canSubmit = !isOtherGenerationRunning && (isEditMode
+    ? !!editVideoInitial.videoPath && !!prompt.trim()
+    : isRetakeMode
     ? retakeInput.ready && !!retakeInput.videoPath && !isRetaking
     : isExtendMode
       ? extendInput.ready && !!extendInput.videoPath && !isExtending
@@ -3464,17 +3536,19 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             ? restyleFrameState.canRestyle && !!prompt.trim() && !restyleFrameState.isStyling && !isRestyling
             : restyleInput.ready && !!restyleInput.videoPath && !!restyleInput.stylizedImagePath && !isRestyling
           : !!prompt.trim() && hasCompatibleVideoSettings)
-  const promptButtonLabel = isRetakeMode ? 'Retake' : isExtendMode ? 'Extend' : isIcLoraMode ? 'Generate' : isRestyleMode ? (restyleTab === 'image' ? 'Restyle Image' : 'Restyle') : 'Generate'
-  const promptButtonIcon = isRetakeMode
-    ? <Scissors className="h-3.5 w-3.5" />
-    : isExtendMode
-      ? <MoveHorizontal className="h-3.5 w-3.5" />
-      : isIcLoraMode
-        ? <Sparkles className="h-3.5 w-3.5" />
-        : isRestyleMode
-          ? <Wand2 className="h-3.5 w-3.5" />
+  const promptButtonLabel = isEditMode ? 'Edit' : isRetakeMode ? 'Retake' : isExtendMode ? 'Extend' : isIcLoraMode ? 'Generate' : isRestyleMode ? (restyleTab === 'image' ? 'Restyle Image' : 'Restyle') : 'Generate'
+  const promptButtonIcon = isEditMode
+    ? <Wand2 className="h-3.5 w-3.5" />
+    : isRetakeMode
+      ? <Scissors className="h-3.5 w-3.5" />
+      : isExtendMode
+        ? <MoveHorizontal className="h-3.5 w-3.5" />
+        : isIcLoraMode
+          ? <Sparkles className="h-3.5 w-3.5" />
+          : isRestyleMode
+            ? <Wand2 className="h-3.5 w-3.5" />
     : <Sparkles className={`h-3.5 w-3.5 ${isGenerating ? 'animate-pulse' : ''}`} />
-  const promptGenerating = isRetakeMode ? isRetaking : isExtendMode ? isExtending : isIcLoraMode ? isIcLoraGenerating : isRestyleMode ? (restyleTab === 'image' ? restyleFrameState.isStyling : isRestyling) : isGenerating
+  const promptGenerating = isEditMode ? false : isRetakeMode ? isRetaking : isExtendMode ? isExtending : isIcLoraMode ? isIcLoraGenerating : isRestyleMode ? (restyleTab === 'image' ? restyleFrameState.isStyling : isRestyling) : isGenerating
   
   // Close size menu on click outside
   useEffect(() => {
@@ -3694,6 +3768,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                   onExtend={handleExtend}
                   onIcLora={!forceApiGenerations ? handleIcLora : undefined}
                   onRestyle={handleRestyle}
+                  onEditVideo={handleEditVideo}
                   onToggleFavorite={() => currentProjectId && toggleFavorite(currentProjectId, asset.id)}
                 />
               ))}
@@ -3731,9 +3806,24 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         </div>
       )}
 
-      {mode === 'restyle' && (
-        <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
-          <RestylePanel
+            {mode === 'edit' && (
+              <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+                <EditVideoPanel
+                  ref={editVideoPanelRef}
+                  initialVideoPath={editVideoInitial.videoPath}
+                  resetKey={editVideoPanelKey}
+                  fillHeight
+                  engine={settings.model === 'bernini-14b' ? 'bernini-14b' : 'bernini-1.3b'}
+                  onSourceChange={({ videoPath, ready }) => {
+                    if (ready) setEditVideoInitial((prev) => ({ ...prev, videoPath }))
+                  }}
+                />
+              </div>
+            )}
+
+            {mode === 'restyle' && (
+              <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+                <RestylePanel
             ref={restylePanelRef}
             initialVideoPath={restyleInitial.videoPath}
             initialImagePath={restyleInitial.stylizedImagePath}
