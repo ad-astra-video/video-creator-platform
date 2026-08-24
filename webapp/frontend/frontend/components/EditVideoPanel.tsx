@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback, forwardRef, useImperativeHandle } from 'react'
+import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle } from 'react'
 import { VideoPreviewPanel } from './VideoPreviewPanel'
 import { PostProcessControls } from './PostProcessControls'
 import { useBerniniEdit } from '../hooks/use-bernini-edit'
+import { getBlobUrl, isWebPath } from '../lib/runtime/web-store'
+import { measureVideoFps } from '../lib/video-fps'
 import { Loader2, Clapperboard, Wand2, Image as ImageIcon } from 'lucide-react'
 import {
   BERNINI_NATIVE_FPS,
@@ -50,11 +52,45 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
   ref,
 ) {
   const { submitBerniniEdit, isEditing, editStatus, editError, berniniEditResult } = useBerniniEdit()
+  // Parent's onSourceChange may be an unstable inline callback (a fresh identity every
+  // render). Holding it in a ref keeps handleSourceChange stable, so VideoPreviewPanel's
+  // onSourceChange effect dep never churns and we avoid a setState-in-effect update loop.
+  const onSourceChangeRef = useRef(onSourceChange)
+  useEffect(() => {
+    onSourceChangeRef.current = onSourceChange
+  }, [onSourceChange])
+
   const [videoPath, setVideoPath] = useState<string | null>(initialVideoPath || null)
   const [goal, setGoal] = useState<EditGoal>('v2v')
   // r2v reference images as web:// asset paths (1.3B multi-reference).
   const [referencePaths, setReferencePaths] = useState<string[]>([])
   const [post, setPost] = useState<BerniniProcessPayload>({})
+  // Source clip's measured frame rate (best-effort). When > native and the user
+  // hasn't set an explicit fps_boost, we deliver at this rate so the edit MATCHES
+  // the input (motion-preserving RIFE, not a fixed 16fps output).
+  const [sourceFps, setSourceFps] = useState<number | null>(null)
+
+  // Probe the source video's fps whenever the source changes (web:// -> blob URL,
+  // or a plain http/blob URL). Pure best-effort: null falls back to native 16fps.
+  useEffect(() => {
+    let cancelled = false
+    const src = videoPath ?? initialVideoPath
+    if (!src) {
+      setSourceFps(null)
+      return
+    }
+    const url = isWebPath(src) ? getBlobUrl(src) : src
+    if (!url || !/^(blob:|https?:|data:)/.test(String(url))) {
+      setSourceFps(null)
+      return
+    }
+    measureVideoFps(url).then((fps) => {
+      if (!cancelled) setSourceFps(fps)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [videoPath, initialVideoPath])
 
   const effectiveProcessing = isProcessing || isEditing
   const effectiveStatus = processingStatus || editStatus
@@ -65,14 +101,18 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
 
   const handleSourceChange = useCallback((data: { videoPath: string | null }) => {
     setVideoPath(data.videoPath)
-    onSourceChange?.({ videoPath: data.videoPath, ready: !!data.videoPath })
-  }, [onSourceChange])
+    onSourceChangeRef.current?.({ videoPath: data.videoPath, ready: !!data.videoPath })
+  }, [])
 
   useImperativeHandle(ref, () => ({
     runEdit: async (prompt, opts) => {
       const op = opts?.goal ?? goal
       const eng = opts?.engine ?? engine
-      const fps = post.fps_boost?.target_fps ?? BERNINI_NATIVE_FPS
+      // Default the delivery fps to the SOURCE clip's fps so an edit's output matches
+      // the input (motion-preserving RIFE boost). An explicit fps_boost (user set it)
+      // always wins; otherwise fall back to native 16fps.
+      const fps = post.fps_boost?.target_fps
+        ?? (sourceFps && sourceFps > BERNINI_NATIVE_FPS ? sourceFps : BERNINI_NATIVE_FPS)
       const resolution = post.upscale ? resolutionForPost(post) : BERNINI_NATIVE_RESOLUTION
       await submitBerniniEdit({
         operation: op,
@@ -85,7 +125,7 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
         duration: 3,
       })
     },
-  }), [goal, engine, post, videoPath, initialVideoPath, referencePaths, submitBerniniEdit])
+  }), [goal, engine, post, videoPath, initialVideoPath, referencePaths, sourceFps, submitBerniniEdit])
 
   return (
     <div className="flex flex-col gap-3">
