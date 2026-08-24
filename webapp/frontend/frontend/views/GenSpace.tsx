@@ -1036,6 +1036,7 @@ function PromptBar({
         <span className="mx-1.5 h-3.5 w-px bg-zinc-700/60" aria-hidden="true" />
         <SettingsDropdown
           title={masterTask === 'generate' ? 'Generate' : 'Edit'}
+          portal
           value={mode}
           onChange={(v) => onModeChange(v as GenSpaceMode)}
           options={
