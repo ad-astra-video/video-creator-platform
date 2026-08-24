@@ -191,4 +191,15 @@ def build_model_specs(vram_mb: int) -> list[dict]:
                 "display_name": "Bernini 1.3B",
             },
         },
+        {
+            # Bernini 14B (Wan2.2-T2V-A14B), fp8-quantised on-box (69G at
+            # /srv/video-creator/models/Bernini-R-Diffusers). Same minimal marker
+            # pattern as 1.3B - no matrix (frontend derives grid from
+            # lib/bernini-delivery.ts). Advertised so the picker can offer the
+            # higher-fidelity "detailed" engine; 14B rejects >1 r2v reference.
+            "pipeline": "bernini-14b",
+            "spec": {
+                "display_name": "Bernini 14B",
+            },
+        },
     ]
