@@ -86,7 +86,7 @@ export function useExtend() {
         }, {
           onProgress: (ev) => {
             // Live stage text over SSE (encoding / generating / decoding / finalizing).
-            if (ev.message) setState(prev => ({ ...prev, extendStatus: ev.message }))
+            if (ev.message) setState(prev => ({ ...prev, extendStatus: String(ev.message) }))
             else if (ev.stage === 'generating') setState(prev => ({ ...prev, extendStatus: 'Extending...' }))
           },
         })
