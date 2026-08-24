@@ -55,6 +55,7 @@ import { RestylePanel } from '../components/RestylePanel'
 import type { RestylePanelHandle } from '../components/RestylePanel'
 import { EditVideoPanel } from '../components/EditVideoPanel'
 import type { EditVideoPanelHandle } from '../components/EditVideoPanel'
+import { EditTaskContainer } from '../components/EditTaskContainer'
 import { ImageEditPanel } from '../components/ImageEditPanel'
 import type { ImageEditCompleteMeta, ImageEditPanelHandle } from '../components/ImageEditPanel'
 import { ICLoraPanel, CONDITIONING_TYPES } from '../components/ICLoraPanel'
@@ -3507,6 +3508,25 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   const isExtendMode = mode === 'extend'
   const isIcLoraMode = mode === 'ic-lora'
   const isRestyleMode = mode === 'restyle'
+
+  // Quick-pick source swap for the Edit master-task subtasks. Reuses the same
+  // seed-a-panel path as clicking an asset in the project grid (set*Initial +
+  // bump the panel key), so the shared left rail swaps the ACTIVE subtask's
+  // source video. setMode is a no-op here (already in that mode).
+  const quickPickVideo = useCallback((asset: Asset) => {
+    if (mode === 'edit') handleEditVideo(asset)
+    else if (mode === 'restyle') handleRestyle(asset)
+    else if (mode === 'retake') handleRetake(asset)
+    else if (mode === 'extend') handleExtend(asset)
+    else if (mode === 'ic-lora') handleIcLora(asset)
+  }, [mode, handleEditVideo, handleRestyle, handleRetake, handleExtend, handleIcLora])
+
+  // Restyle-only: quick-picking an image sets it as the stylized first frame
+  // (the RestylePanel resetKey effect re-hydrates it from restyleInitial).
+  const quickPickRestyleImage = useCallback((asset: Asset) => {
+    setRestyleInitial(prev => ({ ...prev, stylizedImagePath: asset.path }))
+    setRestylePanelKey(prev => prev + 1)
+  }, [])
   // Livepeer video is the webapp's ONLY video backend: when it is enabled (a Discovery URL is
   // configured) and discovery has settled with no capable runner, the Generate button must be
   // disabled — "disabled only when there are no runners available when Livepeer is enabled".
@@ -3795,6 +3815,11 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
 
       {mode === 'retake' && (
         <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+          <EditTaskContainer
+            assets={activeProject?.assets}
+            activeVideoPath={retakeInitial.videoPath}
+            onPickVideo={quickPickVideo}
+          >
           <RetakePanel
             initialVideoPath={retakeInitial.videoPath}
             initialDuration={retakeInitial.duration}
@@ -3805,11 +3830,17 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             enforceApiConstraints={!isLocalMode}
             onChange={setRetakeInput}
           />
+          </EditTaskContainer>
         </div>
       )}
 
             {mode === 'edit' && (
               <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+                <EditTaskContainer
+                  assets={activeProject?.assets}
+                  activeVideoPath={editVideoInitial.videoPath}
+                  onPickVideo={quickPickVideo}
+                >
                 <EditVideoPanel
                   ref={editVideoPanelRef}
                   initialVideoPath={editVideoInitial.videoPath}
@@ -3820,16 +3851,24 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                     if (ready) setEditVideoInitial((prev) => ({ ...prev, videoPath }))
                   }}
                 />
+                </EditTaskContainer>
               </div>
             )}
 
             {mode === 'restyle' && (
               <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+                <EditTaskContainer
+                  assets={activeProject?.assets}
+                  activeVideoPath={restyleInitial.videoPath}
+                  activeImagePath={restyleInitial.stylizedImagePath}
+                  showImages
+                  onPickVideo={quickPickVideo}
+                  onPickImage={quickPickRestyleImage}
+                >
                 <RestylePanel
             ref={restylePanelRef}
             initialVideoPath={restyleInitial.videoPath}
             initialImagePath={restyleInitial.stylizedImagePath}
-            assets={activeProject?.assets}
             resetKey={restylePanelKey}
             fillHeight
             activeTab={restyleTab}
@@ -3920,11 +3959,17 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
               )}
             </div>
           )}
+          </EditTaskContainer>
         </div>
       )}
 
       {mode === 'extend' && (
         <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+          <EditTaskContainer
+            assets={activeProject?.assets}
+            activeVideoPath={extendInitial.videoPath}
+            onPickVideo={quickPickVideo}
+          >
           <ExtendPanel
             initialVideoPath={extendInitial.videoPath}
             initialDuration={extendInitial.duration}
@@ -3935,6 +3980,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             enforceApiConstraints={!isLocalMode}
             onChange={setExtendInput}
           />
+          </EditTaskContainer>
         </div>
       )}
 
@@ -3942,6 +3988,11 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         // Extra bottom clearance (vs 160px elsewhere): the floating panel here also carries the
         // selected-IC-LoRA info banner, so reserve room so it can't cover the panel's bottom bar.
         <div className="absolute inset-x-0 top-0 bottom-[210px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+          <EditTaskContainer
+            assets={activeProject?.assets}
+            activeVideoPath={icLoraInitial.videoPath}
+            onPickVideo={quickPickVideo}
+          >
           <ICLoraPanel
             initialVideoPath={icLoraInitial.videoPath}
             resetKey={icLoraPanelKey}
@@ -3963,6 +4014,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             outputVideoPath={icLoraResult?.videoPath || null}
             onChange={setIcLoraInput}
           />
+          </EditTaskContainer>
           <LoraLibraryModal
             open={libraryModalOpen}
             onClose={() => setLibraryModalOpen(false)}

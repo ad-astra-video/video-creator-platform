@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useRef, useMemo, forwardRef, useImperativeHandle } from 'react'
+﻿import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle } from 'react'
 import { VideoPreviewPanel } from './VideoPreviewPanel'
 import { validateVideoSource } from '../lib/video-constraints'
 import { webAssetUrl } from '../lib/file-url'
@@ -7,9 +7,8 @@ import { ApiClient } from '../lib/api-client'
 import { resolveRunner, segmentSubjectViaRunner } from '../lib/direct-transport'
 import { ImageEditPanel } from './ImageEditPanel'
 import type { ImageEditPanelHandle, ImageEditCompleteMeta } from './ImageEditPanel'
-import { Image, X, Loader2, Check, Film, Wand2, Upload, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Image, X, Loader2, Check, Film, Wand2, Upload } from 'lucide-react'
 import { logger } from '../lib/logger'
-import type { Asset } from '../types/project-model'
 
 // Restyle panel for the two-step identity-preserving workflow:
 //   1. Drop a video  ->  its first frame is extracted automatically
@@ -92,7 +91,6 @@ interface RestylePanelProps {
   initialImagePath?: string | null
   // Quick-pick candidates drawn from the project's asset library. Videos load as the
   // restyle source; images set the stylized first-frame directly.
-  assets?: Asset[]
   resetKey?: number
   isProcessing?: boolean
   processingStatus?: string
@@ -119,7 +117,6 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   {
     initialVideoPath,
     initialImagePath,
-    assets,
     resetKey,
     isProcessing = false,
     processingStatus = '',
@@ -156,10 +153,6 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   const [stylingError, setStylingError] = useState<string | null>(null)
   const [frameEditProgress, setFrameEditProgress] = useState<{ step: number; totalSteps: number } | null>(null)
 
-  // Quick-pick asset sidebar collapsed state (left rail).
-  const [quickPickOpen, setQuickPickOpen] = useState(true)
-
-
   const videoKnownRef = useRef<string | null>(null)
   const stylizedInputRef = useRef<HTMLInputElement>(null)
   // The embedded ImageEditPanel performs the actual first-frame restyling.
@@ -182,18 +175,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     setTab('video')
   }
 
-  // Quick-pick: bump the token with a chosen video path to force VideoPreviewPanel
-  // to load that source (mirrors drop/browse).
-  const [videoRequest, setVideoRequest] = useState<{ path: string; token: number } | null>(null)
 
-  const quickPickVideos = useMemo(
-    () => (assets || []).filter(a => a.type === 'video'),
-    [assets],
-  )
-  const quickPickImages = useMemo(
-    () => (assets || []).filter(a => a.type === 'image'),
-    [assets],
-  )
 
   // Sync the controlled activeTab from the parent (e.g. when entering restyle mode).
   useEffect(() => {
@@ -205,21 +187,6 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
     onTabChange?.(tab)
   }, [onTabChange])
 
-  const pickQuickVideo = useCallback((path: string) => {
-    setVideoRequest(prev => ({ path, token: (prev?.token ?? 0) + 1 }))
-  }, [])
-
-  const pickQuickImage = useCallback((asset: Asset) => {
-    // Setting the stylized first frame directly (bypasses extract+restyle) and treat
-    // it as accepted so the panel is ready to run the restyle.
-    setStylizedImagePath(asset.path)
-    setCandidates([])
-    setActiveCandidate(null)
-    setExtractedFramePath(null)
-    // Jump to the accepted image first, then let the user switch to the video.
-    setTab('image')
-    onAccept?.(asset.path, videoPath)
-  }, [videoPath, onAccept, setTab])
 
   const handleSourceChange = useCallback(async (data: { videoPath: string | null; videoDuration: number; width: number; height: number }) => {
     setVideoPath(data.videoPath)
@@ -458,91 +425,6 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
   )
 
   return (
-    <div className="flex-1 flex min-h-0 gap-3">
-      {/* Collapsible quick-pick asset sidebar (left) */}
-      <div
-        className={`flex-shrink-0 flex flex-col min-h-0 rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden transition-all ${
-          quickPickOpen ? 'w-40' : 'w-9'
-        }`}
-      >
-        <div className="flex items-center justify-between px-1.5 py-1.5 flex-shrink-0">
-          {quickPickOpen && (
-            <span className="text-[10px] uppercase tracking-wide text-zinc-500 truncate">Quick pick</span>
-          )}
-          <button
-            type="button"
-            onClick={() => setQuickPickOpen(o => !o)}
-            title={quickPickOpen ? 'Hide quick-pick assets' : 'Show quick-pick assets'}
-            className="p-1 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
-          >
-            {quickPickOpen ? <ChevronLeft className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-          </button>
-        </div>
-        {quickPickOpen && (
-          <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-2 px-1.5 pb-2">
-            {quickPickVideos.length > 0 && (
-              <div className="flex flex-col gap-1">
-                <div className="text-[10px] uppercase tracking-wide text-zinc-500 px-0.5">Videos</div>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {quickPickVideos.map(a => (
-                    <button
-                      key={a.id}
-                      onClick={() => pickQuickVideo(a.path)}
-                      title={a.path.split(/[/\\]/).pop()}
-                      className={`aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
-                        videoPath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
-                      }`}
-                    >
-                      {/* Poster: paint the first frame with a non-playing muted video. An <img> of
-                          a video blob (bigThumbnailPath for older/stale assets) renders as a broken
-                          image icon — same fix as the GenSpace asset grid, so use the asset's own
-                          path. Only falls back to the film icon if there is no source. */}
-                      {a.path ? (
-                        <video
-                          src={webAssetUrl(a.path)}
-                          muted
-                          playsInline
-                          preload="auto"
-                          disablePictureInPicture
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="w-full h-full bg-zinc-800 flex items-center justify-center">
-                          <Film className="h-3.5 w-3.5 text-zinc-500" />
-                        </div>
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            {quickPickImages.length > 0 && (
-              <div className="flex flex-col gap-1">
-                <div className="text-[10px] uppercase tracking-wide text-zinc-500 px-0.5">Images</div>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {quickPickImages.map(a => (
-                    <button
-                      key={a.id}
-                      onClick={() => pickQuickImage(a)}
-                      title={a.path.split(/[/\\]/).pop()}
-                      className={`aspect-video rounded-lg overflow-hidden border-2 transition-colors ${
-                        stylizedImagePath === a.path ? 'border-emerald-500' : 'border-zinc-800 hover:border-zinc-600'
-                      }`}
-                    >
-                      <img src={webAssetUrl(a.path)} alt="" className="w-full h-full object-cover" />
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            {quickPickVideos.length === 0 && quickPickImages.length === 0 && (
-              <div className="text-[10px] text-zinc-600 px-1">No assets yet</div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Main content column: tab bar + Image/Video views */}
       <div className="flex-1 min-w-0 flex flex-col gap-3 min-h-0">
       {/* Unified tabbed view: Image (first-frame edit) | Video (source preview) */}
       <div className="flex-shrink-0 flex items-center gap-1 border-b border-zinc-800 pb-2">
@@ -592,7 +474,6 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
                 errorMessage={error ?? undefined}
                 onSourceChange={handleSourceChange}
                 showFilmstrip={false}
-                externalVideoRequest={videoRequest}
               />
             </div>
 
@@ -741,6 +622,5 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
           </div>        )}
       </div>
       </div>
-    </div>
   )
 })
