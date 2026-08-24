@@ -290,16 +290,21 @@ async def handle_suggest_layers(request: web.Request) -> web.Response:
     ]
     async with _parallel:
         try:
-            content = await llms.chat(messages, max_tokens=512, temperature=0.6)
+            reasoning, content = await llms.chat_with_reasoning(
+                messages, max_tokens=512, temperature=0.6,
+            )
         except Exception as exc:
             logger.error("suggest-layers failed: %s", exc, exc_info=True)
             return web.json_response({"error": str(exc)}, status=500)
-    # Parse the bracketed <N> (2-8) out of the response; fall back to the first
-    # lone integer 2-8 if the model didn't bracket it.
+    # The rubric asks for step-by-step thinking and llama-server runs with
+    # --reasoning on --reasoning-format deepseek, so the model's whole reply
+    # (sometimes including the final count) can land in the reasoning channel
+    # with `content` left empty. Parse both channels together.
+    blob = f"{reasoning}\n{content}" if reasoning else content
     import re
-    m = re.search(r"<([2-8])>", content) or re.search(r"\b([2-8])\b", content)
+    m = re.search(r"<([2-8])>", blob) or re.search(r"\b([2-8])\b", blob)
     layers = int(m.group(1)) if m else None
-    return web.json_response({"layers": layers, "raw": content})
+    return web.json_response({"layers": layers, "raw": blob})
 
 
 # ── App factory ──────────────────────────────────────────────────────────────
