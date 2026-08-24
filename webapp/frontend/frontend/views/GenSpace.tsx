@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import {
   Trash2, Download, Image, Video, X,
   Heart, Film, Volume2, VolumeX, Sparkles, Sparkle,
-  Clock, Monitor, ChevronUp, Scissors, Music, Undo2, Redo2, Loader2,
+  Clock, Monitor, ChevronUp, ChevronDown, Scissors, Music, Undo2, Redo2, Loader2,
   ChevronLeft, ChevronRight, Copy, Check, MoveHorizontal, Wand2
 } from 'lucide-react'
 import { useProjects } from '../contexts/ProjectContext'
@@ -992,7 +992,7 @@ function PromptBar({
     }
   }
 
-  const masterTask: 'generate' | 'edit' = mode === 'edit' ? 'edit' : 'generate'
+  const masterTask: 'generate' | 'edit' = (mode === 'image' || mode === 'video') ? 'generate' : 'edit'
 
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-visible relative">
@@ -1010,7 +1010,7 @@ function PromptBar({
         <div className="flex items-center gap-0.5 rounded-lg bg-zinc-950/70 border border-zinc-800 p-0.5">
           <button
             type="button"
-            onClick={() => { if (mode === 'edit') onModeChange('video') }}
+            onClick={() => { if (masterTask !== 'generate') onModeChange('video') }}
             className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-semibold transition-colors ${
               masterTask === 'generate' ? 'bg-white text-black' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
             }`}
@@ -1020,7 +1020,7 @@ function PromptBar({
           </button>
           <button
             type="button"
-            onClick={() => onModeChange('edit')}
+            onClick={() => { if (masterTask !== 'edit') onModeChange('edit') }}
             className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-semibold transition-colors ${
               masterTask === 'edit' ? 'bg-white text-black' : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
             }`}
@@ -1029,11 +1029,37 @@ function PromptBar({
             Edit
           </button>
         </div>
-        {masterTask === 'edit' && (
-          <span className="text-[10px] text-zinc-500 ml-1">
-            Edit a source video — v2v (motion-preserving) or r2v (reference-guided)
-          </span>
-        )}
+        {/* Auxiliary sub-task selector — a ghost control tucked right of the master toggle
+            (Primer: "auxiliary dropdown adjacent to the SegmentedControl"). Its label always
+            reflects the active sub-task and auto-syncs when the master switch changes. */}
+        <span className="mx-1.5 h-3.5 w-px bg-zinc-700/60" aria-hidden="true" />
+        <SettingsDropdown
+          title={masterTask === 'generate' ? 'Generate' : 'Edit'}
+          value={mode}
+          onChange={(v) => onModeChange(v as GenSpaceMode)}
+          options={
+            masterTask === 'generate'
+              ? [
+                  { value: 'image', label: 'Generate Images', icon: <Image className="h-4 w-4" /> },
+                  { value: 'video', label: 'Generate Videos', icon: <Video className="h-4 w-4" /> },
+                ]
+              : [
+                  { value: 'edit', label: 'Edit Video', icon: <Wand2 className="h-4 w-4" /> },
+                  { value: 'restyle', label: 'Restyle', icon: <Wand2 className="h-4 w-4" /> },
+                  { value: 'retake', label: 'Retake', icon: <Scissors className="h-4 w-4" /> },
+                  { value: 'extend', label: 'Extend', icon: <MoveHorizontal className="h-3.5 w-3.5" /> },
+                  ...(canUseIcLora ? [{ value: 'ic-lora', label: 'IC-LoRA', icon: <Sparkles className="h-4 w-4" /> }] : []),
+                ]
+          }
+          triggerClassName="!py-1 !px-1.5 text-[11px] text-zinc-400"
+          trigger={
+            <>
+              {mode === 'image' ? <Image className="h-3.5 w-3.5" /> : mode === 'edit' ? <Wand2 className="h-3.5 w-3.5" /> : mode === 'retake' ? <Scissors className="h-3.5 w-3.5" /> : mode === 'restyle' ? <Wand2 className="h-3.5 w-3.5" /> : mode === 'extend' ? <MoveHorizontal className="h-3.5 w-3.5" /> : mode === 'ic-lora' ? <Sparkles className="h-3.5 w-3.5" /> : <Video className="h-3.5 w-3.5" />}
+              <span className="text-zinc-300 font-medium">{mode === 'image' ? 'Image' : mode === 'edit' ? 'Edit Video' : mode === 'retake' ? 'Retake' : mode === 'restyle' ? 'Restyle' : mode === 'extend' ? 'Extend' : mode === 'ic-lora' ? 'IC-LoRA' : 'Video'}</span>
+              <ChevronDown className="h-3 w-3 text-zinc-500" />
+            </>
+          }
+        />
       </div>
 
       {/* Top row: Image ref | Prompt | Generate */}
@@ -1137,33 +1163,10 @@ function PromptBar({
       
       {/* Bottom row: Mode selector + Settings */}
       <div className="flex items-center gap-0.5 px-1.5 py-1.5 border-t border-zinc-800/60 text-xs text-zinc-400">
-        {mode === 'edit' && <div className="flex-1" />}
-        {mode !== 'edit' && (
-          <>
-        {/* Mode dropdown */}
-        <SettingsDropdown
-          title="MODE"
-          value={mode}
-          onChange={(v) => onModeChange(v as GenSpaceMode)}
-          options={[
-            { value: 'image', label: 'Generate Images', icon: <Image className="h-4 w-4" /> },
-            { value: 'video', label: 'Generate Videos', icon: <Video className="h-4 w-4" /> },
-            { value: 'retake', label: 'Retake', icon: <Scissors className="h-4 w-4" /> },
-            { value: 'restyle', label: 'Restyle', icon: <Wand2 className="h-4 w-4" /> },
-            { value: 'extend', label: 'Extend', icon: <MoveHorizontal className="h-3.5 w-3.5" /> },
-            ...(canUseIcLora ? [{ value: 'ic-lora', label: 'IC-LoRA', icon: <Sparkles className="h-4 w-4" /> }] : []),
-          ]}
-          trigger={
-            <>
-              {mode === 'image' ? <Image className="h-3.5 w-3.5" /> : mode === 'retake' ? <Scissors className="h-3.5 w-3.5" /> : mode === 'restyle' ? <Wand2 className="h-3.5 w-3.5" /> : mode === 'extend' ? <MoveHorizontal className="h-3.5 w-3.5" /> : mode === 'ic-lora' ? <Sparkles className="h-3.5 w-3.5" /> : <Video className="h-3.5 w-3.5" />}
-              <span className="text-zinc-300 font-medium">{mode === 'image' ? 'Image' : mode === 'retake' ? 'Retake' : mode === 'restyle' ? 'Restyle' : mode === 'extend' ? 'Extend' : mode === 'ic-lora' ? 'IC-LoRA' : 'Video'}</span>
-              <ChevronUp className="h-3 w-3 text-zinc-500" />
-            </>
-          }
-        />
-        
         <div className="flex-1" />
         
+        {mode !== 'edit' && (
+          <>
         {isRestyleImage ? (
           <>
             {/* First-frame editor engine: Qwen-Image-Edit (default) vs FLUX.2 [klein] 4B
@@ -1624,7 +1627,6 @@ function PromptBar({
             </div>
           </>
         )}
-
           </>
         )}
 
