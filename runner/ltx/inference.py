@@ -1508,10 +1508,10 @@ class VideoCreatorInferenceEngine:
                 "num_inference_steps": num_steps,
                 "generator": torch.Generator(device=self._device).manual_seed(seed),
             }
-            # Only pass guidance_scale when the client explicitly sent it; otherwise
-            # let the diffusers ZImagePipeline default apply (pipeline is authoritative).
-            if guidance_scale is not None:
-                pipe_kwargs["guidance_scale"] = guidance_scale
+            # Z-Image-Turbo is GUIDANCE-DISTILLED (guidance-free). diffusers'
+            # ZImagePipeline defaults CFG to 5.0, which breaks a turbo render (see
+            # image-worker). Honour an explicit client guidance_scale; default to 0.0.
+            pipe_kwargs["guidance_scale"] = guidance_scale if guidance_scale is not None else 0.0
             result = self._zimage_pipe(**pipe_kwargs)
             img = result.images[0]
             img.save(tmp_out.name)
@@ -1631,8 +1631,8 @@ class VideoCreatorInferenceEngine:
             else:
                 kwargs["image"] = image
                 pipe = self._zimg2img_pipe
-            if guidance_scale is not None:
-                kwargs["guidance_scale"] = guidance_scale
+            # Turbo is guidance-distilled (CFG 5.0 default breaks it) — default to 0.0.
+            kwargs["guidance_scale"] = guidance_scale if guidance_scale is not None else 0.0
 
             result = pipe(**kwargs)
             img = result.images[0]

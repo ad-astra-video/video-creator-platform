@@ -29,12 +29,18 @@ logger = logging.getLogger(__name__)
 
 
 # ── FP8 linear (native Blackwell, no torchao) ────────────────────────────────
-# torchao 0.18.0's prebuilt fp8 kernels fail to load on py3.12 / cu12.8 / sm_120
-# (built for py310 + CUDA 13 + Hopper). torch._scaled_mm works natively on this
-# box, so we wrap the pre-quantized fp8 Linear weights in a small module that
-# quantizes activations per-token and does the scaled matmul against the fp8
-# weight. Weights stay genuinely fp8 (the user requirement); only the activation
-# is quantized dynamically (standard fp8 w8a8).
+# TESTED 2026-08 on this stack (py3.12 / torch 2.11+cu128 / SM120): torchao
+# 0.18.0 ITSELF imports fine (wheel is cp310-abi3 = cross-version, so the tag
+# is not a python blocker), but its native fp8 CUDA extensions (_C_mxfp8,
+# _C_cutlass_90a) fail to load under cu12.8 — built against CUDA 13
+# (libcudart.so.13 mismatch). Without those kernels torchao's fp8 runs via
+# SOFTWARE emulation (no fp8 tensor cores -> no advantage). So the accelerated
+# fp8 path here is the native torch._scaled_mm shim below: we wrap the
+# pre-quantized fp8 Linear weights in a small module that quantizes activations
+# per-token and does the scaled matmul against the fp8 weight. Weights stay
+# genuinely fp8 (the user requirement); only the activation is quantized
+# dynamically (standard fp8 w8a8). Revisit only if a torchao fp8 kernel is ever
+# shown to load AND beat _scaled_mm on this exact stack.
 
 _FP8_MAX = 448.0
 
@@ -284,19 +290,54 @@ class ImageInferenceEngine:
     # Lazy pipeline builders
     # ------------------------------------------------------------------
     def _qwen_edit_pipe(self):
-        """Build (once) and return the QwenImageEditPipeline."""
+        """Build (once) and return the Qwen-Image-Edit-2511 pipeline.
+
+        Uses ``QwenImageEditPlusPipeline`` (the 2509/2511 class that accepts a
+        LIST of reference images for multi-image editing). When QWEN_DTYPE=fp8
+        the transformer is a PRE-QUANTIZED fp8 checkpoint loaded per-component
+        (text_encoder/VAE bf16, transformer fp8) and routed through the native
+        torch._scaled_mm ``_swap_fp8_linears`` path, exactly like the layered
+        engine — so fp8 weights stay fp8 instead of being silently widened.
+        """
         with self._model_lock:
             if self._qwen_edit is None:
                 import torch
-                from diffusers import QwenImageEditPipeline
-                logger.info("Loading Qwen-Image-Edit from %s (dtype=%s, offload=%s)",
-                            _cfg.QWEN_EDIT_ROOT, _cfg.QWEN_DTYPE, _cfg.QWEN_OFFLOAD)
-                self._qwen_edit = QwenImageEditPipeline.from_pretrained(
-                    _cfg.QWEN_EDIT_ROOT,
-                    torch_dtype=self._resolve_dtype(torch),
-                )
-                if _cfg.QWEN_DTYPE.strip().lower() == "int8":
-                    self._apply_int8(self._qwen_edit)
+                from diffusers import QwenImageEditPlusPipeline
+                dtype = _cfg.QWEN_DTYPE.strip().lower()
+                root = _cfg.QWEN_EDIT_ROOT
+                logger.info("Loading Qwen-Image-Edit-2511 from %s (dtype=%s, offload=%s)",
+                            root, dtype, _cfg.QWEN_OFFLOAD)
+                if dtype == "fp8":
+                    # Per-component fp8 load: transformer from the pre-quantized
+                    # fp8 single-file (kept fp8), text_encoder/VAE bf16. Mirrors
+                    # _qwen_layered_pipe's fp8 branch (incl. the native
+                    # torch._scaled_mm swap; torchao's fp8 CUDA kernels can't
+                    # load under cu12.8, so torchao fp8 = emulation only).
+                    from transformers import (
+                        AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration,
+                    )
+                    from diffusers import (
+                        AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler,
+                        QwenImageTransformer2DModel,
+                    )
+                    _sched = FlowMatchEulerDiscreteScheduler.from_pretrained(f"{root}/scheduler")
+                    _vae = AutoencoderKLQwenImage.from_pretrained(f"{root}/vae", torch_dtype=torch.bfloat16)
+                    _te = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        f"{root}/text_encoder", torch_dtype=torch.bfloat16)
+                    _tok = AutoTokenizer.from_pretrained(f"{root}/tokenizer")
+                    _proc = AutoProcessor.from_pretrained(f"{root}/processor")
+                    _tr = QwenImageTransformer2DModel.from_pretrained(
+                        f"{root}/transformer", torch_dtype=torch.float8_e4m3fn)
+                    ImageInferenceEngine._fix_nonlinear_dtypes(_tr)
+                    ImageInferenceEngine._swap_fp8_linears(_tr)
+                    self._qwen_edit = QwenImageEditPlusPipeline(
+                        scheduler=_sched, vae=_vae, text_encoder=_te,
+                        tokenizer=_tok, processor=_proc, transformer=_tr)
+                else:
+                    self._qwen_edit = QwenImageEditPlusPipeline.from_pretrained(
+                        root, torch_dtype=self._resolve_dtype(torch))
+                    if dtype == "int8":
+                        self._apply_int8(self._qwen_edit)
                 self._maybe_offload(self._qwen_edit)
                 self.ready = True
             return self._qwen_edit
@@ -350,8 +391,9 @@ class ImageInferenceEngine:
                         f"{root}/transformer", torch_dtype=torch.float8_e4m3fn)
                     # Keep Linear weights fp8 (the user's requirement); restore
                     # norms/biases to bf16; swap Linears for _Fp8Linear (native
-                    # torch._scaled_mm) since torchao's fp8 kernels don't load on
-                    # this py312/Blackwell image (libcudart.so.13 vs cu12.8).
+                    # torch._scaled_mm). torchao's fp8 CUDA ext can't load under
+                    # cu12.8 (built vs CUDA 13) -> emulation only, so native
+                    # _scaled_mm stays the accelerated fp8 path here.
                     ImageInferenceEngine._fix_nonlinear_dtypes(_tr)
                     ImageInferenceEngine._swap_fp8_linears(_tr)
                     self._qwen_layered = QwenImageLayeredPipeline(
@@ -495,12 +537,18 @@ class ImageInferenceEngine:
         model, processor = hid["model"], hid["processor"]
         from .hidream_models import pipeline as _hp
 
-        src = _decoded_pil(image)
+        # Multi-reference edit: image may be a single source or a list; write
+        # every source to a temp PNG and pass all of them as ref_image_paths.
+        images = image if isinstance(image, (list, tuple)) else [image]
+        srcs = [_decoded_pil(i) for i in images]
         import tempfile, os
-        fd, path = tempfile.mkstemp(suffix=".png")
-        try:
+        paths = []
+        for src in srcs:
+            fd, path = tempfile.mkstemp(suffix=".png")
             os.close(fd)
             src.save(path, format="PNG")
+            paths.append(path)
+        try:
             steps = _resolve_steps(num_inference_steps, quality, "hidream")
             def _cb(step, total, decode=None):
                 if progress_cb:
@@ -510,7 +558,7 @@ class ImageInferenceEngine:
                         pass
             return _hp.generate_image(
                 model=model, processor=processor, prompt=prompt,
-                ref_image_paths=[path], height=2048, width=2048,
+                ref_image_paths=paths, height=2048, width=2048,
                 num_inference_steps=int(steps), guidance_scale=_cfg.HIDREAM_GUIDANCE,
                 shift=3.0, timesteps_list=None, scheduler_name="default",
                 seed=int(seed) if seed is not None else 32,
@@ -518,10 +566,11 @@ class ImageInferenceEngine:
                 callback=_cb if progress_cb else None,
             )
         finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            for path in paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _apply_int8(pipe: Any) -> None:
@@ -687,7 +736,13 @@ class ImageInferenceEngine:
 
         engine='zimage' -> Z-Image whole-frame img2img edit (masked edits use
         Z-Image inpaint)."""
-        src = _decoded_pil(image)
+        # Multi-reference-image edit (Qwen-Image-Edit-2511 / HiDream): ``image``
+        # may be a single base64 str/bytes/PIL OR a list of them (the frontend
+        # attaches 1..n references). Engines that are single-conditioning only
+        # (zimage, mask path) collapse to the first image; qwen-edit / hidream
+        # forward the whole list as their reference images.
+        is_multi = isinstance(image, (list, tuple))
+        src = _decoded_pil(image[0] if is_multi else image)
         mask_img = _decoded_pil(mask) if mask is not None else None
         engine = str(engine).lower()
 
@@ -749,7 +804,12 @@ class ImageInferenceEngine:
         if progress_cb is not None:
             call_kw["callback_on_step_end"] = _edit_step_cb(
                 progress_cb, int(kw.get("num_inference_steps", _cfg.QWEN_STEPS)))
-        out = pipe(image=src, **call_kw, **kw)
+        ref_images = ([_decoded_pil(i) for i in image]
+                      if is_multi else [src])
+        # 2511 multi-image conditioning: pass the reference list to the pipe.
+        # A single image may be passed as a bare PIL for exact parity.
+        out = pipe(image=(ref_images[0] if len(ref_images) == 1 else ref_images),
+                   **call_kw, **kw)
         return _to_pil(out)
 
     def plain_image(self, prompt, **kw) -> Image.Image:
@@ -891,7 +951,17 @@ class ImageInferenceEngine:
             pass
 
     def _zimage_call_kw(self, kw: dict) -> dict:
-        """Translate a ``seed`` kwarg into the ``generator`` Z-Image expects.
+        """Translate a ``seed`` kwarg into the ``generator`` Z-Image expects, and
+        default CFG guidance to 0.0.
+
+        Z-Image-Turbo is a GUIDANCE-DISTILLED (guidance-free) model. diffusers'
+        ``ZImagePipeline`` defaults ``guidance_scale`` to 5.0 and applies CFG
+        (``pred = pos + g * (pos - neg)``) at that value unless overridden —
+        running a distilled turbo with CFG at 5.0 yields over-saturated, washed-out,
+        incorrect output (verified empirically: gs=0.0 vs gs=5.0 differ by ~110/765
+        mean-abs pixel). The desktop reference forces guidance_scale=0.0 ("Turbo is
+        guidance-free"). We honour an EXPLICIT client guidance_scale (setdefault),
+        but a request that omits it gets the correct turbo default 0.0 instead of 5.0.
 
         ZImagePipeline / ZImageImg2ImgPipeline / ZImageInpaintPipeline take a
         ``generator`` (a seeded torch.Generator) for reproducibility and DO NOT
@@ -906,6 +976,9 @@ class ImageInferenceEngine:
         idx = self.current_device
         device = f"cuda:{idx}" if idx is not None else "cpu"
         kw["generator"] = torch.Generator(device=device).manual_seed(seed)
+        # Turbo is guidance-distilled: never let the diffusers default CFG (5.0) apply.
+        # Honour an explicit client guidance_scale; default 0.0 otherwise.
+        kw.setdefault("guidance_scale", 0.0)
         return kw
 
     def _pipe_kwargs(self) -> dict:

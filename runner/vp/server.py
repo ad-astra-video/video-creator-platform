@@ -65,12 +65,21 @@ def _require_token(request: web.Request) -> None:
         raise web.HTTPForbidden(reason="missing/mismatched X-Worker-Token")
 
 
-async def handle_load(_req: web.Request) -> web.Response:
+async def handle_load(req: web.Request) -> web.Response:
     """No-op /load: vp-worker is intentionally NOT device-aware (low-VRAM, runs
     on whatever GPU the scheduler hands it; rails load lazily on first use).
     The live-runner's GPU scheduler calls /load before every dispatch, so we
     must ACK it even though there's nothing to preload — otherwise the acquire
-    flow fails with a 404 and routing to this worker breaks."""
+    flow fails with a 404 and routing to this worker breaks.
+
+    ``model`` is consumed only to log the scheduler's rail hint (process /
+    fps-boost / upscale / ffmpeg); nothing is preloaded."""
+    model = None
+    try:
+        model = (await req.json()).get("model")
+    except Exception:
+        pass
+    logger.info("vp-worker /load: model=%s (no-op: not device-aware)", model)
     return web.json_response({"status": "loaded", "loaded": True, "device": ""})
 
 

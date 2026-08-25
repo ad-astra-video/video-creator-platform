@@ -174,6 +174,10 @@ async def handle_load(req: web.Request) -> web.Response:
     _require_token(req)
     global _default_device
     body = await req.json()
+    # ``model`` is an advisory warm/cache hint: image-worker selects the actual
+    # model per-request from the body's ``engine`` (z-image / flux / qwen /
+    # hidream) on the first generation, so /load only pins the GPU device here.
+    model_hint = body.get("model")
     device = body.get("device")
     if device is None:
         device = DEFAULT_DEVICE
@@ -187,9 +191,9 @@ async def handle_load(req: web.Request) -> web.Response:
     e = _engine_for(device)
     e.current_device = device
     _default_device = device
-    logger.info("image-worker /load: device=%s (visible=%d, engines=%s)",
-                device, visible, sorted(_engines))
-    return web.json_response({"loaded": True, "ready": ready, "device": device})
+    logger.info("image-worker /load: device=%s model=%s (visible=%d, engines=%s)",
+                device, model_hint, visible, sorted(_engines))
+    return web.json_response({"loaded": True, "ready": ready, "device": device, "model": model_hint})
 
 
 async def handle_evict(req: web.Request) -> web.Response:
@@ -280,6 +284,10 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
     for k in ("width", "height", "num_inference_steps", "guidance_scale", "seed"):
         if body.get(k) is not None:
             kw[k] = body.get(k)
+    # Echo the resolved seed in the complete event so the webapp can record the
+    # exact seed that ran (see handle_edit).
+    seed = int(kw["seed"]) if "seed" in kw else random.randrange(0, 2**31 - 1)
+    kw.setdefault("seed", seed)
     if "num_inference_steps" not in kw:
         q = str(body.get("quality") or "").strip().lower()
         if q in ("fast", "balanced", "high"):
@@ -342,6 +350,7 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
         "image": _pil_to_b64(img),
         "content_type": "image/png",
         "engine": engine_name,
+        "seed": seed,
     })
     await resp.write_eof()
     return resp
@@ -374,10 +383,15 @@ async def handle_edit(req: web.Request) -> web.Response:
     keep_subject = bool(body.get("keep_subject", False))
     strength = float(body.get("strength", 0.6))
     padding_mask_crop = int(body.get("padding_mask_crop", 0) or 0)
+    # Resolve the seed: client-supplied passes through (deterministic replay);
+    # otherwise mint a fresh random one. Echoed back in the response metadata so
+    # the webapp can record the exact seed that ran.
+    seed = int(body["seed"]) if body.get("seed") is not None else random.randrange(0, 2**31 - 1)
     kw = {}
     for k in ("width", "height", "num_inference_steps", "guidance_scale", "seed"):
         if body.get(k) is not None:
             kw[k] = body.get(k)
+    kw.setdefault("seed", seed)
     # Bare quality name -> this engine's step count (client threads quality;
     # worker translates). Explicit num_inference_steps wins over quality.
     if "num_inference_steps" not in kw:
@@ -410,6 +424,7 @@ async def handle_edit(req: web.Request) -> web.Response:
         "image": _pil_to_b64(img),
         "content_type": "image/png",
         "engine": engine_name,
+        "seed": seed,
     })
 
 

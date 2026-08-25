@@ -80,7 +80,7 @@ class GPUScheduler:
         self._slots = [GPUSlot(gpu_id=i) for i in range(self.gpu_count)]
         if self.gemma_resident_gpu is not None and 0 <= self.gemma_resident_gpu < self.gpu_count:
             s = self._slots[self.gemma_resident_gpu]
-            s.worker, s.state, s.resident = "gemma-worker", "busy", True
+            s.worker, s.state, s.resident = "gemma-worker", "idle", True
             s.last_used = time.monotonic()
     @classmethod
     def from_config(cls) -> "GPUScheduler":
@@ -156,7 +156,7 @@ class GPUScheduler:
         if self.gemma_resident_gpu is None:
             return
         s = self._slot(self.gemma_resident_gpu)
-        s.worker, s.state, s.resident = "gemma-worker", "busy", True
+        s.worker, s.state, s.resident = "gemma-worker", "idle", True
         s.last_used = time.monotonic()
         self._gemma_evicted = False
 
@@ -190,7 +190,7 @@ class GPUScheduler:
                     except asyncio.TimeoutError:
                         raise QueueTimeout(f"gemma GPU busy within {self.queue_timeout_s:.0f}s")
                 s = self._slot(self.gemma_resident_gpu)
-                s.worker, s.state, s.resident = "gemma-worker", "busy", True
+                s.worker, s.state, s.resident = "gemma-worker", "idle", True
                 s.last_used = time.monotonic()
                 self._gemma_evicted = False
                 return self.gemma_resident_gpu
@@ -272,11 +272,13 @@ class GPUScheduler:
                 warm = self._warm_gpu_of(worker)
                 if warm is not None:
                     self._claim(warm, worker)
+                    warm.state = "idle"  # boot assignment = resident-warm, not busy
                     logger.info("GPU pick: %s reuses warm GPU %d", worker, warm.gpu_id)
                     return warm.gpu_id
                 idle = self._pick_idle_gpu()
                 if idle is not None:
                     self._claim(idle, worker)
+                    idle.state = "idle"
                     logger.info("GPU pick: %s -> idle GPU %d", worker, idle.gpu_id)
                     return idle.gpu_id
                 victim = self._pick_lru_victim(exclude=worker)
@@ -326,8 +328,18 @@ class GPUScheduler:
                 for d in devs:
                     s = self._slot(d)
                     s.worker = name
-                    s.state = "busy"
                     s.resident = True
+                    # /info reports RESIDENCY, not in-flight busy-ness: a model
+                    # warm on a card is AVAILABLE (idle) unless a request is
+                    # actively running on it (state=="busy" set by acquire()).
+                    # Only mark idle — never busy — or a warm card the scheduler
+                    # released back to idle gets flipped to "busy" again, and the
+                    # SAME worker can no longer reuse it (its own slots are also
+                    # excluded from LRU eviction) => "no GPU free for X within
+                    # 600s" wedge while every GPU sits idle. Preserve a genuine
+                    # in-flight busy mark (don't downgrade a running request).
+                    if s.state != "busy":
+                        s.state = "idle"
                     s.last_used = time.monotonic()
             for s in self._slots:
                 if (self.gemma_resident_gpu is not None

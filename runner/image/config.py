@@ -12,7 +12,10 @@ Do not rename them.
 import os
 
 # ── Model roots (on the shared /models bind-mount) ──────────────────────────
-QWEN_EDIT_ROOT = os.environ.get("QWEN_EDIT_ROOT", "/models/image/edit")
+# Qwen-Image-Edit-2511 (QwenImageEditPlusPipeline, multi-reference-image edits
+# + fp8) is the current edit engine. Its own root keeps it separate from the
+# legacy edit weights.
+QWEN_EDIT_ROOT = os.environ.get("QWEN_EDIT_ROOT", "/models/image/edit-2511")
 QWEN_LAYERED_ROOT = os.environ.get("QWEN_LAYERED_ROOT", "/models/image/layered")
 ZIMAGE_ROOT = os.environ.get("ZIMAGE_ROOT", "/models/image/zimage")
 

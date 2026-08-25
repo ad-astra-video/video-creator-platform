@@ -7,10 +7,11 @@
 # Uses the modern `hf download` CLI (NOT the deprecated huggingface-cli).
 #
 # Layout produced (mirrors runner/image/config.py defaults):
-#   <MODELS_DIR>/image/edit/Qwen/qwen-image-edit/            -> Qwen-Image-Edit
-#   <MODELS_DIR>/image/layered/Qwen/qwen-image-layered/      -> Qwen-Image-Layered (fp8 shards)
-#   <MODELS_DIR>/image/zimage/                                -> Z-Image (Turbo)
-#   <MODELS_DIR>/image/hidream/                               -> HiDream-O1-Image (8B UiT)
+#   <MODELS_DIR>/image/edit-2511/                         -> Qwen-Image-Edit-2511 (QwenImageEditPlusPipeline, fp8) [CURRENT edit engine]
+#   <MODELS_DIR>/image/edit/Qwen/qwen-image-edit/         -> Qwen-Image-Edit (legacy 2509; no longer the edit engine)
+#   <MODELS_DIR>/image/layered/Qwen/qwen-image-layered/   -> Qwen-Image-Layered (fp8 shards)
+#   <MODELS_DIR>/image/zimage/                            -> Z-Image (Turbo)
+#   <MODELS_DIR>/image/hidream/                           -> HiDream-O1-Image (8B UiT)
 #
 # Usage (run on the GPU box HOST before docker compose up):
 #   export HUGGING_FACE_HUB_TOKEN=hf_...
@@ -22,10 +23,12 @@ MODELS_DIR="${MODELS_DIR:-/models}"
 mkdir -p "$MODELS_DIR"
 
 HF_TOKEN="${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}"
-# Qwen-Image-Edit / Qwen-Image-Layered are gated repos on HF — a token is required.
+# Most image models (Qwen-Image-Edit 2509, Qwen-Image-Layered, FLUX.2) are gated
+# on HF — a token is required. EXCEPTION: Qwen-Image-Edit-2511 and its 1038lab
+# fp8 transformer are NOT gated and download without a token (no --token there).
 if [ -z "$HF_TOKEN" ]; then
-    echo "ERROR: HUGGING_FACE_HUB_TOKEN not set — Qwen-Image-* are gated models." >&2
-    echo "  export HUGGING_FACE_HUB_TOKEN=hf_...  Then rerun." >&2
+    echo "ERROR: HUGGING_FACE_HUB_TOKEN not set — most image models are gated." >&2
+    echo "  export HUGGING_FACE_HUB_TOKEN=hf_...  Then rerun (2511 needs none)." >&2
     exit 1
 fi
 
@@ -55,7 +58,7 @@ mkdir -p "$LAYERED_DIR/transformer"
 # transformer weight shards — we replace them with the fp8 single-file below.
 hf download --token "$HF_TOKEN" "Qwen/Qwen-Image-Layered" \
     --exclude "transformer/diffusion_pytorch_model-*.safetensors" \
-              "transformer/diffusion_pytorch_model.safetensors.index.json" \
+    --exclude "transformer/diffusion_pytorch_model.safetensors.index.json" \
     --local-dir "$LAYERED_DIR"
 # T5B pre-quantized FP8 E4M3FN transformer: same 1934 keys as the bf16 shards,
 # no 'transformer.' prefix; 843 FP8 linear weights + 1091 BF16 sensitive layers
@@ -89,6 +92,28 @@ hf download --token "$HF_TOKEN" "black-forest-labs/FLUX.2-klein-4B" \
 hf download --token "$HF_TOKEN" "black-forest-labs/FLUX.2-dev" \
     ae.safetensors --local-dir "$MODELS_DIR/flux2" || true
 hf download --token "$HF_TOKEN" "Qwen/Qwen3-4B" || true
+
+# [6/6] Qwen-Image-Edit-2511 — the CURRENT edit engine (QwenImageEditPlusPipeline,
+# multi-reference-image editing + fp8). Same recipe as Layered: pull the upstream
+# (bf16) 2511 diffusers scaffolding (configs / scheduler / vae / text_encoder /
+# tokenizer / processor) and swap its transformer weights for a PRE-QUANTIZED FP8
+# (E4M3FN) single-file checkpoint so the worker keeps fp8 and never quantizes in
+# flight. Transformer keys are bare diffusers QwenImageTransformer2DModel names
+# (verified: 1933 tensors, all F8_E4M3, 20.4 GB) -> drop-in for transformer/.
+echo ">>> [6/6] Qwen-Image-Edit-2511 (FP8 transformer via 1038lab)"
+EDIT2511_DIR="$IMAGE_BASE/edit-2511"
+mkdir -p "$EDIT2511_DIR/transformer"
+# 2511 is NOT gated on HF (verified: gated:False, files served unauthenticated
+# HTTP 200) — no --token, unlike the 2509/Layered/FLUX models above.
+hf download "Qwen/Qwen-Image-Edit-2511" \
+    --exclude "transformer/diffusion_pytorch_model-*.safetensors" \
+    --exclude "transformer/diffusion_pytorch_model.safetensors.index.json" \
+    --local-dir "$EDIT2511_DIR"
+hf download "1038lab/Qwen-Image-Edit-2511-FP8" \
+    Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors \
+    --local-dir "$EDIT2511_DIR/transformer"
+mv -f "$EDIT2511_DIR/transformer/Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors" \
+      "$EDIT2511_DIR/transformer/diffusion_pytorch_model.safetensors"
 
 # [5/5] HiDream-O1-Image — the /image (text-to-image) + /edit (instruction
 # editing) engine. An 8B pixel-level Unified Transformer run through the

@@ -216,6 +216,12 @@ async def handle_load(req: web.Request) -> web.Response:
         body = await req.json()
     except Exception:
         body = {}
+    # ``model`` is accepted for parity with every other worker's /load; ltx-worker
+    # is SINGLE-ENGINE (one LTX-2.5 video model), so the scheduler's model hint is
+    # advisory — only the device affects this engine.
+    model = body.get("model")
+    if model:
+        logger.info("ltx-worker /load: model=%s (single-engine; advisory)", model)
     device = body.get("device")
     if device is not None and engine is not None:
         try:

@@ -235,6 +235,35 @@ async def test_edit_missing_image_400(client):
     assert r.status == 400
 
 
+async def test_edit_echoes_seed(client):
+    """/edit returns the seed used in the response metadata: a client-supplied
+    seed is echoed verbatim, and a minted one is reported when absent."""
+    cli, _ = client
+    r = await cli.post("/video-creator/v1/edit",
+                       json={"image": _tiny_png_b64(), "prompt": "make it red",
+                             "seed": 12345})
+    assert r.status == 200
+    body = await r.json()
+    assert body["seed"] == 12345
+    # No seed supplied -> the worker mints one and reports it truthfully.
+    r2 = await cli.post("/video-creator/v1/edit",
+                        json={"image": _tiny_png_b64(), "prompt": "make it red"})
+    body2 = await r2.json()
+    assert isinstance(body2["seed"], int)
+    assert 0 <= body2["seed"] < 2**31 - 1
+
+
+async def test_edit_sse_complete_echoes_seed(client):
+    """The /edit SSE complete event carries the seed used."""
+    cli, _ = client
+    r = await cli.post("/video-creator/v1/edit?sse=1",
+                       json={"image": _tiny_png_b64(), "prompt": "make it red",
+                             "engine": "qwen-edit", "seed": 4321})
+    assert r.status == 200
+    text = await r.text()
+    assert '"seed": 4321' in text
+
+
 async def test_layer_clamps_out_of_range(client):
     cli, _ = client
     r = await cli.post("/video-creator/v1/layer",

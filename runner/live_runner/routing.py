@@ -53,6 +53,77 @@ ROUTES = {
     "ffmpeg": "vp-worker",
 }
 
+# Endpoint -> model the worker should make resident on /load. This is uniform
+# across EVERY worker: the live-runner always tells a worker which model family
+# to warm, so residency selection is one mechanism rather than a per-endpoint
+# special case. Some routes share a physical worker that can serve multiple
+# model families — the wan-worker hosts BOTH the diffsynth id-v2v pipe (restyle)
+# AND the Bernini subprocess (edit/t2v), and that is where the value bites (the
+# id-v2v pipe is never built for a Bernini job, and vice-versa). For a
+# single-model worker (ltx / gemma / vp) the value is advisory — its /load
+# accepts ``model`` for symmetry and ignores it in favour of its one engine.
+# For image the worker still selects the model per-request from the body's
+# ``engine``; the /load ``model`` is a warm/cache hint.
+BERNINI_ENDPOINTS = frozenset({"bernini-t2v", "bernini-v2v", "bernini-r2v"})
+
+# Image endpoints: the worker picks the actual model per-request from the body's
+# ``engine``, so /load ``model`` is advisory.
+_IMAGE_ENDPOINTS = frozenset({"image", "edit", "layer", "style-frame"})
+
+# Default model id per route. Covers every endpoint in ROUTES so model selection
+# is never an afterthought — model_for_endpoint() returns a value for all of
+# them (== None would mean "worker picks on its own"). sam3 is in
+# _IMAGE_ONLY_ENDPOINTS (exempt from ensure()) so its mapping is informational.
+ROUTE_MODELS: dict[str, str] = {
+    # LTX worker — a single LTX-2.5 video engine serves all gen/extend rails.
+    "t2v": "ltx",
+    "i2v": "ltx",
+    "a2v": "ltx",
+    "extend": "ltx",
+    "retake": "ltx",
+    "extract-conditioning": "ltx",
+    "ic-lora-generate": "ltx",
+    # Image worker — advisory family label (real model chosen per-request).
+    "image": "image",
+    "edit": "image",
+    "layer": "image",
+    "style-frame": "image",
+    # Gemma worker — a single Gemma LLM serves all text endpoints.
+    "prompt-enhance": "gemma",
+    "suggest-gap-prompt": "gemma",
+    "chat": "gemma",
+    "suggest-layers": "gemma",
+    # wan/idv2v worker — hosts BOTH the diffsynth id-v2v pipe and Bernini.
+    "restyle": "idv2v",
+    "bernini-t2v": "bernini-1.3b",
+    "bernini-v2v": "bernini-1.3b",
+    "bernini-r2v": "bernini-1.3b",
+    "bernini-evict": "bernini-1.3b",
+    "sam3": "sam3",  # image-only endpoint; exempt from ensure() anyway
+    # VP worker — post rails share one lightweight process stage.
+    "process": "vp",
+    "fps-boost": "vp",
+    "upscale": "vp",
+    "ffmpeg": "vp",
+}
+
+
+def model_for_endpoint(endpoint: str, body: dict | None = None) -> str | None:
+    """Model id to make resident for ``endpoint`` (a value for every route).
+
+    Bernini routes read the request body's ``engine`` (bernini-1.3b /
+    bernini-14b) when present so the correct family becomes resident, else 1.3b.
+    Image routes pass the request body's ``engine`` through as an advisory warm
+    hint. All other routes map 1:1 from ROUTE_MODELS to their worker's model
+    family.
+    """
+    body = body or {}
+    if endpoint in BERNINI_ENDPOINTS or endpoint in _IMAGE_ENDPOINTS:
+        engine = body.get("engine")
+        if isinstance(engine, str) and engine:
+            return engine
+    return ROUTE_MODELS.get(endpoint)
+
 # Routing capability ids advertised for the platform (each maps 1:1 via ROUTES
 # to the worker container that serves it). `qwen-image-edit` is deliberately
 # NOT here: it was an engine label, not a route. Available image MODELS are
@@ -193,7 +264,8 @@ async def proxy(
             # shared 32 GB card. Let the worker's own klein/sam3 eviction
             # lifecycle handle residency for these.
             if endpoint not in _IMAGE_ONLY_ENDPOINTS:
-                await worker_manager.ensure(target, device=device)
+                await worker_manager.ensure(
+                    target, device=device, model=model_for_endpoint(endpoint, body))
             return await _post_worker(session, token, target, endpoint, body, device)
         except WorkerCallFailed as exc:
             last = exc
@@ -235,7 +307,8 @@ async def proxy_worker_sse(
     """
     import asyncio
     from . import config as cfg
-    await worker_manager.ensure(worker, device=device)
+    await worker_manager.ensure(
+        worker, device=device, model=model_for_endpoint(endpoint, body))
     base = cfg.WORKERS[worker]
     url = f"{base}/video-creator/v1/{endpoint}?sse=1"
     headers = {"X-Worker-Token": token}

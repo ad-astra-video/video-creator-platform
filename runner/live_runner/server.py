@@ -54,8 +54,13 @@ _last_worker_reconcile = 0.0
 # the device-aware per-worker residency path. Legacy video workers (ltx/idv2v)
 # that still share one physical GPU keep the proven evict-before-load swap so two
 # models can never co-reside on the same card. image-worker + gemma each live on
-# their own GPU, so device-aware residency is safe for them.
-_DEVICE_AWARE_WORKERS = frozenset({"image-worker", "gemma-worker", "ltx-worker", "idv2v-worker"})
+# their own GPU, so device-aware residency is safe for them. wan-worker is the
+# Bernini host (same worker code as idv2v): it accepts a ``model`` in /load and
+# MUST receive the scheduler's device (it never defaults a card), so it is
+# device-aware too.
+_DEVICE_AWARE_WORKERS = frozenset({
+    "image-worker", "gemma-worker", "ltx-worker", "idv2v-worker", "wan-worker",
+})
 
 
 def _device_for(worker: str, gpu: int) -> int | None:
@@ -245,80 +250,81 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
     headers = {"X-Worker-Token": token}
     idv2v_base = config.WORKERS["idv2v-worker"]
     idv2v_gpu = await _scheduler.acquire("idv2v-worker")
-    await wm.ensure("idv2v-worker", device=_device_for("idv2v-worker", idv2v_gpu))
-
-    job_id = str(body.get("job_id") or uuid.uuid4().hex[:12])
-    rbody = {**body, "job_id": job_id}
-
-    async def _send(ev: dict) -> None:
-        if progress_cb is None:
-            return
-        try:
-            await progress_cb(ev)
-        except Exception:
-            pass
-
-    # 1) ID-V2V restyle (background task so we can poll /progress concurrently).
-    async def _restyle():
-        async with session.post(f"{idv2v_base}/video-creator/v1/restyle",
-                                json=rbody, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
-            if r.status >= 400:
-                return {"_error": (await r.read())[:500].decode("utf-8", "replace")}
-            return await r.json()
-
-    task = asyncio.create_task(_restyle())
     try:
-        while not task.done():
+        await wm.ensure("idv2v-worker", device=_device_for("idv2v-worker", idv2v_gpu))
+
+        job_id = str(body.get("job_id") or uuid.uuid4().hex[:12])
+        rbody = {**body, "job_id": job_id}
+
+        async def _send(ev: dict) -> None:
+            if progress_cb is None:
+                return
             try:
-                async with session.get(
-                    f"{idv2v_base}/video-creator/v1/progress/{job_id}",
-                    headers=headers, timeout=aiohttp.ClientTimeout(total=5)
-                ) as r:
-                    if r.status == 200:
-                        info = await r.json()
-                        stage, message = _client_stage(info)
-                        prog = info.get("progress")
-                        p = None
-                        if stage == "generating":
-                            try:
-                                p = round(float(prog), 4)
-                            except (TypeError, ValueError):
-                                p = None
-                        await _send({"stage": stage, "message": message, "progress": p})
+                await progress_cb(ev)
             except Exception:
                 pass
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
-            except asyncio.TimeoutError:
-                pass
-        data = task.result()
-        if data.get("_error"):
-            return web.Response(status=502, text=data["_error"],
+
+        # 1) ID-V2V restyle (background task so we can poll /progress concurrently).
+        async def _restyle():
+            async with session.post(f"{idv2v_base}/video-creator/v1/restyle",
+                                    json=rbody, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
+                if r.status >= 400:
+                    return {"_error": (await r.read())[:500].decode("utf-8", "replace")}
+                return await r.json()
+
+        task = asyncio.create_task(_restyle())
+        try:
+            while not task.done():
+                try:
+                    async with session.get(
+                        f"{idv2v_base}/video-creator/v1/progress/{job_id}",
+                        headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+                    ) as r:
+                        if r.status == 200:
+                            info = await r.json()
+                            stage, message = _client_stage(info)
+                            prog = info.get("progress")
+                            p = None
+                            if stage == "generating":
+                                try:
+                                    p = round(float(prog), 4)
+                                except (TypeError, ValueError):
+                                    p = None
+                            await _send({"stage": stage, "message": message, "progress": p})
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
+                except asyncio.TimeoutError:
+                    pass
+            data = task.result()
+            if data.get("_error"):
+                return web.Response(status=502, text=data["_error"],
+                                    content_type="application/json", charset="utf-8")
+        except Exception as exc:
+            logger.exception("restyle chain failed")
+            return web.Response(status=500, text=str(exc),
                                 content_type="application/json", charset="utf-8")
-    except Exception as exc:
-        logger.exception("restyle chain failed")
-        return web.Response(status=500, text=str(exc),
-                            content_type="application/json", charset="utf-8")
 
-    await _scheduler.release("idv2v-worker", idv2v_gpu)
-    out_b64 = data.get("output_video")
-    if not out_b64:
-        return web.json_response(data, status=502)
+        out_b64 = data.get("output_video")
+        if not out_b64:
+            return web.json_response(data, status=502)
 
-    # Restyle returns the native id-v2v output. The LTX spatial upscaler has been
-    # removed from the restyle path.
-    return web.json_response({
-        "output_video": out_b64,
-        "frames_generated": data.get("frames_generated"),
-        "resolution": data.get("resolution"),
-        "gen_resolution": data.get("resolution"),
-        "upscaled": False,
-        "video_caption": data.get("video_caption"),
-        "enhanced_prompt": data.get("enhanced_prompt"),
-        "used_prompt": data.get("used_prompt"),
-    })
-
+        # Restyle returns the native id-v2v output. The LTX spatial upscaler has been
+        # removed from the restyle path.
+        return web.json_response({
+            "output_video": out_b64,
+            "frames_generated": data.get("frames_generated"),
+            "resolution": data.get("resolution"),
+            "gen_resolution": data.get("resolution"),
+            "upscaled": False,
+            "video_caption": data.get("video_caption"),
+            "enhanced_prompt": data.get("enhanced_prompt"),
+            "used_prompt": data.get("used_prompt"),
+        })
+    finally:
+        await _scheduler.release("idv2v-worker", idv2v_gpu)
 
 async def handle_ws(req: web.Request) -> web.Response:
     """WebSocket endpoint (orchestrator-proxied) for long-running generation jobs.
@@ -413,98 +419,98 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
     headers = {"X-Worker-Token": token}
     idv2v_base = config.WORKERS["idv2v-worker"]
     idv2v_gpu = await _scheduler.acquire("idv2v-worker")
-    await wm.ensure("idv2v-worker", device=_device_for("idv2v-worker", idv2v_gpu))
-
-    def _client_stage(info: dict):
-        st = info.get("stage", "generating")
-        msg = info.get("message", "") or ""
-        if st == "preprocessing":
-            return "preprocessing", "Preparing frames..."
-        if st == "decoding":
-            return "decoding", "Decoding video..."
-        if st == "complete":
-            return "finalizing", "Finalizing output..."
-        if st == "generating":
-            return "generating", msg or "Generating..."
-        return st, msg
-
-    async def _send(ev: dict) -> None:
-        if ws.closed:
-            return
-        try:
-            await ws.send_json({"type": "progress", "request_id": request_id,
-                                "job_id": job_id, **ev})
-        except Exception:
-            pass
-
-    async def _restyle():
-        # Restyle jobs routinely exceed aiohttp's 300s default total timeout
-        # (id-v2v ~6.4min on .8). Without an explicit timeout the POST to the
-        # worker aborts at 5:00, the live-runner sends an (empty-message) error
-        # frame, and the desktop reports "runner websocket error" even though
-        # the worker finishes fine. Give the backbone the full budget.
-        async with session.post(f"{idv2v_base}/video-creator/v1/restyle",
-                                json=body, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
-            if r.status >= 400:
-                return {"_error": (await r.read())[:500].decode("utf-8", "replace")}
-            return await r.json()
-
-    task = asyncio.create_task(_restyle())
     try:
-        while not task.done():
+        await wm.ensure("idv2v-worker", device=_device_for("idv2v-worker", idv2v_gpu))
+
+        def _client_stage(info: dict):
+            st = info.get("stage", "generating")
+            msg = info.get("message", "") or ""
+            if st == "preprocessing":
+                return "preprocessing", "Preparing frames..."
+            if st == "decoding":
+                return "decoding", "Decoding video..."
+            if st == "complete":
+                return "finalizing", "Finalizing output..."
+            if st == "generating":
+                return "generating", msg or "Generating..."
+            return st, msg
+
+        async def _send(ev: dict) -> None:
+            if ws.closed:
+                return
             try:
-                async with session.get(
-                    f"{idv2v_base}/video-creator/v1/progress/{job_id}",
-                    headers=headers, timeout=aiohttp.ClientTimeout(total=5)
-                ) as r:
-                    if r.status == 200:
-                        info = await r.json()
-                        stage, message = _client_stage(info)
-                        prog = info.get("progress")
-                        p = None
-                        if stage == "generating":
-                            try:
-                                p = round(float(prog), 4)
-                            except (TypeError, ValueError):
-                                p = None
-                        await _send({"stage": stage, "message": message, "progress": p})
+                await ws.send_json({"type": "progress", "request_id": request_id,
+                                    "job_id": job_id, **ev})
             except Exception:
                 pass
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
-            except asyncio.TimeoutError:
-                pass
-        data = task.result()
-        if data.get("_error") or not data.get("output_video"):
-            err = data.get("_error") or str(data)
+
+        async def _restyle():
+            # Restyle jobs routinely exceed aiohttp's 300s default total timeout
+            # (id-v2v ~6.4min on .8). Without an explicit timeout the POST to the
+            # worker aborts at 5:00, the live-runner sends an (empty-message) error
+            # frame, and the desktop reports "runner websocket error" even though
+            # the worker finishes fine. Give the backbone the full budget.
+            async with session.post(f"{idv2v_base}/video-creator/v1/restyle",
+                                    json=body, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
+                if r.status >= 400:
+                    return {"_error": (await r.read())[:500].decode("utf-8", "replace")}
+                return await r.json()
+
+        task = asyncio.create_task(_restyle())
+        try:
+            while not task.done():
+                try:
+                    async with session.get(
+                        f"{idv2v_base}/video-creator/v1/progress/{job_id}",
+                        headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+                    ) as r:
+                        if r.status == 200:
+                            info = await r.json()
+                            stage, message = _client_stage(info)
+                            prog = info.get("progress")
+                            p = None
+                            if stage == "generating":
+                                try:
+                                    p = round(float(prog), 4)
+                                except (TypeError, ValueError):
+                                    p = None
+                            await _send({"stage": stage, "message": message, "progress": p})
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
+                except asyncio.TimeoutError:
+                    pass
+            data = task.result()
+            if data.get("_error") or not data.get("output_video"):
+                err = data.get("_error") or str(data)
+                if not ws.closed:
+                    await ws.send_json({"type": "error", "request_id": request_id, "error": err})
+                return
+        except Exception as exc:
             if not ws.closed:
-                await ws.send_json({"type": "error", "request_id": request_id, "error": err})
+                await ws.send_json({"type": "error", "request_id": request_id, "error": str(exc)})
             return
-    except Exception as exc:
+
+        # Restyle returns the native id-v2v output. The LTX spatial upscaler has been
+        # removed from the restyle path.
+        payload = {
+            "output_video": data["output_video"],
+            "frames_generated": data.get("frames_generated"),
+            "resolution": data.get("resolution"),
+            "gen_resolution": data.get("resolution"),
+            "upscaled": False,
+            "job_id": job_id,
+            "video_caption": data.get("video_caption"),
+            "enhanced_prompt": data.get("enhanced_prompt"),
+            "used_prompt": data.get("used_prompt"),
+        }
         if not ws.closed:
-            await ws.send_json({"type": "error", "request_id": request_id, "error": str(exc)})
-        return
-
-    await _scheduler.release("idv2v-worker", idv2v_gpu)
-
-    # Restyle returns the native id-v2v output. The LTX spatial upscaler has been
-    # removed from the restyle path.
-    payload = {
-        "output_video": data["output_video"],
-        "frames_generated": data.get("frames_generated"),
-        "resolution": data.get("resolution"),
-        "gen_resolution": data.get("resolution"),
-        "upscaled": False,
-        "job_id": job_id,
-        "video_caption": data.get("video_caption"),
-        "enhanced_prompt": data.get("enhanced_prompt"),
-        "used_prompt": data.get("used_prompt"),
-    }
-    if not ws.closed:
-        await ws.send_json({"type": "complete", "request_id": request_id,
-                            "job_id": job_id, "payload": payload})
-
+            await ws.send_json({"type": "complete", "request_id": request_id,
+                                "job_id": job_id, "payload": payload})
+    finally:
+        await _scheduler.release("idv2v-worker", idv2v_gpu)
 
 async def _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body,
                     device: int | None = None) -> None:
@@ -811,9 +817,10 @@ async def _register_with_retry() -> None:
                     "gpu_count": config.GPU_COUNT,
                     "model_specs": _MODEL_SPECS,
                     "models": MODELS,
-                    "ltx_up": False,
-                    "idv2v_up": False,
-                    "warm": None,
+                    # Startup placeholder; _refresh_metadata_loop replaces this
+                    # with the live ltx/wan/gemma/image/vp warm-cold map on the
+                    # first beat.
+                    "status": {"ltx": "c", "wan": "c", "gemma": "c", "image": "c", "vp": "c"},
                 }, separators=(",", ":")),
                 heartbeat_interval_s=config.HEARTBEAT_INTERVAL_S,
             )

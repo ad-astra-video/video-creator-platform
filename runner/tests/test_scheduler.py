@@ -52,10 +52,55 @@ def test_gemma_gpu_reserved_at_boot():
     slots = s.status()["gpus"]
     by_id = {g["gpu_id"]: g for g in slots}
     assert by_id[1]["worker"] == "gemma-worker"
-    assert by_id[1]["state"] == "busy"
+    assert by_id[1]["state"] == "idle"  # resident-warm & available, not in-flight
     assert by_id[1]["resident"] is True
     assert by_id[0]["state"] == "idle"
     assert by_id[2]["state"] == "idle"
+
+
+def test_reconcile_keeps_idle_warm_slot_reusable_for_same_worker():
+    """THE deadlock regression: after image runs warm on both non-gemma cards,
+    a heartbeat reconcile must NOT flip those released (idle-warm) slots back to
+    "busy". If it did, the same worker could neither reuse them (they read busy)
+    nor evict them (its own slots are excluded from LRU eviction) -> it waits
+    forever and times out with "no GPU free for image-worker" while every GPU is
+    actually idle. Marking reported devices idle (preserving a genuine in-flight
+    busy) keeps the warm copy reusable with no reload."""
+    s = _mk(gpu_count=3, gemma_gpu=1, timeout=0.05)
+
+    async def _t():
+        g1 = await s.acquire("image-worker")
+        g2 = await s.acquire("image-worker")  # concurrent peer -> 2nd card
+        assert g1 != g2
+        await s.release("image-worker", g1)
+        await s.release("image-worker", g2)
+        # Both copies warm+idle. A heartbeat reconcile re-reports residency.
+        await s.reconcile({"image-worker": {"devices": [g1, g2]}})
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        # Reconcile must leave the warm cards reusable (idle), not busy.
+        assert st[g1]["state"] == "idle" and st[g1]["resident"] is True
+        assert st[g2]["state"] == "idle" and st[g2]["resident"] is True
+        # A subsequent request for the SAME worker reuses a warm card (no timeout).
+        g3 = await s.acquire("image-worker")
+        assert g3 in (g1, g2)
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[g3]["state"] == "busy"  # now in flight again
+
+    asyncio.run(_t())
+
+
+def test_reconcile_preserves_inflight_busy_mark():
+    """Reconcile must NOT downgrade a genuinely in-flight (busy) slot to idle, or
+    a concurrent request could share a card mid-job (one-GPU-one-request)."""
+    s = _mk(gpu_count=3, gemma_gpu=1, timeout=0.05)
+
+    async def _t():
+        gpu = await s.acquire("image-worker")  # in flight -> busy
+        await s.reconcile({"image-worker": {"devices": [gpu]}})
+        st = {g["gpu_id"]: g for g in s.status()["gpus"]}
+        assert st[gpu]["state"] == "busy"  # not downgraded while running
+
+    asyncio.run(_t())
 
 
 def test_acquire_takes_free_non_gemma_gpu():

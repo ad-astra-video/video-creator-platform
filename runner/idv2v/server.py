@@ -1,4 +1,4 @@
-﻿"""ID-V2V worker HTTP service (aiohttp).
+"""ID-V2V worker HTTP service (aiohttp).
 
 A swappable worker container driven by the `live-runner` edge on the internal
 Docker network. It does NOT register with the Livepeer Orchestrator or do
@@ -70,6 +70,11 @@ def _require_token(request: web.Request) -> None:
 # One ModelManager instance owned by this worker process.
 _model: ModelManager | None = None
 _model_lock = asyncio.Lock()
+# Which model is resident: None | "idv2v" | "bernini-1.3b" | "bernini-14b".
+# The worker can serve either family (diffsynth id-v2v pipe, or the Bernini
+# subprocess), and /load places whichever the scheduler asks for on the
+# assigned GPU — one resident video model per card at a time.
+_resident_kind: str | None = None
 
 
 def _get_model() -> ModelManager:
@@ -79,59 +84,136 @@ def _get_model() -> ModelManager:
     return _model
 
 
+def _device_from_body(device) -> int | None:
+    """Return a validated CUDA index from a /load body ``device``, or None if
+    missing/invalid. The device is authoritative — it comes from the live-runner
+    scheduler's assignment, never inferred or defaulted here."""
+    if device in (None, ""):
+        return None
+    try:
+        idx = int(device)
+    except (TypeError, ValueError):
+        return None
+    return idx if idx >= 0 else None
+
+
 async def handle_load(request: web.Request) -> web.Response:
     _require_token(request)
-    global _model
+    global _model, _resident_kind
     body = {}
     try:
         body = await request.json()
     except Exception:
         body = {}
-    device = body.get("device")
+    device_idx = _device_from_body(body.get("device"))
+    if device_idx is None:
+        return web.json_response(
+            {"error": "/load requires a valid 'device' (GPU index) from the "
+                      "live-runner scheduler"},
+            status=400,
+        )
+    device_str = f"cuda:{device_idx}"
+    model_arg = body.get("model") or ""
+    kind = config.resolve_model(model_arg)  # idv2v | bernini-1.3b | bernini-14b
     async with _model_lock:
-        model = _get_model()
-        if device is not None:
+        if kind in config.BERNINI_MODELS:
+            # Load the Bernini subprocess resident on the assigned GPU. Free the
+            # id-v2v diffsynth pipe first (one resident video model per card),
+            # unless a restyle is actively generating on it.
+            if _model is not None and not run_mod.generation_active():
+                _model.evict()
+            _model = None
             try:
-                device = int(device)
-            except (TypeError, ValueError):
-                device = None
-            cur = model.device
-            cur_idx = int(cur.split(":")[1]) if ":" in str(cur) else 0
-            if device is not None and device >= 0 and cur_idx != device:
-                logger.info("idv2v-worker /load: relocating GPU %d -> %d",
-                            cur_idx, device)
-                model.set_device(str(device))
-        if model.is_ready:
+                mgr = await bernini_mod.get_manager(model=kind, device=device_str)
+                await asyncio.wait_for(mgr.ensure_loaded(), timeout=900)
+            except bernini_mod.BerniniError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+            except asyncio.TimeoutError:
+                return web.json_response({"error": "bernini load timed out"}, status=504)
+            _resident_kind = kind
             return web.json_response(
-                {"loaded": True, "already_loaded": True, "device": model.device})
+                {"loaded": True, "model": kind, "device": mgr.device})
+
+        # idv2v (default) — free a resident Bernini subprocess first.
+        await bernini_mod.evict_manager()
+        model = _get_model()
+        if model.device != device_str:
+            logger.info("idv2v-worker /load: relocating GPU %s -> %s",
+                        model.device, device_str)
+            model.set_device(str(device_idx))
+        if model_arg and config.resolve_model(model_arg) == "idv2v":
+            variant = config._norm_variant(model_arg)
+            if model.variant != variant:
+                model.set_variant(variant)
+        if model.is_ready:
+            _resident_kind = "idv2v"
+            return web.json_response(
+                {"loaded": True, "already_loaded": True,
+                 "device": model.device, "model": "idv2v"})
         try:
             await asyncio.wait_for(model.load(), timeout=3600)
         except asyncio.TimeoutError:
             return web.json_response({"error": "model load timed out"}, status=504)
-    return web.json_response({"loaded": True, "device": model.device})
+        _resident_kind = "idv2v"
+        return web.json_response(
+            {"loaded": True, "device": model.device, "model": "idv2v"})
+
+
+def _resident_status() -> dict:
+    """Health/info payload for whichever model family is resident."""
+    global _resident_kind
+    if _resident_kind and _resident_kind in config.BERNINI_MODELS:
+        b = bernini_mod.resident_status()
+        ready = bool(b and b.get("ready"))
+        device = (b or {}).get("device") or config.GPU_DEVICE
+        return {
+            "status": "loaded" if ready else "loading",
+            "model_loaded": ready,
+            "device": device,
+            "resident_kind": _resident_kind,
+            "model": _resident_kind,
+            "precision": "bf16",
+            "offload": False,
+        }
+    model = _model
+    base = health_check(model) if model is not None else {
+        "status": "unloaded", "model_loaded": False, "device": config.GPU_DEVICE,
+        "precision": config.IDV2V_QUANT, "offload": config.IDV2V_OFFLOAD,
+    }
+    base["resident_kind"] = _resident_kind
+    base["model"] = "idv2v" if _resident_kind == "idv2v" else None
+    return base
 
 
 async def handle_evict(request: web.Request) -> web.Response:
     _require_token(request)
-    global _model
+    global _model, _resident_kind
     async with _model_lock:
         if _model is not None:
             _model.evict()
         _model = None
+        await bernini_mod.evict_manager()
+        _resident_kind = None
     return web.json_response({"evicted": True})
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    model = _model
-    info = health_check(model) if model is not None else {
-        "status": "unloaded", "model_loaded": False, "device": config.GPU_DEVICE,
-        "precision": config.IDV2V_QUANT, "offload": config.IDV2V_OFFLOAD,
-    }
-    return web.json_response({"status": "ok", **info})
+    return web.json_response({"status": "ok", **_resident_status()})
 
 
 def _device_index() -> int:
     """CUDA index this worker currently targets (for the scheduler's reconcile)."""
+    global _resident_kind
+    if _resident_kind and _resident_kind in config.BERNINI_MODELS:
+        b = bernini_mod.resident_status()
+        if b and b.get("device"):
+            ds = str(b["device"])
+            if ":" in ds:
+                try:
+                    return int(ds.split(":", 1)[1])
+                except ValueError:
+                    pass
+        return 0
     if _model is not None:
         cur = str(_model.device)
         if ":" in cur:
@@ -226,17 +308,13 @@ def _gpu_info() -> dict:
 
 async def handle_info(request: web.Request) -> web.Response:
     """GET /info — liveness + the GPU this worker renders on (for the live-runner)."""
-    model = _model
-    base = health_check(model) if model is not None else {
-        "status": "unloaded", "model_loaded": False, "device": config.GPU_DEVICE,
-        "precision": config.IDV2V_QUANT, "offload": config.IDV2V_OFFLOAD,
-    }
+    base = _resident_status()
     return web.json_response({
         "runner_id": "",
         "app": "idv2v",
         "capabilities": ["restyle", "sam3", "prompt-enhance",
                           "bernini-t2v", "bernini-v2v", "bernini-r2v"],
-        "ready": model is not None,
+        "ready": base.get("model_loaded", False),
         "gpu": _gpu_info(),
         "device_in_use": _device_index(),
         **base,
@@ -363,6 +441,7 @@ def _encode_frames_to_b64_jpeg(frames, max_side: int = 896) -> list:
 
 async def handle_restyle(request: web.Request) -> web.Response:
     _require_token(request)
+    global _resident_kind
     body = await request.json()
     job_id = body.get("job_id") or uuid.uuid4().hex[:12]
 
@@ -403,6 +482,9 @@ async def handle_restyle(request: web.Request) -> web.Response:
         pass
     model = _get_model()
     async with _model_lock:
+        # A restyle needs the id-v2v pipe (never bernini) — free a resident
+        # Bernini subprocess first so they don't share the GPU.
+        await bernini_mod.evict_manager()
         if not model.is_ready:
             model.set_variant(requested)
             try:
@@ -417,6 +499,7 @@ async def handle_restyle(request: web.Request) -> web.Response:
                 await asyncio.wait_for(model.load(), timeout=3600)
             except asyncio.TimeoutError:
                 return web.json_response({"error": "model load timed out", "job_id": job_id}, status=504)
+        _resident_kind = "idv2v"
     try:
         result = await run_mod.process_job(model, body, job_id=job_id)
         run_mod.set_progress(job_id, 1.0, "complete", "restyle done")
@@ -472,6 +555,7 @@ async def handle_bernini(request: web.Request) -> web.Response:
     post rails orchestrated by the live-runner.
     """
     _require_token(request)
+    global _model, _resident_kind
     # Routes are STATIC paths (aiohttp match_info has no {task} placeholder),
     # so derive the task from the request path. Handles every alias:
     #   /v1/t2v            -> t2v
@@ -497,6 +581,12 @@ async def handle_bernini(request: web.Request) -> web.Response:
         return web.json_response({"error": "missing 'prompt'"}, status=400)
 
     manager = await bernini_mod.get_manager(device=None)
+    # One resident video model per card: if the id-v2v diffsynth pipe is
+    # resident, drop it before the Bernini subprocess allocates the shared GPU.
+    if _model is not None and not run_mod.generation_active():
+        _model.evict()
+        _model = None
+    _resident_kind = manager.model
     run_mod.set_progress(job_id, 0.02, "bernini", "decoding media")
     with bernini_io.tmpdir_context() as tmpdir:
         media = bernini_io.decode_source_media(body, tmpdir)

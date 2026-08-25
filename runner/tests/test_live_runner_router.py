@@ -25,6 +25,7 @@ class InMemoryTransport(WorkerTransport):
         self.payloads = []    # request bodies sent with post()
         self.resident = None
         self.model_loaded = None   # when set, /health reports this value
+        self.down = set()      # worker names whose /health probe raises (DOWN)
 
     def _name(self, base):
         # The injected worker->base mapping points names at a base that encodes
@@ -43,6 +44,8 @@ class InMemoryTransport(WorkerTransport):
         return {}
 
     async def health(self, base):
+        if self._name(base) in self.down:
+            raise ConnectionError(f"{self._name(base)} unreachable")
         if self.model_loaded is not None:
             return {"status": "ok", "model_loaded": self.model_loaded}
         return {"status": "ok"}
@@ -85,11 +88,45 @@ async def _evict_all_releases(fake_workers, workers_map):
     assert w.resident is None
 
 
-async def _check_health_reports_workers_up(fake_workers, workers_map):
-    w = _mk(fake_workers, workers_map)
+async def _check_health_reports_workers_up(fake_workers):
+    w = ResidentWorkerManager(
+        transport=fake_workers,
+        workers={"ltx-worker": "ltx-worker", "wan-worker": "wan-worker",
+                 "gemma-worker": "gemma-worker", "image-worker": "image-worker",
+                 "vp-worker": "vp-worker"},
+    )
     meta = await w.check_health()
-    assert meta["ltx_up"] is True
-    assert meta["idv2v_up"] is True
+    # Healthy but nothing resident -> every canonical family cold. The legacy
+    # idv2v alias folds into "wan" (no standalone idv2v key).
+    assert meta["status"] == {"ltx": "c", "wan": "c", "gemma": "c", "image": "c", "vp": "c"}
+    assert "idv2v" not in meta["status"]
+
+
+async def _check_health_marks_resident_warm(fake_workers):
+    w = ResidentWorkerManager(
+        transport=fake_workers,
+        workers={"ltx-worker": "ltx-worker", "wan-worker": "wan-worker",
+                 "gemma-worker": "gemma-worker", "image-worker": "image-worker",
+                 "vp-worker": "vp-worker"},
+    )
+    await w.ensure("ltx-worker", device=0)
+    meta = await w.check_health()
+    assert meta["status"]["ltx"] == "w"
+    assert meta["status"]["wan"] == "c"
+
+
+async def _check_health_marks_down_family(fake_workers):
+    w = ResidentWorkerManager(
+        transport=fake_workers,
+        workers={"ltx-worker": "ltx-worker", "wan-worker": "wan-worker",
+                 "gemma-worker": "gemma-worker", "image-worker": "image-worker",
+                 "vp-worker": "vp-worker"},
+    )
+    # vp-worker unreachable -> its family is DOWN; ltx stays warm; others cold.
+    fake_workers.down = {"vp-worker"}
+    await w.ensure("ltx-worker", device=0)
+    meta = await w.check_health()
+    assert meta["status"] == {"ltx": "w", "wan": "c", "gemma": "c", "image": "c", "vp": "d"}
 
 
 def test_resident_starts_none(fake_workers, workers_map):
@@ -109,8 +146,16 @@ def test_evict_all_releases(fake_workers, workers_map):
     asyncio.run(_evict_all_releases(fake_workers, workers_map))
 
 
-def test_check_health_reports_workers_up(fake_workers, workers_map):
-    asyncio.run(_check_health_reports_workers_up(fake_workers, workers_map))
+def test_check_health_reports_workers_up(fake_workers):
+    asyncio.run(_check_health_reports_workers_up(fake_workers))
+
+
+def test_check_health_marks_resident_warm(fake_workers):
+    asyncio.run(_check_health_marks_resident_warm(fake_workers))
+
+
+def test_check_health_marks_down_family(fake_workers):
+    asyncio.run(_check_health_marks_down_family(fake_workers))
 
 
 def test_routing_table_has_restyle_on_idv2v():
@@ -240,9 +285,12 @@ def test_health_reports_gemma_model(fake_workers):
     async def _t():
         await wm.load_pinned()
         meta = await wm.check_health()
-        assert meta["gmm"] is True
-        assert meta["gemma_up"] is True
-        assert "gemma-worker" in meta["pin"]
+        # Pinned gemma is resident -> warm; the rest are cold. idv2v-worker in
+        # this map is the legacy alias, folding into "wan" (no idv2v key).
+        assert meta["status"]["gemma"] == "w"
+        assert meta["status"]["ltx"] == "c"
+        assert meta["status"]["wan"] == "c"
+        assert "idv2v" not in meta["status"]
 
     asyncio.run(_t())
 
@@ -341,10 +389,12 @@ class _FakeWM:
     def __init__(self):
         self.ensured = []
         self.devices = []
+        self.models = []
 
-    async def ensure(self, name, device=None):
+    async def ensure(self, name, device=None, model=None):
         self.ensured.append(name)
         self.devices.append(device)
+        self.models.append(model)
 
 
 def _patch_workers():

@@ -179,27 +179,21 @@ def build_model_specs(vram_mb: int) -> list[dict]:
             },
         },
         {
-            # Bernini is a selectable T2V engine on the wan-worker (NOT an LTX
-            # variant). Advertised as a minimal marker (display_name + native
-            # 480p/16 hint) so it surfaces in the model picker WITHOUT a matrix;
-            # the frontend (lib/bernini-delivery.ts) derives Bernini's full
-            # resolution/fps/duration grid from its native 480p@16 + the RIFE /
-            # FlashVSR post rails (never the LTX alias). Kept lean for the
-            # go-livepeer 1024-byte heartbeat metadata cap.
-            "pipeline": "bernini-1.3b",
+            # Bernini is ONE pipeline on the wan-worker (NOT an LTX variant),
+            # advertised as a single entry whose spec.options lists the engines
+            # this runner serves -- "1.3b" (fast) / "14b" (detailed, rejects >1 r2v
+            # reference). The backend (idv2v/config.resolve_model) aliases these
+            # short ids to the full wan-worker model families. The frontend maps
+            # each option to the fast/detailed model choice and ONLY selects a
+            # runner whose advertised options include the engine the user picked.
+            # Minimal marker (no resolution/fps matrix) -- the frontend
+            # (lib/bernini-delivery.ts) derives Bernini's grid from its native
+            # 480p@16 + the RIFE / FlashVSR post rails (never the LTX alias).
+            # Kept lean for the go-livepeer 1024-byte heartbeat metadata cap.
+            "pipeline": "bernini",
             "spec": {
-                "display_name": "Bernini 1.3B",
-            },
-        },
-        {
-            # Bernini 14B (Wan2.2-T2V-A14B), fp8-quantised on-box (69G at
-            # /srv/video-creator/models/Bernini-R-Diffusers). Same minimal marker
-            # pattern as 1.3B - no matrix (frontend derives grid from
-            # lib/bernini-delivery.ts). Advertised so the picker can offer the
-            # higher-fidelity "detailed" engine; 14B rejects >1 r2v reference.
-            "pipeline": "bernini-14b",
-            "spec": {
-                "display_name": "Bernini 14B",
+                "display_name": "Bernini",
+                "options": ["1.3b", "14b"],
             },
         },
     ]

@@ -41,11 +41,18 @@ RUN pip install --no-cache-dir \
 
 # Diffusers + accelerate + transformers for the Qwen-Image-Edit / Layered / Z-Image
 # pipelines. Pinned to the versions validated with the Qwen fp8 layered checkpoint.
-# torchao provides the int8_weight_only() quant (used only for the edit engine when
-# QWEN_DTYPE=int8); the layered engine loads a PRE-QUANTIZED FP8 checkpoint and
-# does NOT quantize in flight (QWEN_LAYERED_DTYPE=fp8).
+# torchao 0.18.0 has NO source dist on PyPI (only 0.0.1/0.0.3/0.1 have sdists), so it
+# cannot be source-built with --no-binary. Its wheel is cp310-abi3 (a cross-version ABI,
+# intended to install on newer CPython incl. 3.12), so py312 install is NOT ruled out by
+# the wheel tag alone — but its compiled FP8 extension is linked against a different CUDA
+# toolkit (libcudart.so.13) than this cu12.8 image, and torchao FP8 ultimately wraps
+# PyTorch's torch._scaled_mm anyway. The VERIFIED fp8 path on this py312/cu12.8/sm120
+# stack is the native torch._scaled_mm (_swap_fp8_linears). Keep torchao 0.18.0 as a
+# binary wheel for int8_weight_only() + any torchao imports, but do NOT make torchao's
+# fp8 kernels a dependency unless one is demonstrated working here with real advantage.
 RUN pip install --no-cache-dir \
-    "diffusers==0.39.0" "accelerate>=0.33.0" "transformers==5.15.0" "torchao==0.18.0"
+    "diffusers==0.39.0" "accelerate>=0.33.0" "transformers==5.15.0" \
+    && pip install --no-cache-dir "torchao==0.18.0"
 
 # FLUX.2 [klein] 4B style-frame editor (black-forest-labs/flux2). Installed with
 # --no-deps so the pinned torch==2.8.0 / transformers==4.56.1 in its pyproject

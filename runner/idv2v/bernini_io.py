@@ -44,7 +44,9 @@ def decode_source_media(body: dict, tmpdir: str) -> dict[str, Any]:
     """
     job: dict[str, Any] = {}
 
-    video_b64 = body.get("video")
+    # `video` is the Bernini rail's field; also accept `source_video` (the worker's
+    # legacy restyle/idv2v media field) so either name decodes.
+    video_b64 = body.get("video") or body.get("source_video")
     if video_b64:
         if isinstance(video_b64, list):
             paths = []

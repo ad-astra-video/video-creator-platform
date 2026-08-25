@@ -30,6 +30,19 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger("video_creator.runner.live_runner.swap")
 
+# Canonical worker families advertised in heartbeat metadata, mapped to the
+# worker-container names that belong to each. idv2v-worker is the LEGACY alias of
+# wan-worker (the same container before the rename): restyle jobs still ensure()
+# it under the old name while Bernini jobs use wan-worker, so both feed the single
+# "wan" family and no standalone idv2v entry is emitted.
+_WORKER_FAMILY: dict[str, tuple[str, ...]] = {
+    "ltx": ("ltx-worker",),
+    "wan": ("wan-worker", "idv2v-worker"),
+    "gemma": ("gemma-worker",),
+    "image": ("image-worker",),
+    "vp": ("vp-worker",),
+}
+
 
 class WorkerTransport:
     """HTTP transport to worker containers (control + health calls).
@@ -121,7 +134,8 @@ class ResidentWorkerManager:
                     self._pinned_loaded.add(name)
                     logger.info("GPU pin: %s resident (dedicated)", name)
 
-    async def ensure(self, name: str, device: int | None = None) -> None:
+    async def ensure(self, name: str, device: int | None = None,
+                     model: str | None = None) -> None:
         """Make ``name`` resident: evict the current shared resident (if any), load ``name``.
 
         Pinned workers load (once) and are never evicted; shared-GPU workers (a
@@ -145,8 +159,10 @@ class ResidentWorkerManager:
                 # and every later ensure() short-circuited above — the worker's
                 # model was NEVER (re)loaded ("warm but unloaded"). Assigning after
                 # success lets the idle backfill keep retrying until the load lands.
-                await self.transport.post(self._base(name), "/load",
-                                          {"device": device})
+                payload: dict = {"device": device}
+                if model:
+                    payload["model"] = model
+                await self.transport.post(self._base(name), "/load", payload)
                 resident.add(device)
                 if name in self.pinned:
                     self._pinned_loaded.add(name)
@@ -167,7 +183,8 @@ class ResidentWorkerManager:
                 return
             if self._current:
                 await self.transport.post(self._base(self._current), "/evict")
-            await self.transport.post(self._base(name), "/load")
+            req = {} if not model else {"model": model}
+            await self.transport.post(self._base(name), "/load", req)
             self._current = name
             logger.info("GPU swap: %s resident", name)
 
@@ -251,30 +268,51 @@ class ResidentWorkerManager:
     async def check_health(self) -> dict:
         """Live /health probe of every worker for heartbeat metadata.
 
-        Returns a SHORTHAND status map (kept tiny for go-livepeer's 1024-byte
-        heartbeat metadata cap): {<short>_up, warm, gmm, pin} where each worker
-        name is reduced to its base token (ltx-worker -> ltx). None of these
-        keys are read by the Worker control plane or the webapp -- they are
-        informational -- so terse keys are safe. ``capabilities``/``model_specs``
-        (the actual contract) are added in server.py, not here.
+        Returns a SHORTHAND warm/cold/down map (kept tiny for go-livepeer's
+        1024-byte heartbeat metadata cap): {"status": {"ltx": "c", "wan": "d",
+        "gemma": "w", "image": "c", "vp": "c"}} — each canonical worker family is
+        "w" (model resident/warm, reachable), "c" (reachable but cold / not
+        resident), or "d" (DOWN: every probe in the family failed / unreachable).
+        A family is "d" only when none of its members is reachable; a reachable
+        member with no loaded model is "c". The legacy idv2v-worker alias maps
+        into the "wan" family, so no idv2v key appears. None of these keys are
+        read by the Worker control plane or the webapp — they are informational
+        — so terse keys are safe.
+        ``capabilities``/``model_specs``/``models`` (the actual contract) are
+        added in server.py, not here.
         """
-        up = {name: False for name in self.workers}
+        up: set[str] = set()
         health: dict[str, dict] = {}
-        for name in up:
+        for name in self.workers:
             try:
                 health[name] = await self.transport.health(self._base(name))
-                up[name] = True
+                up.add(name)
             except Exception:
                 pass
         # A worker we believe is loaded that /health now reports as NOT loaded
         # (container restarted) has its residency dropped here so the next
         # ensure()/backfill re-loads it instead of routing to an unloaded worker.
         await self._reconcile_loaded(health)
-        gemma = "gemma-worker"
-        gemma_loaded = (gemma in self._pinned_loaded) or (self._current == gemma)
+
+        def _is_warm(name: str) -> bool:
+            return (
+                name in up
+                and (
+                    name in self._pinned_loaded
+                    or self._current == name
+                    or bool(self._resident.get(name))
+                )
+            )
+
+        def _family_status(members: list[str]) -> str:
+            family_up = [m for m in members if m in up]
+            if not family_up:
+                return "d"  # every probe in the family failed -> DOWN/unreachable
+            return "w" if any(_is_warm(m) for m in family_up) else "c"
+
         return {
-            **{f"{name.split('-', 1)[0]}_up": v for name, v in up.items()},
-            "warm": self._current,
-            "gmm": gemma_loaded,
-            "pin": self.pinned_resident,
+            "status": {
+                family: _family_status(members)
+                for family, members in _WORKER_FAMILY.items()
+            }
         }

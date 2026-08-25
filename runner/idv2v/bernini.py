@@ -48,6 +48,28 @@ class BerniniError(RuntimeError):
     pass
 
 
+def _normalize_target_device(device) -> str:
+    """Normalize a target device (int index, bare ``N``, or ``cuda:N``) to a full
+    torch device string for the bernini subprocess. The device comes from the
+    live-runner scheduler's ``/load`` (may arrive as an int, a bare ``N``, or a
+    ``cuda:N`` string); ``None``/empty falls back to the worker's configured
+    GPU_DEVICE. Does NOT invent a device — if the result is empty the caller
+    (`/load`) rejects the request rather than defaulting to ``cuda:0``."""
+    target = device or config.BERNINI_GPU_DEVICE or config.GPU_DEVICE
+    if isinstance(target, bool):
+        target = str(target)
+    if isinstance(target, int):
+        return f"cuda:{target}"
+    target = str(target).strip()
+    if target and not target.startswith(("cuda", "cpu", "meta", "xpu", "mps")):
+        try:
+            if str(int(target)) == target:  # bare index e.g. "3"
+                return f"cuda:{target}"
+        except ValueError:
+            pass
+    return target
+
+
 class BerniniManager:
     """Own one resident ``bernini_cli.py`` subprocess for a single model."""
 
@@ -56,7 +78,8 @@ class BerniniManager:
                  root: Optional[str] = None, guidance: str = "rv2v"):
         self.model = model
         self.resolve_model = model  # config.resolve_model(model)
-        self.device = device or config.BERNINI_GPU_DEVICE or config.GPU_DEVICE or "cuda:0"
+        self.device = _normalize_target_device(
+            device or config.BERNINI_GPU_DEVICE or config.GPU_DEVICE or "cuda:0")
         self.venv_py = venv_py or config.BERNINI_VENV_PY
         self.root = root or config.bernini_root(model)
         self.guidance = guidance
@@ -195,11 +218,30 @@ _manager_lock = asyncio.Lock()
 
 async def get_manager(model: str = "bernini-1.3b",
                       device: Optional[str] = None) -> BerniniManager:
-    """Return (creating if needed) the worker's shared Bernini manager."""
+    """Return the worker's shared Bernini manager, loading ``model`` on ``device``.
+
+    When ``device`` is None the existing resident manager is reused (or created
+    on the worker's configured GPU) — inference simply uses whichever card the
+    scheduler placed it on via ``/load``. When ``device`` is given (a ``/load``
+    relocation), a manager that differs in model or device is evicted and a fresh
+    one created on the new target, so the live-runner can steer Bernini onto the
+    assigned GPU. A device that resolves to empty raises ``BerniniError`` — the
+    scheduler must send one; we never default to ``cuda:0``.
+    """
     global _manager
+    target = _normalize_target_device(device)
     async with _manager_lock:
-        if _manager is None:
-            _manager = BerniniManager(model=model, device=device)
+        if _manager is not None and _manager.model == model and _manager.device == target:
+            return _manager
+        if _manager is not None:
+            await _manager.evict()
+        _manager = None
+        if not target:
+            raise BerniniError(
+                "bernini load requires a 'device' from the live-runner scheduler "
+                "(none provided / GPU_DEVICE empty)"
+            )
+        _manager = BerniniManager(model=model, device=target)
         return _manager
 
 
@@ -209,3 +251,13 @@ async def evict_manager() -> None:
         if _manager is not None:
             await _manager.evict()
         _manager = None
+
+
+def resident_status() -> Optional[dict]:
+    """Advisory dict describing the resident Bernini subprocess, or None if none
+    is loaded (used by /health + /info so the live-runner sees Bernini residency
+    like any other worker model)."""
+    global _manager
+    if _manager is None:
+        return None
+    return _manager.resident

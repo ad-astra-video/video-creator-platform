@@ -175,9 +175,14 @@ async def _post(messages: list[dict[str, Any]], *, temperature: float,
         raise RuntimeError(f"Unexpected llama-server response: {exc}") from exc
     content = msg.get("content")
     reasoning = (msg.get("reasoning_content") or "").strip()
-    if not isinstance(content, str) or not content.strip():
+    content_txt = content.strip() if isinstance(content, str) else ""
+    # Gemma 4 runs llama-server with --reasoning on, so the model may put its
+    # whole answer in the reasoning channel and leave `content` empty. That is a
+    # legitimate reply — only raise when BOTH channels are empty. Callers that
+    # want the answer use chat_with_reasoning, which surfaces both.
+    if not content_txt and not reasoning:
         raise RuntimeError("llama-server returned empty content")
-    return reasoning, content.strip()
+    return reasoning, content_txt
 
 
 async def chat(messages: list[dict[str, Any]], *, max_tokens: int = 512,

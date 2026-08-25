@@ -61,6 +61,15 @@ _parallel = asyncio.Semaphore(config.GEMMA_MAX_PARALLEL)
 
 async def handle_load(request: web.Request) -> web.Response:
     _require_token(request)
+    # ``model`` accepted for symmetry with every worker's /load; gemma-worker
+    # is single-model (MODEL_NAME), so a hint that differs is logged + ignored.
+    model = None
+    try:
+        model = (await request.json()).get("model")
+    except Exception:
+        pass
+    if model and model != MODEL_NAME:
+        logger.info("gemma-worker /load: model=%s (serving %s; ignoring)", model, MODEL_NAME)
     already = await llms.is_running()
     try:
         await asyncio.wait_for(llms.ensure_running(), timeout=3600)
@@ -279,12 +288,31 @@ async def handle_suggest_layers(request: web.Request) -> web.Response:
     if not image:
         return web.json_response({"error": "missing 'image'"}, status=400)
     import base64 as _b64
-    head = _b64.b64decode(image[:64])
-    mime = "image/jpeg" if head[:3] == b"\xff\xd8\xff" else "image/png"
+    image_bytes = _b64.b64decode(image)
+    # Normalize to PNG before handing to llama-server. Its multimodal reader
+    # only reliably decodes PNG (JPEG is flaky) and rejects WebP/other formats
+    # with "Failed to load image or audio file"; the worker's own JPEG-vs-PNG
+    # sniff would mislabel WebP bytes as PNG. Pillow (bundled) re-encodes any
+    # supported format, so suggest-layers works for browser-native WebP/JPEG
+    # imports too, not just generated PNGs.
+    try:
+        from io import BytesIO as _BytesIO
+        from PIL import Image as _PIL
+        with _PIL.open(_BytesIO(image_bytes)) as im:
+            with _BytesIO() as buf:
+                im.convert("RGB").save(buf, format="PNG")
+                image_bytes = buf.getvalue()
+        mime = "image/png"
+    except Exception:
+        # Not Pillow-decodable (unexpected bytes): keep the raw image and fall
+        # back to the old sniff so llama-server rejects cleanly rather than us
+        # 500ing on a corrupt/unsupported image here.
+        mime = "image/jpeg" if image_bytes[:3] == b"\xff\xd8\xff" else "image/png"
+    image_b64 = _b64.b64encode(image_bytes).decode()
     messages = [
         {"role": "system", "content": LAYER_SUGGEST_RUBRIC},
         {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image}"}},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
             {"type": "text", "text": "How many layers should this image be decomposed into?"},
         ]},
     ]

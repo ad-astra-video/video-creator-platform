@@ -288,7 +288,7 @@ services:
     environment:
       - WORKER_TOKEN=${WORKER_TOKEN:-}
       - GPU_DEVICE=${IMAGE_GPU_DEVICE:-0}
-      - QWEN_EDIT_ROOT=${QWEN_EDIT_ROOT:-/models/image/edit}
+      - QWEN_EDIT_ROOT=${QWEN_EDIT_ROOT:-/models/image/edit-2511}
       - QWEN_LAYERED_ROOT=${QWEN_LAYERED_ROOT:-/models/image/layered}
       - ZIMAGE_ROOT=${ZIMAGE_ROOT:-/models/image/zimage}
       - QWEN_DTYPE=${QWEN_DTYPE:-fp8}
