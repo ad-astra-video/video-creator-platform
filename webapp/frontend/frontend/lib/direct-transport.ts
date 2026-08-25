@@ -62,6 +62,9 @@ const TASK_ENDPOINTS: Record<string, string> = {
   'ic-lora:extract-conditioning': '/video-creator/v1/extract-conditioning',
   edit: '/video-creator/v1/edit',
   layer: '/video-creator/v1/layer',
+  // Whole-frame klein styling runs on the IMAGE worker (capability `style-frame`) —
+  // not the id-v2v video `restyle` rail (see imageEditCapability).
+  'style-frame': '/video-creator/v1/style-frame',
   // Bernini generation/edit rails (wan-worker, engine id `idv2v`) — mirror the
   // live-runner ROUTES table additions so the browser POSTs to the right worker.
   'bernini-t2v': '/video-creator/v1/bernini-t2v',
@@ -260,12 +263,23 @@ function runnerServesModel(runner: RunnerDto, model: string | undefined): boolea
 }
 
 
+/**
+ * The capability to resolve for an image-edit operation. klein is a whole-frame style model
+ * that cannot take a mask; an unmasked klein edit styles the frame on the image worker's
+ * /style-frame rail (capability `style-frame`) — NOT the video (id-v2v) `restyle` worker.
+ * Every masked edit (including a masked klein, which falls back to an inpaint engine) and
+ * all other engines use the image worker's /edit rail (capability `edit`).
+ */
+export function imageEditCapability(engine: string, maskedEdit: boolean): 'edit' | 'style-frame' {
+  return engine === 'klein' && !maskedEdit ? 'style-frame' : 'edit'
+}
 
 /**
- * Style the restyle first frame DIRECTLY on a runner (paid Livepeer rail): hand the actual
- * image bytes (base64) to the id-v2v worker's /video-creator/v1/style-frame (FLUX.2 klein 4B)
- * instead of the Worker rail, which can't read a browser web:// asset key and simply skips
- * ("style-frame unavailable in browser without asset upload").
+ * Style an image on the image worker (paid Livepeer rail): hand the actual image bytes
+ * (base64) to the image worker's /video-creator/v1/style-frame (FLUX.2 klein 4B). Used for
+ * whole-frame klein styling and the restyle first-frame web path (which flows through
+ * ImageEditPanel). The browser POSTs directly because the Worker rail can't read a web://
+ * asset key.
  */
 export async function styleFrameViaRunner(
   runner: RunnerDto,
@@ -275,7 +289,7 @@ export async function styleFrameViaRunner(
 ): Promise<{ styledImageUrl: string; width?: number; height?: number; enhancedPrompt?: string }> {
   const res = await postToRunnerWithTicket(
     runner,
-    'restyle:style-frame',
+    'style-frame',
     {
       image: imageBase64,
       prompt,

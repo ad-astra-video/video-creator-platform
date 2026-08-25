@@ -2,7 +2,7 @@ import { useState, useCallback, useImperativeHandle, forwardRef, useEffect, useR
 import { createPortal } from 'react-dom'
 import { webAssetUrl } from '../lib/file-url'
 import { getBlob, isWebPath } from '../lib/runtime/web-store'
-import { resolveRunner, layerImageViaRunner, editImageViaRunner, styleFrameViaRunner, suggestLayersViaRunner, sam3SelectViaRunner } from '../lib/direct-transport'
+import { resolveRunner, layerImageViaRunner, editImageViaRunner, styleFrameViaRunner, suggestLayersViaRunner, sam3SelectViaRunner, imageEditCapability } from '../lib/direct-transport'
 import type { LayerRunProgress } from '../lib/direct-transport'
 import type { LayerPreview } from '../lib/direct-transport'
 import { Layers, Loader2, X, Image as ImageIcon, ChevronDown, Wand2 } from 'lucide-react'
@@ -329,7 +329,9 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
       // regenerate (the SAM3-derived mask is white = selected item; "Invert" flips it
       // so the edit touches everything EXCEPT the item).
       const maskedEdit = !!(maskB64 || samMaskB64)
-      const runner = eng === 'klein' && !maskedEdit ? await resolveRunner(['restyle']) : await resolveRunner(['edit'])
+      // klein (whole-frame) styles on the image worker's /style-frame; every masked edit and
+      // all other engines use the image worker's /edit rail (see imageEditCapability).
+      const runner = await resolveRunner([imageEditCapability(eng, maskedEdit)])
       if (!runner) { setEditError('No capable runner is available for this edit right now.'); return false }
       const b64 = await blobToBase64(blob)
       // Extra reference images for multi-reference edits (Qwen-Image-Edit-2511 /

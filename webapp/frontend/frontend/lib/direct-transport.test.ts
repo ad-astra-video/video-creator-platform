@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { readSSEStream } from './sse-stream'
-import { endpointForTask } from './direct-transport'
+import { endpointForTask, imageEditCapability } from './direct-transport'
 
 /**
  * Fake ReadableStreamDefaultReader that mirrors the REAL browser semantics the
@@ -144,5 +144,19 @@ describe('endpointForTask — Bernini + post rails', () => {
 
   it('falls back to the /video-creator/v1/{task} convention for unknown tasks', () => {
     expect(endpointForTask('some-new-task')).toBe('/video-creator/v1/some-new-task')
+  })
+})
+
+describe('image edit routing', () => {
+  it('style-frame maps to the image worker path', () => {
+    expect(endpointForTask('style-frame')).toBe('/video-creator/v1/style-frame')
+  })
+
+  it('unmasked klein routes to the style-frame (image worker) capability; everything else to edit', () => {
+    expect(imageEditCapability('klein', false)).toBe('style-frame')
+    expect(imageEditCapability('klein', true)).toBe('edit')
+    expect(imageEditCapability('qwen-edit', false)).toBe('edit')
+    expect(imageEditCapability('hidream', false)).toBe('edit')
+    expect(imageEditCapability('zimage', false)).toBe('edit')
   })
 })
