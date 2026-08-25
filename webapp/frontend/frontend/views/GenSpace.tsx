@@ -1,10 +1,9 @@
-﻿import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
-import { createPortal } from 'react-dom'
+﻿import { useState, useRef, useEffect, useCallback, useMemo, forwardRef, useImperativeHandle, useId } from 'react'
 import {
   Trash2, Download, Image, Video, X,
   Heart, Film, Volume2, VolumeX, Sparkles, Sparkle,
   Clock, Monitor, ChevronUp, ChevronDown, Scissors, Music, Undo2, Redo2, Loader2,
-  ChevronLeft, ChevronRight, Copy, Check, MoveHorizontal, Wand2
+  ChevronLeft, ChevronRight, Copy, Check, MoveHorizontal, Wand2, Play, Maximize2
 } from 'lucide-react'
 import { useProjects } from '../contexts/ProjectContext'
 import type { GenSpaceRetakeSource } from '../contexts/ProjectContext'
@@ -17,6 +16,7 @@ import { setBillingProjectId } from '../lib/billing-context'
 import { resolveRunner, enhancePromptViaRunner, pathToBase64 } from '../lib/direct-transport'
 import { isWebPlatform } from '../lib/livepeer-discovery'
 import { extractFrame } from '../lib/runtime/web-store'
+import { saveProjectTimeline, readProjectTimeline } from '../lib/runtime/fs-access'
 import { withGenerationActive } from '../lib/generation-active'
 import { useVideoGenerationModelSpecs } from '../hooks/use-video-generation-model-specs'
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
@@ -36,7 +36,6 @@ import type { ICLoraConditioningType } from '../components/ICLoraPanel'
 import type { Asset } from '../types/project-model'
 import { GenerationErrorDialog } from '../components/GenerationErrorDialog'
 import { addVisualAssetToProject } from '../lib/asset-copy'
-import { useGenerationTasks } from '../contexts/GenerationTaskContext'
 import { pathToFileUrl } from '../lib/file-url'
 import {
   areVideoGenerationSettingsEquivalent,
@@ -56,8 +55,13 @@ import type { RestylePanelHandle } from '../components/RestylePanel'
 import { EditVideoPanel } from '../components/EditVideoPanel'
 import type { EditVideoPanelHandle } from '../components/EditVideoPanel'
 import { EditTaskContainer } from '../components/EditTaskContainer'
+import { ChatDock, DOCK_DEFAULT_WIDTH, DOCK_MAX_WIDTH, DOCK_MIN_WIDTH } from '../components/ChatDock'
+import { useChatDock } from '../hooks/use-chat-dock'
+import type { ChatDockMessage } from '../lib/chat-dock'
+import { shouldDropRestoredGeneration } from '../lib/chat-dock'
 import { ImageEditPanel } from '../components/ImageEditPanel'
 import type { ImageEditCompleteMeta, ImageEditPanelHandle } from '../components/ImageEditPanel'
+import { ReferenceImagesRow } from '../components/ReferenceImagesRow'
 import { ICLoraPanel, CONDITIONING_TYPES } from '../components/ICLoraPanel'
 import type { OutpaintPads } from '../components/OutpaintCanvasEditor'
 import { LoraLibraryModal } from '../components/LoraLibraryModal'
@@ -163,7 +167,14 @@ function AssetCard({
         setIsHovered(false)
         setCurrentTime(0)
       }}
-      onClick={onPlay}
+      onClick={() => {
+        // Clicking a VIDEO opens the Edit Video panel with it loaded. Clicking an
+        // IMAGE opens the image edit panel and adds it to the prompt bar as input.
+        // Dedicated overlay buttons (below) re-expose the fullscreen preview for both.
+        if (asset.type === 'video' && onEditVideo) { onEditVideo(asset); return }
+        if (asset.type === 'image' && onEditImage) { onEditImage(asset); return }
+        onPlay()
+      }}
       draggable={asset.type === 'image'}
       onDragStart={(e) => asset.type === 'image' && onDragStart(e, asset)}
     >
@@ -294,6 +305,35 @@ function AssetCard({
           </div>
         </div>
         
+        {/* Centered preview affordance for videos (click now opens Edit Video, so a
+            dedicated button preserves the fullscreen viewer). pointer-events-none
+            wrapper keeps the rest of the overlay click-through. */}
+        {asset.type === 'video' && (
+          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 flex items-center justify-center pointer-events-none">
+            <button
+              onClick={(e) => { e.stopPropagation(); onPlay() }}
+              aria-label="Preview video fullscreen"
+              className="pointer-events-auto flex items-center justify-center h-14 w-14 rounded-full bg-black/50 backdrop-blur-md text-white hover:bg-black/70 hover:scale-105 transition-all border border-white/20"
+            >
+              <Play className="h-6 w-6 ml-0.5 fill-current" />
+            </button>
+          </div>
+        )}
+        {/* Centered preview affordance for images (click now opens the image edit
+            panel + injects into the prompt bar, so a dedicated button preserves the
+            fullscreen viewer). */}
+        {asset.type === 'image' && (
+          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 flex items-center justify-center pointer-events-none">
+            <button
+              onClick={(e) => { e.stopPropagation(); onPlay() }}
+              aria-label="Preview image fullscreen"
+              className="pointer-events-auto flex items-center justify-center h-14 w-14 rounded-full bg-black/50 backdrop-blur-md text-white hover:bg-black/70 hover:scale-105 transition-all border border-white/20"
+            >
+              <Maximize2 className="h-6 w-6" />
+            </button>
+          </div>
+        )}
+
         {/* Bottom controls for video */}
         {asset.type === 'video' && (
           <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
@@ -391,6 +431,10 @@ function StrengthArc({ value, className }: { value: number; className?: string }
 }
 
 // Options popover for image edits — strength (volume-style) + padding, both sliders.
+// Mirror of LoraInfoPopover: uses the NATIVE Popover API (popover="auto"), so the panel
+// lives in the browser's top layer (escapes any overflow clipping) and is anchored within
+// the viewport — bottom-anchored above the trigger, left-clamped, max-height + scroll —
+// so it never renders off-screen. ESC + click-outside light-dismiss come from the browser.
 function EditOptionsButton({
   strength,
   padding,
@@ -404,44 +448,45 @@ function EditOptionsButton({
   onPadding: (v: number) => void
   disabled?: boolean
 }) {
-  const [isOpen, setIsOpen] = useState(false)
-  const ref = useRef<HTMLButtonElement>(null)
+  const id = useId()
+  const btnRef = useRef<HTMLButtonElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
-  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const [isOpen, setIsOpen] = useState(false)
 
-  // Auto-close on outside click / Escape. The panel is PORTALED to document.body,
-  // so "inside" must include both the trigger button and the portaled panel — the
-  // mousedown target sits in body, not under the button, otherwise clicking a
-  // slider would look like an outside click and close the popover.
+  // Keep React state in sync with the native popover's open/close (ESC + click-outside
+  // light-dismiss are handled by the browser) so the trigger restyles while open.
   useEffect(() => {
-    if (!isOpen) return
-    const onClick = (e: MouseEvent) => {
-      const t = e.target as Node
-      const inside =
-        (ref.current && ref.current.contains(t)) ||
-        (panelRef.current && panelRef.current.contains(t))
-      if (!inside) setIsOpen(false)
-    }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setIsOpen(false) }
-    document.addEventListener('mousedown', onClick)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onClick)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [isOpen])
+    const pop = panelRef.current
+    if (!pop) return
+    const onToggle = () => setIsOpen(pop.matches(':popover-open'))
+    pop.addEventListener('toggle', onToggle)
+    return () => pop.removeEventListener('toggle', onToggle)
+  }, [])
+
+  // Native Popover API attrs missing from @types/react 18.3's JSX; cast so they render.
+  const popoverAttrs = { popover: 'auto' } as unknown as React.HTMLAttributes<HTMLDivElement>
+  const triggerAttrs = { popovertarget: id } as unknown as React.ButtonHTMLAttributes<HTMLButtonElement>
+
+  // The prompt bar sits low on screen, so anchor the panel ABOVE the trigger, clamped to
+  // stay within the viewport (mirrors LoraInfoPopover.anchor).
+  const anchor = () => {
+    const btn = btnRef.current, pop = panelRef.current
+    if (!btn || !pop) return
+    const r = btn.getBoundingClientRect()
+    pop.style.margin = '0'
+    pop.style.top = 'auto'
+    pop.style.right = 'auto'
+    pop.style.left = `${Math.max(8, r.left)}px`
+    pop.style.bottom = `${window.innerHeight - r.top + 6}px`
+  }
 
   return (
     <>
       <button
-        ref={ref}
+        ref={btnRef}
         type="button"
-        onClick={(e) => {
-          const r = e.currentTarget.getBoundingClientRect()
-          // Open upward, above the trigger — the prompt bar sits low on screen.
-          setPos({ top: r.top - 12, left: r.left })
-          setIsOpen(o => !o)
-        }}
+        {...triggerAttrs}
+        onClick={anchor}
         disabled={disabled}
         className={`flex shrink-0 items-center gap-1 whitespace-nowrap px-2 py-1.5 rounded-md transition-colors ${isOpen ? 'bg-zinc-700' : 'hover:bg-zinc-800'} ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}
         title="Edit options: strength + padding"
@@ -450,60 +495,56 @@ function EditOptionsButton({
         <StrengthArc value={strength} className="h-4 w-4 text-emerald-400" />
       </button>
 
-      {isOpen && pos && createPortal(
-        <>
-          <div className="fixed inset-0 z-[70]" onClick={() => setIsOpen(false)} />
-          <div
-            ref={panelRef}
-            className="fixed z-[71] rounded-lg border border-zinc-700 bg-zinc-900 p-3 shadow-2xl"
-            style={{ top: pos.top, left: pos.left, transform: 'translateY(-100%)' }}
-          >
-            <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-3">Edit options</div>
+      <div
+        ref={panelRef}
+        id={id}
+        {...popoverAttrs}
+        style={{ maxHeight: '70vh', overflowY: 'auto' }}
+        className="rounded-lg border border-zinc-700 bg-zinc-900 p-3 shadow-2xl"
+      >
+        <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-3">Edit options</div>
 
-            {/* Strength — vertical slider */}
-            <div className="flex items-center gap-3 min-h-[120px]">
-              <div className="flex flex-col items-center gap-1">
-                <StrengthArc value={strength} className="h-6 w-6 text-emerald-400" />
-                <span className="text-[9px] text-zinc-500 uppercase">Strength</span>
-                <input
-                  type="range"
-                  min={0.1}
-                  max={1}
-                  step={0.05}
-                  value={strength}
-                  onChange={e => onStrength(parseFloat(e.target.value))}
-                  className="h-24 accent-emerald-500"
-                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
-                  aria-label="Edit strength"
-                />
-                <span className="text-[10px] text-zinc-400 tabular-nums">{strength.toFixed(2)}</span>
-              </div>
-
-              {/* Padding — vertical slider */}
-              <div className="flex flex-col items-center gap-1">
-                <svg viewBox="0 0 20 20" className="h-6 w-6 text-zinc-300" fill="none" aria-hidden="true">
-                  <rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" strokeWidth="1.5" />
-                  <rect x="8" y="8" width="4" height="4" fill="currentColor" />
-                </svg>
-                <span className="text-[9px] text-zinc-500 uppercase">Padding</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={40}
-                  step={1}
-                  value={padding}
-                  onChange={e => onPadding(parseInt(e.target.value, 10))}
-                  className="h-24 accent-emerald-500"
-                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
-                  aria-label="Mask padding crop"
-                />
-                <span className="text-[10px] text-zinc-400 tabular-nums">{padding}px</span>
-              </div>
-            </div>
+        {/* Strength — vertical slider */}
+        <div className="flex items-center gap-3 min-h-[120px]">
+          <div className="flex flex-col items-center gap-1">
+            <StrengthArc value={strength} className="h-6 w-6 text-emerald-400" />
+            <span className="text-[9px] text-zinc-500 uppercase">Strength</span>
+            <input
+              type="range"
+              min={0.1}
+              max={1}
+              step={0.05}
+              value={strength}
+              onChange={e => onStrength(parseFloat(e.target.value))}
+              className="h-24 accent-emerald-500"
+              style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+              aria-label="Edit strength"
+            />
+            <span className="text-[10px] text-zinc-400 tabular-nums">{strength.toFixed(2)}</span>
           </div>
-        </>,
-        document.body,
-      )}
+
+          {/* Padding — vertical slider */}
+          <div className="flex flex-col items-center gap-1">
+            <svg viewBox="0 0 20 20" className="h-6 w-6 text-zinc-300" fill="none" aria-hidden="true">
+              <rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" strokeWidth="1.5" />
+              <rect x="8" y="8" width="4" height="4" fill="currentColor" />
+            </svg>
+            <span className="text-[9px] text-zinc-500 uppercase">Padding</span>
+            <input
+              type="range"
+              min={0}
+              max={40}
+              step={1}
+              value={padding}
+              onChange={e => onPadding(parseInt(e.target.value, 10))}
+              className="h-24 accent-emerald-500"
+              style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+              aria-label="Mask padding crop"
+            />
+            <span className="text-[10px] text-zinc-400 tabular-nums">{padding}px</span>
+          </div>
+        </div>
+      </div>
     </>
   )
 }
@@ -601,7 +642,7 @@ function LoRAPicker({
         <span className="truncate">{label}</span>
       </button>
       {isOpen && (
-        <div className="absolute bottom-full mb-1 left-0 z-50 w-72 max-h-80 overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 shadow-xl">
+        <div className="absolute bottom-full mb-1 right-0 z-50 w-72 max-h-80 overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 shadow-xl">
           <div className="px-3 py-2 text-[10px] uppercase tracking-wide text-zinc-500 border-b border-zinc-800">
             Select LoRAs
           </div>
@@ -682,7 +723,7 @@ function CustomLoraField({ value, onChange }: {
         <span className="truncate max-w-[140px]">{value ? `Custom: ${shortUrl}` : 'Custom LoRA'}</span>
       </button>
       {open && (
-        <div className="absolute bottom-full mb-1 left-0 z-50 w-80 rounded-md border border-zinc-700 bg-zinc-900 shadow-xl p-3 space-y-2">
+        <div className="absolute bottom-full mb-1 right-0 z-50 w-80 rounded-md border border-zinc-700 bg-zinc-900 shadow-xl p-3 space-y-2">
           <div className="text-[10px] uppercase tracking-wide text-zinc-500">Custom LoRA (Hugging Face)</div>
           <input
             value={url}
@@ -717,7 +758,7 @@ function CustomLoraField({ value, onChange }: {
   )
 }
 
-type GenSpaceMode = 'image' | 'video' | 'retake' | 'extend' | 'ic-lora' | 'restyle' | 'edit'
+type GenSpaceMode = 'image' | 'video' | 'retake' | 'extend' | 'ic-lora' | 'restyle' | 'edit' | 'edit-image'
 
 // Resolve a selected resolution option key to {width,height}, or undefined for "original"
 // (backend then uses the source resolution).
@@ -729,6 +770,15 @@ function resolveResolution(options: ResolutionOption[], key: string): { width: n
 
 // Prompt bar component matching the design
 // Two-row layout: prompt row on top, settings row below
+
+// Prompt textarea sizing: auto-grows as you type up to 6 visible lines, then scrolls.
+// The user can also drag a grip to force a taller (or shorter) fixed height.
+const PROMPT_MIN_H = 70            // min px height (matches the old fixed h-[70px])
+const PROMPT_LINE_H = 20           // leading-5 => 20px per line
+const PROMPT_MAX_LINES = 6
+const PROMPT_PAD = 16              // py-2 (8px top + bottom)
+const PROMPT_MAX_H = PROMPT_LINE_H * PROMPT_MAX_LINES + PROMPT_PAD  // 6 lines + padding
+const PROMPT_MAX_MANUAL_H = 360    // ceiling for the drag-to-resize handle
 function PromptBar({
   mode,
   onModeChange,
@@ -880,12 +930,45 @@ function PromptBar({
   const audioInputRef = useRef<HTMLInputElement>(null)
   const [isDragOver, setIsDragOver] = useState(false)
   const [isAudioDragOver, setIsAudioDragOver] = useState(false)
+  // Prompt textarea: auto-grow up to 6 lines, plus a user drag-handle for a fixed override.
+  const promptRef = useRef<HTMLTextAreaElement>(null)
+  const [promptHeight, setPromptHeight] = useState<number | null>(null)
+  useEffect(() => {
+    const el = promptRef.current
+    if (!el) return
+    if (promptHeight != null) {
+      el.style.height = `${promptHeight}px`
+      return
+    }
+    el.style.height = 'auto'
+    const target = Math.max(PROMPT_MIN_H, Math.min(el.scrollHeight, PROMPT_MAX_H))
+    el.style.height = `${target}px`
+  }, [prompt, promptHeight])
+  const startPromptResize = (e: React.PointerEvent) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const el = promptRef.current
+    const startY = e.clientY
+    const startH = promptHeight ?? (el?.offsetHeight ?? PROMPT_MIN_H)
+    const move = (ev: PointerEvent) => {
+      const h = Math.max(PROMPT_MIN_H, Math.min(PROMPT_MAX_MANUAL_H, startH + (ev.clientY - startY)))
+      setPromptHeight(Math.round(h))
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+  }
   const isRetake = mode === 'retake'
   const isExtend = mode === 'extend'
   const isIcLora = mode === 'ic-lora'
   const isRestyleImage = mode === 'restyle' && restyleTab === 'image'
   const isRestyleVideo = mode === 'restyle' && restyleTab === 'video'
-  const isEditingImage = mode === 'image' && !!inputImage
+  const isEditingImage = (mode === 'image' || mode === 'edit-image') && !!inputImage
 
   // Resolution selector: local only, and only when there's a lower tier to pick.
   const showResolution = isLocalMode && !!resolutionOpts && resolutionOpts.length > 1
@@ -1047,6 +1130,7 @@ function PromptBar({
                 ]
               : [
                   { value: 'edit', label: 'Edit Video', icon: <Wand2 className="h-4 w-4" /> },
+                  { value: 'edit-image', label: 'Edit Image', icon: <Image className="h-4 w-4" /> },
                   { value: 'restyle', label: 'Restyle', icon: <Wand2 className="h-4 w-4" /> },
                   { value: 'retake', label: 'Retake', icon: <Scissors className="h-4 w-4" /> },
                   { value: 'extend', label: 'Extend', icon: <MoveHorizontal className="h-3.5 w-3.5" /> },
@@ -1056,8 +1140,8 @@ function PromptBar({
           triggerClassName="!py-1 !px-1.5 text-[11px] text-zinc-400"
           trigger={
             <>
-              {mode === 'image' ? <Image className="h-3.5 w-3.5" /> : mode === 'edit' ? <Wand2 className="h-3.5 w-3.5" /> : mode === 'retake' ? <Scissors className="h-3.5 w-3.5" /> : mode === 'restyle' ? <Wand2 className="h-3.5 w-3.5" /> : mode === 'extend' ? <MoveHorizontal className="h-3.5 w-3.5" /> : mode === 'ic-lora' ? <Sparkles className="h-3.5 w-3.5" /> : <Video className="h-3.5 w-3.5" />}
-              <span className="text-zinc-300 font-medium">{mode === 'image' ? 'Image' : mode === 'edit' ? 'Edit Video' : mode === 'retake' ? 'Retake' : mode === 'restyle' ? 'Restyle' : mode === 'extend' ? 'Extend' : mode === 'ic-lora' ? 'IC-LoRA' : 'Video'}</span>
+              {(mode === 'image' || mode === 'edit-image') ? <Image className="h-3.5 w-3.5" /> : mode === 'edit' ? <Wand2 className="h-3.5 w-3.5" /> : mode === 'retake' ? <Scissors className="h-3.5 w-3.5" /> : mode === 'restyle' ? <Wand2 className="h-3.5 w-3.5" /> : mode === 'extend' ? <MoveHorizontal className="h-3.5 w-3.5" /> : mode === 'ic-lora' ? <Sparkles className="h-3.5 w-3.5" /> : <Video className="h-3.5 w-3.5" />}
+              <span className="text-zinc-300 font-medium">{mode === 'edit-image' ? 'Edit Image' : mode === 'image' ? 'Image' : mode === 'edit' ? 'Edit Video' : mode === 'retake' ? 'Retake' : mode === 'restyle' ? 'Restyle' : mode === 'extend' ? 'Extend' : mode === 'ic-lora' ? 'IC-LoRA' : 'Video'}</span>
               <ChevronDown className="h-3 w-3 text-zinc-500" />
             </>
           }
@@ -1067,7 +1151,7 @@ function PromptBar({
       {/* Top row: Image ref | Prompt | Generate */}
       <div className="flex items-start">
         {/* Input image drop zone — video mode (I2V) or image mode (edit source) */}
-        {(mode === 'video' || mode === 'image') && !isRetake && !isIcLora && (
+        {(mode === 'video' || mode === 'image' || mode === 'edit-image') && !isRetake && !isIcLora && (
           <div
             className={`relative w-10 h-10 mx-2 mt-2 rounded-lg border-2 border-dashed transition-colors flex items-center justify-center flex-shrink-0 cursor-pointer ${
               isDragOver ? 'border-blue-500 bg-blue-500/10' : 'border-zinc-700 hover:border-zinc-500'
@@ -1138,6 +1222,7 @@ function PromptBar({
         {/* Prompt input - fills remaining width */}
         <div className="flex-1 min-w-0 py-1">
           <textarea
+            ref={promptRef}
             value={prompt}
             onChange={(e) => onPromptChange(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -1151,7 +1236,7 @@ function PromptBar({
                 ? (promptOptional
                     ? "Describe the new area, or leave empty to extend the scene..."
                     : "Describe the style or transformation to apply...")
-              : mode === 'image'
+              : (mode === 'image' || mode === 'edit-image')
                 ? (isEditingImage
                     ? "Describe the change, e.g. make it photorealistic..."
                     : "A close-up of a woman talking on the phone...")
@@ -1159,12 +1244,17 @@ function PromptBar({
             }
             className="w-full bg-transparent text-white text-sm placeholder:text-zinc-500 focus:outline-none px-2 py-2 resize-none overflow-y-auto h-[70px] leading-5"
           />
+          <div
+            onPointerDown={startPromptResize}
+            title="Drag to resize prompt area"
+            className="h-2 mt-0.5 cursor-ns-resize rounded-full bg-zinc-800/40 hover:bg-zinc-500/60 active:bg-zinc-500/80 transition-colors"
+          />
         </div>
 
       </div>
       
       {/* Bottom row: Mode selector + Settings */}
-      <div className="flex items-center gap-0.5 px-1.5 py-1.5 border-t border-zinc-800/60 text-xs text-zinc-400">
+      <div className="flex flex-wrap items-center gap-x-0.5 gap-y-1.5 px-1.5 py-1.5 border-t border-zinc-800/60 text-xs text-zinc-400">
         <div className="flex-1" />
         
         {mode !== 'edit' && (
@@ -1295,7 +1385,7 @@ function PromptBar({
           </>
         ) : isIcLora ? (
         <IcLoraSettingsControls {...icLoraControls} />
-        ) : mode === 'image' ? (
+        ) : (mode === 'image' || mode === 'edit-image') ? (
           <>
             {/* Model selector — edit mode (Qwen-Image-Edit | FLUX.2 klein) vs T2I (Z-Image | FLUX.2 Klein) */}
             {isEditingImage ? (
@@ -1563,6 +1653,12 @@ function PromptBar({
           </>
         )}
         
+          </>
+        )}
+      </div>
+      {/* Action row: Enhance (left) + Generate (right) — below the generation settings */}
+      <div className="flex items-center justify-between gap-2 px-1.5 pt-1.5 pb-1.5 border-t border-zinc-800/60">
+        <div className="flex items-center gap-1 flex-wrap">
         {/* Catalog-aware prompt enhancer — video/IC-LoRA (local-generation-only) or image
             (generation/editing, any backend). Runs either the local Gemma text encoder or, if
             available, Gemini's hosted API. */}
@@ -1629,14 +1725,13 @@ function PromptBar({
             </div>
           </>
         )}
-          </>
-        )}
 
+        </div>
         {/* Generate button */}
         <button
           onClick={onGenerate}
           disabled={isGenerating || !canGenerate || isEnhancingPrompt}
-          className={`flex items-center gap-1.5 ml-2 px-3 py-1.5 rounded-md text-xs font-medium transition-all flex-shrink-0 ${
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all flex-shrink-0 ${
             isGenerating || !canGenerate || isEnhancingPrompt
               ? 'bg-zinc-700 text-zinc-500 cursor-not-allowed'
               : 'bg-white text-black hover:bg-zinc-200'
@@ -1727,7 +1822,11 @@ const DEFAULT_VIDEO_SETTINGS = {
   first_frame_engine: 'qwen-edit' as 'qwen-edit' | 'klein' | 'hidream',
 }
 
-export function GenSpace() {
+export interface GenSpaceHandle {
+  returnToAssets: () => void
+}
+
+export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref) {
   const {
     activeProject,
     addAsset,
@@ -1746,9 +1845,6 @@ export function GenSpace() {
     setGenSpaceIcLoraSource,
     setPendingIcLoraUpdate,
   } = useProjects()
-  const { trackGeneration, generationCompleted, generationFailed } = useGenerationTasks()
-  const genTaskIdRef = useRef<string | null>(null)
-  const genImageTaskIdRef = useRef<string | null>(null)
   const currentProjectId = activeProject?.id ?? null
   const { shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, forceApiGenerations, settings: appSettings } = useAppSettings()
   const {
@@ -1774,6 +1870,15 @@ export function GenSpace() {
   const [gallerySize, setGallerySize] = useState<GallerySize>('medium')
   const [showSizeMenu, setShowSizeMenu] = useState(false)
   const sizeMenuRef = useRef<HTMLDivElement>(null)
+
+  // Expose 'return to the project assets listing' to the header (Project.tsx):
+  // dismiss any open task panel (mode) and the fullscreen asset preview modal.
+  useImperativeHandle(ref, () => ({
+    returnToAssets: () => {
+      setMode('video')
+      setSelectedAsset(null)
+    },
+  }), [])
   const persistedVideoKeyRef = useRef<string | null>(null)
   const retakeSubmissionRef = useRef<{
     prompt: string
@@ -1846,7 +1951,7 @@ export function GenSpace() {
   // LoRA picker is local-only), it just falls back to a generic rewrite. "retake"/"extend" have
   // no prompt input, so they're excluded.
   const enhanceAvailableForMode =
-    mode === 'video' || mode === 'ic-lora' || mode === 'image' || mode === 'extend' || mode === 'retake' || mode === 'restyle'
+    mode === 'video' || mode === 'ic-lora' || mode === 'image' || mode === 'edit-image' || mode === 'extend' || mode === 'retake' || mode === 'restyle'
   // The prompt enhancer can run the local Gemma text encoder OR Gemini's hosted API — this hook
   // tracks which of those is actually available (not just which the user prefers) and picks
   // whichever provider Enhance should use. Refetched whenever the user is in a mode the button
@@ -2130,6 +2235,84 @@ export function GenSpace() {
   // Edit Video (Bernini v2v/r2v rail) state — source video + imperative handle driven
   // by the main prompt bar (mirrors the restyle panel pattern).
   const editVideoPanelRef = useRef<EditVideoPanelHandle>(null)
+
+  // Right-side chat dock: message history (generations vs chats) + layout state.
+  const chat = useChatDock()
+  // User-resizable dock width, persisted so the last size is reused on reload.
+  const [dockWidth, setDockWidth] = useState<number>(() => {
+    try {
+      const v = Number(localStorage.getItem('vc-chat-dock-width'))
+      if (!Number.isFinite(v)) return DOCK_DEFAULT_WIDTH
+      return Math.min(DOCK_MAX_WIDTH, Math.max(DOCK_MIN_WIDTH, v))
+    } catch {
+      return DOCK_DEFAULT_WIDTH
+    }
+  })
+  const onDockWidthChange = useCallback((w: number) => {
+    setDockWidth(w)
+    try { localStorage.setItem('vc-chat-dock-width', String(w)) } catch {}
+  }, [])
+  // ── Project timeline persistence ───────────────────────────────────────────
+  // The chat history IS the project timeline: written to the project's assets
+  // folder (`<projectId>/timeline.json`) as it changes, and restored on load so
+  // a reopened project comes back with its history. Best-effort via fs-access.
+  const restoredTimelineForRef = useRef<string | null>(null)
+  const timelineSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    if (!currentProjectId) return
+    const projectId = currentProjectId
+    if (restoredTimelineForRef.current === projectId) return
+    restoredTimelineForRef.current = projectId
+    if (chat.messages.length > 0) return
+    void (async () => {
+      try {
+        const raw = await readProjectTimeline(projectId)
+        const saved = raw as { version?: number; messages?: unknown } | null
+        if (saved && Array.isArray(saved.messages) && saved.messages.length > 0) {
+          // Deleted results aren't re-shown: drop any generation card whose
+          // result asset was deleted from the project before restoring. This
+          // covers deletion from every surface (GenSpace grid, Video Editor).
+          const assetPaths = activeProject?.assets
+            ? new Set<string>(activeProject.assets.map((a) => a.path))
+            : null
+          const restored = (saved.messages as ChatDockMessage[]).filter(
+            (m) => m.kind !== 'generation' || !shouldDropRestoredGeneration(m, assetPaths),
+          )
+          if (restored.length > 0) chat.replaceMessages(restored)
+        }
+      } catch {
+        logger.warn('Could not restore project timeline')
+      }
+    })()
+  }, [currentProjectId, chat])
+
+  useEffect(() => {
+    if (!currentProjectId) return
+    const projectId = currentProjectId
+    const messages = chat.messages
+    if (timelineSaveTimerRef.current) clearTimeout(timelineSaveTimerRef.current)
+    timelineSaveTimerRef.current = setTimeout(() => {
+      void saveProjectTimeline(projectId, { version: 1, messages }).catch(() => {})
+    }, 800)
+    return () => {
+      if (timelineSaveTimerRef.current) clearTimeout(timelineSaveTimerRef.current)
+    }
+  }, [currentProjectId, chat.messages])
+
+  // Canvas right-edge reservation (px) so the panels stop short of the dock.
+  // Floating -> the modal overlays the canvas, so reserve nothing.
+  const dockReserved = chat.placement === 'floating' ? 0 : (chat.view === 'collapsed' ? 36 : dockWidth)
+  const modeLabelDock =
+    mode === 'edit-image' ? 'Edit Image'
+      : mode === 'image' ? 'Image'
+      : mode === 'edit' ? 'Edit Video'
+        : mode === 'retake' ? 'Retake'
+          : mode === 'restyle' ? 'Restyle'
+            : mode === 'extend' ? 'Extend'
+              : mode === 'ic-lora' ? 'IC-LoRA'
+                : 'Video'
+
   const [editVideoInitial, setEditVideoInitial] = useState<{
     videoPath: string | null
   }>({ videoPath: null })
@@ -2297,8 +2480,32 @@ export function GenSpace() {
     }
   }, [icLoraError])
 
-  // Only show assets that were generated (have generationParams), not imported files
+  // Only show assets that were generated (have generationParams), not imported files.
+  // NOTE: project assets are stored NEWEST-FIRST (ProjectContext.addAsset prepends), so this
+  // filtered view is newest-first too — assets[0] is the most recent result.
   const assets = (activeProject?.assets || []).filter(a => a.generationParams)
+
+  // Resolve a still-running generation entry in the chat dock when a NEW asset
+  // lands in the project (the submit flow adds the produced media via the
+  // project store). Marking the oldest still-running card with the newest asset
+  // is a sound heuristic for the sequential, one-generation-at-a-time UI.
+  const prevAssetCount = useRef(0)
+  useEffect(() => {
+    const n = assets.length
+    if (n > prevAssetCount.current && n > 0) {
+      // assets[0] is the just-added result (prepend order) — NOT assets[n-1],
+      // which is the OLDEST generated asset (e.g. the project base image).
+      const newest = assets[0]
+      const runIdx = chat.messages.findIndex((m) => m.kind === 'generation' && m.status === 'running')
+      if (runIdx !== -1 && newest?.path) {
+        // still = the precomputed frame thumbnail (falls back to the result path) so a
+        // video result shows a real frame in history instead of a black <video> element.
+        const stillPath = newest.smallThumbnailPath || newest.bigThumbnailPath || newest.path
+        chat.markGenerationDone(chat.messages[runIdx].id, newest.path, stillPath)
+      }
+    }
+    prevAssetCount.current = n
+  }, [assets, chat])
   const [lastPrompt, setLastPrompt] = useState('')
 
   // On mount: recover any generation that was still running when the frontend reloaded.
@@ -2442,17 +2649,9 @@ export function GenSpace() {
           }],
           activeTakeIndex: 0,
         })
-        if (genTaskIdRef.current) {
-          generationCompleted(genTaskIdRef.current, lastPrompt || 'Video generation', videoPath)
-          genTaskIdRef.current = null
-        }
         reset()
       } catch (err) {
         persistedVideoKeyRef.current = null
-        if (genTaskIdRef.current) {
-          generationFailed(genTaskIdRef.current, lastPrompt || 'Video generation', err instanceof Error ? err.message : String(err))
-          genTaskIdRef.current = null
-        }
         logger.error(`Failed to persist generated video asset: ${err}`)
       }
     })()
@@ -2850,16 +3049,8 @@ export function GenSpace() {
             activeTakeIndex: 0,
           })
         }
-        if (genImageTaskIdRef.current) {
-          generationCompleted(genImageTaskIdRef.current, lastPrompt || 'Image generation', imagePaths[imagePaths.length - 1] ?? imagePaths[0])
-          genImageTaskIdRef.current = null
-        }
         reset()
       } catch (err) {
-        if (genImageTaskIdRef.current) {
-          generationFailed(genImageTaskIdRef.current, lastPrompt || 'Image generation', err instanceof Error ? err.message : String(err))
-          genImageTaskIdRef.current = null
-        }
         logger.error(`Failed to persist generated image asset(s): ${err}`)
       } finally {
         addingImagesRef.current = false
@@ -2978,7 +3169,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     // meaningful in image mode or video's i2v; IC-LoRA's own reference is always a driving
     // video (icLoraInput.videoPath), never this, so a leftover inputImage from an earlier
     // image-mode/i2v session must not leak into an IC-LoRA (or plain t2v) enhance call.
-    const imagePathForEnhance = mode === 'image' || mode === 'video' ? inputImage ?? undefined : undefined
+    const imagePathForEnhance = mode === 'image' || mode === 'edit-image' || mode === 'video' ? inputImage ?? undefined : undefined
     // The runner's prompt-enhance worker grounds the rewrite in the reference image ONLY when it
     // receives the actual image bytes as `image_base64` (a browser web:// path is unreadable
     // remotely, so forwarding just image_path makes the worker fall through to a generic t2v
@@ -3027,7 +3218,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         const runner = await resolveRunner(['prompt-enhance'])  // runner advertises prompt-enhance, not prompt
         if (!runner) return { ok: false, status: '4XX', error: { code: 'NO_RUNNER', message: 'No capable Livepeer runner available for prompt enhancement' } as any }
         try {
-          const enhancedPrompt = await enhancePromptViaRunner(runner, {
+          const { enhancedPrompt, reasoning } = await enhancePromptViaRunner(runner, {
             prompt: sourcePrompt,
             lora_catalog_ids: loraCatalogIds,
             ic_lora_id: mode === 'ic-lora' ? selectedIcLoraId ?? undefined : undefined,
@@ -3038,9 +3229,9 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             direction: extendDir,
             task: enhanceTask,
             provider: enhanceProvider,
-            media_type: mode === 'image' ? 'image' : 'video',
+            media_type: (mode === 'image' || mode === 'edit-image') ? 'image' : 'video',
           })
-          return { ok: true, data: { enhancedPrompt } as any }
+          return { ok: true, data: { enhancedPrompt, reasoning } as any }
         } catch (e) {
           const msg = e instanceof Error ? e.message : 'Enhance failed'
           return { ok: false, status: '5XX', error: { code: 'RUNNER_ERROR', message: msg } as any }
@@ -3053,7 +3244,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         conditioningType,
         imagePath: imagePathForEnhance,
         provider: enhanceProvider,
-        mediaType: mode === 'image' ? 'image' : 'video',
+        mediaType: (mode === 'image' || mode === 'edit-image') ? 'image' : 'video',
       } as any)
     })
 
@@ -3073,6 +3264,27 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     logger.info('Enhance request succeeded, clearing recovery marker')
     localStorage.removeItem(GENERATION_RECOVERY_KEY)
     applyEnhanceResult(sourcePrompt, result.data.enhancedPrompt)
+    // LLM trace card: a real, non-fabricated record of what was sent (the request inputs
+    // we control) and the response, with the runner's reasoning when present. The deeper
+    // server-built prompt messages are surfaced once prompt building moves client-side.
+    chat.addLlmTrace({
+      label: 'Enhance',
+      sent: {
+        prompt: sourcePrompt,
+        mode,
+        ...(loraCatalogIds.length ? { loraCatalogIds } : {}),
+        ...(conditioningType ? { conditioningType } : {}),
+        image: imagePathForEnhance ? 'present' : 'none',
+        contextFrames: contextFrames ? contextFrames.length : 0,
+        ...(extendDir ? { direction: extendDir } : {}),
+        ...(enhanceTask ? { task: enhanceTask } : {}),
+      },
+      response: result.data.enhancedPrompt,
+      ...(typeof result.data.reasoning === 'string' && result.data.reasoning
+        ? { reasoning: result.data.reasoning }
+        : {}),
+      appliedTo: 'prompt',
+    })
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Enhance failed unexpectedly'
       setEnhancePromptError(msg)
@@ -3082,7 +3294,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     } finally {
       setIsEnhancingPrompt(false)
     }
-  }, [isEnhancingPrompt, mode, selectedLoras, selectedIcLoraId, icLoraCondType, inputImage, extendInput, extendDirection, retakeInput, enhanceProvider, applyEnhanceResult, writeRecoveryContext])
+  }, [isEnhancingPrompt, mode, selectedLoras, selectedIcLoraId, icLoraCondType, inputImage, extendInput, extendDirection, retakeInput, enhanceProvider, applyEnhanceResult, writeRecoveryContext, chat])
 
   const handleEnhancePrompt = useCallback(() => {
     if (!canEnhancePrompt) return
@@ -3144,6 +3356,10 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   }, []) // mount only
 
   const handleGenerate = async () => {
+    // Record a running generation in the chat dock; the assets-completion
+    // watcher flips it to done (with the produced media) once it lands.
+    const submittedPrompt = prompt.trim()
+    const genId = submittedPrompt ? chat.addGeneration(submittedPrompt, mode) : null
     if (mode === 'ic-lora') {
       if ((!prompt.trim() && !promptOptional) || !icLoraInput.videoPath || !icLoraInput.ready) return
 
@@ -3249,7 +3465,11 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       if (!editVideoInitial.videoPath) return
       setPrompt(prompt)
       await writeRecoveryContext({ prompt })
-      await editVideoPanelRef.current?.runEdit(prompt)
+      // Surface a runner/transport failure on the chat-dock card that is waiting for a
+      // response (created at the top of handleGenerate), instead of stranding it on
+      // 'running'. The inline error still shows in the Edit Video panel too.
+      const editErr = await editVideoPanelRef.current?.runEdit(prompt)
+      if (editErr && genId) chat.markGenerationError(genId, editErr)
       return
     }
 
@@ -3262,6 +3482,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           prompt,
           enhance: false,
           engine: settings.first_frame_engine ?? 'qwen-edit',
+          referenceImages: editReferenceKeys,
         })
         if (!started) return
         return
@@ -3308,10 +3529,10 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     // Save the prompt before generation starts
     setLastPrompt(prompt)
 
-    if (mode === 'image') {
+    if (mode === 'image' || mode === 'edit-image') {
       // Layered / region-selective editing via the ImageEditPanel, driven by the prompt bar.
       if (inputImage && imageEditPanelRef.current) {
-        const ok = await imageEditPanelRef.current.runEdit(prompt, { engine: settings.imageEditModel ?? 'qwen-edit', quality: settings.imageEditQuality ?? (settings.imageEditModel === 'hidream' ? 'high' : 'balanced'), strength: settings.imageEditStrength ?? 0.55, paddingMaskCrop: settings.imageEditPadding ?? 0, onProgress: (p) => setImageEditProgress(p) })
+        const ok = await imageEditPanelRef.current.runEdit(prompt, { engine: settings.imageEditModel ?? 'qwen-edit', quality: settings.imageEditQuality ?? (settings.imageEditModel === 'hidream' ? 'high' : 'balanced'), strength: settings.imageEditStrength ?? 0.55, paddingMaskCrop: settings.imageEditPadding ?? 0, referenceImages: editReferenceKeys, onProgress: (p) => setImageEditProgress(p) })
         if (ok) return
         // No capable runner / no edit — fall through to the standard image rail.
       }
@@ -3337,7 +3558,6 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         imageEditQuality: settings.imageEditQuality ?? 'balanced',
       }
       await writeRecoveryContext({ prompt, settings: imageSettings, genType: 'image', inputImageUrl: editSource ?? undefined })
-      genImageTaskIdRef.current = trackGeneration({ label: prompt || 'Image generation', kind: 'image', projectId: currentProjectId })
       generateImage(prompt, imageSettings, editSource)
     } else {
       // Generate video (t2v if no image/audio, i2v if image, a2v if audio)
@@ -3366,7 +3586,6 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         inputImageUrl: imagePath ?? undefined,
         inputAudioUrl: audioPath ?? undefined,
       })
-      genTaskIdRef.current = trackGeneration({ label: prompt || 'Video generation', kind: 'video', projectId: currentProjectId })
       generate(prompt, imagePath, genSettings, audioPath)
     }
   }
@@ -3377,6 +3596,21 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   // True while an item/layer mask is active in the embedded ImageEditPanel — masks
   // require the inpaint engine, so the FLUX.2 klein edit model is disabled then.
   const [imageMaskActive, setImageMaskActive] = useState(false)
+  // Reference images for multi-image edits (Qwen-Image-Edit-2511 / HiDream-O1):
+  // extra project images attached alongside the primary edit target, sent as a
+  // list to /edit. Cleared when the primary edit image changes.
+  const [editReferenceKeys, setEditReferenceKeys] = useState<string[]>([])
+
+  // The primary edit target for the reference row: the image being edited (image /
+  // edit-image) or the restyle first frame (restyle image tab). The row is shown
+  // while either surface is active, and multi-ref is honored by qwen-edit / hidream.
+  const refPrimaryKey = (mode === 'restyle' && restyleTab === 'image')
+    ? restyleFrameState.extractedFramePath ?? null
+    : (mode === 'image' || mode === 'edit-image') && !!inputImage ? inputImage : null
+  const refRowActive = refPrimaryKey != null
+  useEffect(() => { setEditReferenceKeys([]) }, [refPrimaryKey])
+  const addReference = (path: string) => setEditReferenceKeys(prev => prev.includes(path) ? prev : [...prev, path])
+  const removeReference = (path: string) => setEditReferenceKeys(prev => prev.filter(x => x !== path))
 
   // Persist an ImageEditPanel's edited image into the project and continue editing on it.
   const handleImageEditComplete = useCallback(async (newKey: string, meta: ImageEditCompleteMeta) => {
@@ -3425,10 +3659,14 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     }
   }, [currentProjectId, addAsset, settings.imageResolution, settings.aspectRatio, inputImage, setInputImage])
 
-  const handleDelete = (assetId: string) => {
-    if (currentProjectId) {
-      deleteAsset(currentProjectId, assetId)
-    }
+  const handleDelete = (asset: Asset) => {
+    if (!currentProjectId) return
+    // Mark chat-dock generation cards for this result as deleted so the live
+    // timeline shows a placeholder instead of a broken preview (and drops them
+    // when the project is reopened). Match the media path plus its thumbnails.
+    const paths = [asset.path, asset.smallThumbnailPath, asset.bigThumbnailPath].filter(Boolean) as string[]
+    chat.markGenerationDeleted(paths)
+    deleteAsset(currentProjectId, asset.id)
   }
   
   const handleDragStart = (e: React.DragEvent, asset: Asset) => {
@@ -3444,7 +3682,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   }
 
   const handleEditImage = (imageAsset: Asset) => {
-    setMode('image')
+    setMode('edit-image')
     setInputImage(imageAsset.path)
     setPrompt((prev) => (prev.trim() ? prev : imageAsset.prompt || ''))
   }
@@ -3680,7 +3918,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       {/* Assets area — full width, no background, above the prompt bar */}
       {/* Kept mounted even with no assets so the Browse LoRAs / Favorites / size toolbar survives the empty state. */}
       {isLibraryMode && !(mode === 'image' && !!inputImage) && (
-        <div className="absolute inset-x-0 top-0 bottom-[160px] flex flex-col px-4 pt-4">
+        <div className="absolute inset-x-0 top-0 bottom-0 flex flex-col px-4 pt-4" style={{ right: dockReserved }}>
           {/* Top bar */}
           <div className="flex items-center justify-between pb-2 gap-2">
             <div className="flex items-center gap-2">
@@ -3782,7 +4020,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                 <AssetCard
                   key={asset.id}
                   asset={asset}
-                  onDelete={() => handleDelete(asset.id)}
+                  onDelete={() => handleDelete(asset)}
                   onPlay={() => setSelectedAsset(asset)}
                   onDragStart={handleDragStart}
                   onCreateVideo={handleCreateVideo}
@@ -3800,8 +4038,16 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         </div>
       )}
 
-      {mode === 'image' && !!inputImage && (
-        <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+      {(mode === 'image' || mode === 'edit-image') && !!inputImage && (
+        <div className="absolute inset-x-0 top-0 bottom-0 px-4 pt-4 pb-4 flex flex-col overflow-hidden" style={{ right: dockReserved }}>
+          <EditTaskContainer
+            assets={activeProject?.assets}
+            activeImagePath={inputImage}
+            showImages
+            showVideos={false}
+            onPickVideo={() => {}}
+            onPickImage={handleEditImage}
+          >
           <div className="flex-1 min-h-0 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3 overflow-y-auto">
             <ImageEditPanel
               ref={imageEditPanelRef}
@@ -3811,11 +4057,12 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
               onActiveChange={(info) => setImageMaskActive(info.masked)}
             />
           </div>
+          </EditTaskContainer>
         </div>
       )}
 
       {mode === 'retake' && (
-        <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+        <div className="absolute inset-x-0 top-0 bottom-0 px-4 pt-4 pb-4 flex flex-col overflow-hidden" style={{ right: dockReserved }}>
           <EditTaskContainer
             assets={activeProject?.assets}
             activeVideoPath={retakeInitial.videoPath}
@@ -3836,7 +4083,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       )}
 
             {mode === 'edit' && (
-              <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+              <div className="absolute inset-x-0 top-0 bottom-0 px-4 pt-4 pb-4 flex flex-col overflow-hidden" style={{ right: dockReserved }}>
                 <EditTaskContainer
                   assets={activeProject?.assets}
                   activeVideoPath={editVideoInitial.videoPath}
@@ -3847,7 +4094,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                   initialVideoPath={editVideoInitial.videoPath}
                   resetKey={editVideoPanelKey}
                   fillHeight
-                  engine={settings.model === 'bernini-14b' ? 'bernini-14b' : 'bernini-1.3b'}
+                  engine={settings.model === '14b' ? '14b' : '1.3b'}
                   onSourceChange={({ videoPath, ready }) => {
                     if (ready) setEditVideoInitial((prev) => ({ ...prev, videoPath }))
                   }}
@@ -3857,7 +4104,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             )}
 
             {mode === 'restyle' && (
-              <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+              <div className="absolute inset-x-0 top-0 bottom-0 px-4 pt-4 pb-4 flex flex-col overflow-hidden" style={{ right: dockReserved }}>
                 <EditTaskContainer
                   assets={activeProject?.assets}
                   activeVideoPath={restyleInitial.videoPath}
@@ -3965,7 +4212,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       )}
 
       {mode === 'extend' && (
-        <div className="absolute inset-x-0 top-0 bottom-[160px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+        <div className="absolute inset-x-0 top-0 bottom-0 px-4 pt-4 pb-4 flex flex-col overflow-hidden" style={{ right: dockReserved }}>
           <EditTaskContainer
             assets={activeProject?.assets}
             activeVideoPath={extendInitial.videoPath}
@@ -3988,7 +4235,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       {mode === 'ic-lora' && !forceApiGenerations && (
         // Extra bottom clearance (vs 160px elsewhere): the floating panel here also carries the
         // selected-IC-LoRA info banner, so reserve room so it can't cover the panel's bottom bar.
-        <div className="absolute inset-x-0 top-0 bottom-[210px] px-4 pt-4 pb-4 flex flex-col overflow-hidden">
+        <div className="absolute inset-x-0 top-0 bottom-0 px-4 pt-4 pb-4 flex flex-col overflow-hidden" style={{ right: dockReserved }}>
           <EditTaskContainer
             assets={activeProject?.assets}
             activeVideoPath={icLoraInitial.videoPath}
@@ -4035,8 +4282,21 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         </div>
       )}
 
-      {/* Floating prompt panel — wider, responsive, centered */}
-      <div className="absolute bottom-5 left-1/2 w-[min(860px,calc(100%-2rem))] -translate-x-1/2">
+      {/* Chat dock — the prompt panel docked to the right, hosting the message
+          history (generations vs chats) above the prompt/settings bar. */}
+      <div className="absolute top-2 right-0 bottom-2 overflow-visible" style={{ width: dockReserved }}>
+        <ChatDock
+          messages={chat.messages}
+          view={chat.view}
+          placement={chat.placement}
+          modeLabel={modeLabelDock}
+          onToggleCollapse={chat.toggleCollapse}
+          onTogglePlacement={chat.togglePlacement}
+          onClear={chat.clear}
+          onStopTrack={chat.stopTracking}
+          width={dockWidth}
+          onWidthChange={onDockWidthChange}
+        >
 
         {/* Active IC-LoRA (IC-LoRA view only). */}
         {mode === 'ic-lora' && isCatalogIcLora && selectedIcLora && (
@@ -4065,6 +4325,16 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
               isCommunity: entry?.author?.affiliation !== 'ltx',
             }
           })} />
+        )}
+
+        {refRowActive && (
+          <ReferenceImagesRow
+            primaryKey={refPrimaryKey}
+            references={editReferenceKeys}
+            assets={activeProject?.assets}
+            onAdd={addReference}
+            onRemove={removeReference}
+          />
         )}
 
         {/* Prompt bar */}
@@ -4131,10 +4401,11 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
 
         {/* Advanced IC-LoRA controls — bottom-aligned to the right of the prompt panel. */}
         {mode === 'ic-lora' && !forceApiGenerations && advancedIcLoraControls && (
-          <div className="absolute left-full bottom-0 ml-3">
+          <div className="pt-1">
             <IcLoraAdvancedPanel {...icLoraControlsProps} />
           </div>
         )}
+        </ChatDock>
       </div>
 
       <LoraLibraryModal
@@ -4235,6 +4506,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
                 {[
                   selectedAsset.resolution,
                   selectedAsset.duration ? `${formatSeconds(selectedAsset.duration)}s` : 'Image',
+                  selectedAsset.generationParams?.seed != null ? `Seed ${selectedAsset.generationParams.seed}` : null,
                 ].filter(Boolean).join(' • ')}
               </p>
             </div>
@@ -4332,4 +4604,4 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       )}
     </div>
   )
-}
+})

@@ -25,8 +25,7 @@ import { LogViewer } from './components/LogViewer'
 import { ApiGatewayModal, type ApiGatewaySection } from './components/ApiGatewayModal'
 import { Button } from './components/ui/button'
 import { ProjectAssetsFolderModal } from './components/ProjectAssetsFolderModal'
-import { GenerationTaskProvider } from './contexts/GenerationTaskContext'
-import { GenerationTaskPanel } from './components/GenerationTaskPanel'
+
 import { WebFirstRun } from './components/WebFirstRun'
 
 type SetupState = 'loading' | { needsSetup: boolean; needsLicense: boolean }
@@ -741,20 +740,17 @@ function AppContent() {
 export default function App() {
   return (
     <ProjectProvider>
-      <GenerationTaskProvider>
-        <ViewProvider>
-        <KeyboardShortcutsProvider>
-          <AppSettingsProvider>
-            <DevFlagsProvider>
-              <AppContent />
-              <GenerationTaskPanel />
-              <KeyboardShortcutsModal />
-              <DevPanel />
-            </DevFlagsProvider>
-          </AppSettingsProvider>
-        </KeyboardShortcutsProvider>
-        </ViewProvider>
-      </GenerationTaskProvider>
+      <ViewProvider>
+      <KeyboardShortcutsProvider>
+        <AppSettingsProvider>
+          <DevFlagsProvider>
+            <AppContent />
+            <KeyboardShortcutsModal />
+            <DevPanel />
+          </DevFlagsProvider>
+        </AppSettingsProvider>
+      </KeyboardShortcutsProvider>
+      </ViewProvider>
     </ProjectProvider>
   )
 }

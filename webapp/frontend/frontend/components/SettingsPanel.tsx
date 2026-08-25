@@ -20,7 +20,7 @@ export interface LoraSelection {
 }
 
 export interface GenerationSettings {
-  model: 'fast' | 'pro' | 'ltx-2.5' | 'bernini-1.3b' | 'bernini-14b'
+  model: 'fast' | 'pro' | 'ltx-2.5' | '1.3b' | '14b'
   duration: number
   videoResolution: string
   fps: number

@@ -9,7 +9,7 @@
 // Pure functions: no DOM, no backend imports, no generated OpenAPI types. Unit-tested in
 // the node environment (vitest, frontend/**/*.test.ts).
 
-export type BerniniEngine = 'bernini-1.3b' | 'bernini-14b'
+export type BerniniEngine = '1.3b' | '14b'
 
 /** A delivery resolution tier (+ 'raw-4x' = native FlashVSR 4x, no ffmpeg downscale). */
 export type BerniniResolution = '480p' | '1080p' | '1440p' | 'raw-4x'
@@ -50,8 +50,8 @@ const FPS_OPTIONS: number[] = [16, 24, 30, 60]
 // Native capacity by engine, in SECONDS at native. Post rails never extend duration.
 // (Calibrated on-box in Task 9 — these are the reference-tuned defaults.)
 const NATIVE_DURATIONS: Record<BerniniEngine, number[]> = {
-  'bernini-1.3b': [2, 3, 5],
-  'bernini-14b': [2, 3, 5],
+  '1.3b': [2, 3, 5],
+  '14b': [2, 3, 5],
 }
 
 const FINAL_BY_RESOLUTION: Partial<Record<BerniniResolution, UpscaleFinal>> = {
@@ -211,7 +211,9 @@ export function berniniRunnerV2VBody(
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     ...berniniRunnerT2VBody(prompt, target, opts),
-    source_video: sourceVideo,
+    // The Bernini worker's decode_source_media reads the source clip under `video` —
+    // NOT `source_video` (which the older restyle/idv2v rail uses). v2v edits in place.
+    video: sourceVideo,
   }
   return body
 }

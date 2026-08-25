@@ -149,6 +149,26 @@ function uuidFromAssetsKey(key: string): string | null {
   return UUID_RE.test(uuid) ? uuid : null
 }
 
+/**
+ * Delete a project's ENTIRE subfolder (`<folder>/<projectId>/`) from the user's chosen
+ * folder — every saved asset file plus its timeline.json. Best-effort; returns true when
+ * the folder was removed, false if there's no folder / no such subfolder / the call fails.
+ * Never throws. This is intentionally separate from deleteProject in ProjectContext so the
+ * caller can gate this destructive, irreversible step behind an explicit confirmation.
+ */
+export async function deleteProjectFolder(projectId: string): Promise<boolean> {
+  const root = await requireWriteableAssetsHandle()
+  if (!root) return false
+  try {
+    const r = root as unknown as FsDirLike
+    await r.removeEntry(projectId, { recursive: true })
+    return true
+  } catch (e) {
+    console.warn('[fs-access] failed to delete project folder:', e)
+    return false
+  }
+}
+
 export interface ProjectFolderAsset {
   key: string
   data: Blob
@@ -261,4 +281,56 @@ export async function listProjectFolderAssets(): Promise<ProjectFolderAsset[]> {
     console.warn('[fs-access] failed to scan project-assets folder:', e)
   }
   return out
+}
+
+// ── Project timeline (chat history) JSON ────────────────────────────────────
+
+// Fixed filename for a project's chat/timeline JSON, written into the project's
+// assets subfolder (`<folder>/<projectId>/timeline.json`) so the history survives
+// a reload and can be restored when the project is reopened. Best-effort (returns
+// false / null on any failure, never throws).
+const TIMELINE_FILENAME = 'timeline.json'
+
+export async function saveProjectTimeline(projectId: string, data: unknown): Promise<boolean> {
+  const root = await requireWriteableAssetsHandle()
+  if (!root) return false
+  try {
+    const r = root as unknown as FsDirLike
+    const projDir = await r.getDirectoryHandle(projectId, { create: true })
+    let fh: FsFileHandleLike
+    try {
+      fh = await projDir.getFileHandle(TIMELINE_FILENAME)
+    } catch {
+      fh = await projDir.getFileHandle(TIMELINE_FILENAME, { create: true })
+    }
+    const writable = await fh.createWritable()
+    await writable.write(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+    await writable.close()
+    return true
+  } catch (e) {
+    console.warn('[fs-access] failed to write project timeline:', e)
+    return false
+  }
+}
+
+export async function readProjectTimeline(projectId: string): Promise<unknown | null> {
+  const root = await requireWriteableAssetsHandle()
+  if (!root) return null
+  try {
+    const r = root as unknown as FsDirLike
+    let projDir: FsDirLike
+    try {
+      projDir = await r.getDirectoryHandle(projectId)
+    } catch {
+      return null
+    }
+    const fh = await projDir.getFileHandle(TIMELINE_FILENAME)
+    const file = await (fh as unknown as { getFile(): Promise<File> }).getFile()
+    const text = await file.text()
+    if (!text) return null
+    return JSON.parse(text)
+  } catch (e) {
+    console.warn('[fs-access] failed to read project timeline:', e)
+    return null
+  }
 }

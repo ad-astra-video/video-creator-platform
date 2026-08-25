@@ -105,109 +105,119 @@ export function useBerniniEdit() {
     result: null,
   })
 
-  const submitBerniniEdit = useCallback(async (params: BerniniEditSubmitParams) => {
-    if (!params.videoPath || !params.prompt) return
+  const submitBerniniEdit = useCallback(
+    async (params: BerniniEditSubmitParams): Promise<string | null> => {
+      if (!params.videoPath || !params.prompt) return null
 
-    setState({
-      isEditing: true,
-      editStatus: 'Connecting to remote runner...',
-      editError: null,
-      result: null,
-    })
+      setState({
+        isEditing: true,
+        editStatus: 'Connecting to remote runner...',
+        editError: null,
+        result: null,
+      })
 
-    await withGenerationActive(async () => {
-      try {
-        const spec = berniniTaskFor(params.operation)
-        const runner = await resolveRunner([spec.capability])
-        if (!runner) {
-          const msg = 'No capable Livepeer runner is currently available for Bernini editing.'
-          logger.error(`Bernini edit error: ${msg}`)
-          setState({ isEditing: false, editStatus: '', editError: msg, result: null })
-          return
-        }
+      // The error (if any) this submission ends with. Returned to the caller so the
+      // GenSpace task card can be marked 'error' with the REAL runner message instead
+      // of being stranded on 'running'.
+      let editErrorMsg: string | null = null
 
-        const videoB64 = await assetToBase64(params.videoPath)
-        if (!videoB64) {
-          const msg = 'Could not read the source video for this edit.'
-          logger.error(`Bernini edit error: ${msg}`)
-          setState({ isEditing: false, editStatus: '', editError: msg, result: null })
-          return
-        }
-
-        const target = {
-          engine: params.engine,
-          resolution: params.resolution ?? BERNINI_NATIVE_RESOLUTION,
-          fps: params.fps ?? BERNINI_NATIVE_FPS,
-          duration: Math.min(Math.max(params.duration ?? 3, 1), 5),
-        }
-
-        const opts = {
-          negativePrompt: params.negativePrompt,
-          seed: params.seed,
-        }
-
-        let body: Record<string, unknown>
-        if (params.operation === 'r2v') {
-          const refB64 = (params.referencePaths ?? []).filter(Boolean)
-          const refs: string[] = []
-          for (const p of refB64) {
-            const b = await assetToBase64(p)
-            if (b) refs.push(b)
-          }
-          if (refs.length === 0) {
-            const msg = 'Reference-image editing (r2v) requires at least one reference image.'
-            logger.error(`Bernini edit error: ${msg}`)
-            setState({ isEditing: false, editStatus: '', editError: msg, result: null })
+      await withGenerationActive(async () => {
+        try {
+          const spec = berniniTaskFor(params.operation)
+          const runner = await resolveRunner([spec.capability], { model: params.engine })
+          if (!runner) {
+            editErrorMsg = 'No capable Livepeer runner is currently available for Bernini editing.'
+            logger.error(`Bernini edit error: ${editErrorMsg}`)
+            setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
             return
           }
-          body = berniniRunnerR2VBody(params.prompt, refs, target, opts)
-        } else {
-          body = berniniRunnerV2VBody(params.prompt, videoB64, target, opts)
+
+          const videoB64 = await assetToBase64(params.videoPath)
+          if (!videoB64) {
+            editErrorMsg = 'Could not read the source video for this edit.'
+            logger.error(`Bernini edit error: ${editErrorMsg}`)
+            setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
+            return
+          }
+
+          const target = {
+            engine: params.engine,
+            resolution: params.resolution ?? BERNINI_NATIVE_RESOLUTION,
+            fps: params.fps ?? BERNINI_NATIVE_FPS,
+            duration: Math.min(Math.max(params.duration ?? 3, 1), 5),
+          }
+
+          const opts = {
+            negativePrompt: params.negativePrompt,
+            seed: params.seed,
+          }
+
+          let body: Record<string, unknown>
+          if (params.operation === 'r2v') {
+            const refB64 = (params.referencePaths ?? []).filter(Boolean)
+            const refs: string[] = []
+            for (const p of refB64) {
+              const b = await assetToBase64(p)
+              if (b) refs.push(b)
+            }
+            if (refs.length === 0) {
+              editErrorMsg = 'Reference-image editing (r2v) requires at least one reference image.'
+              logger.error(`Bernini edit error: ${editErrorMsg}`)
+              setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
+              return
+            }
+            body = berniniRunnerR2VBody(params.prompt, refs, target, opts)
+          } else {
+            body = berniniRunnerV2VBody(params.prompt, videoB64, target, opts)
+          }
+
+          logger.info(`[bernini-edit] rail=${spec.task} media=base64`)
+          const res = await postRunnerTaskWithTicketSSE(runner, spec.task, body, {
+            onProgress: (ev) => {
+              const msg = getPhaseMessage(ev.stage || '')
+              const isBackbone = ev.stage === 'generating'
+              const pct = typeof ev.progress === 'number' ? ev.progress : null
+              const showPct = isBackbone && pct !== null
+              setState(prev => ({
+                ...prev,
+                editStatus: showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg,
+              }))
+            },
+          })
+
+          if (!res.mediaBlob) {
+            editErrorMsg = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
+            logger.error(`Bernini edit error: ${editErrorMsg}`)
+            setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
+            return
+          }
+
+          const videoPath = registerBlob(
+            res.mediaBlob,
+            'bernini-edit.mp4',
+            (res.mediaBlob as Blob).type || 'video/mp4',
+          )
+
+          setState({
+            isEditing: false,
+            editStatus: 'Edit complete!',
+            editError: null,
+            result: { videoPath },
+          })
+        } catch (err) {
+          editErrorMsg = err instanceof Error ? err.message : 'Bernini edit failed'
+          logger.error(`Bernini edit error: ${editErrorMsg}`)
+          setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
+        } finally {
+          window.localStorage.removeItem(GENERATION_RECOVERY_KEY)
+          window.localStorage.removeItem(GENERATION_RECOVERY_TS_KEY)
         }
+      })
 
-        logger.info(`[bernini-edit] rail=${spec.task} media=base64`)
-        const res = await postRunnerTaskWithTicketSSE(runner, spec.task, body, {
-          onProgress: (ev) => {
-            const msg = getPhaseMessage(ev.stage || '')
-            const isBackbone = ev.stage === 'generating'
-            const pct = typeof ev.progress === 'number' ? ev.progress : null
-            const showPct = isBackbone && pct !== null
-            setState(prev => ({
-              ...prev,
-              editStatus: showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg,
-            }))
-          },
-        })
-
-        if (!res.mediaBlob) {
-          const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
-          logger.error(`Bernini edit error: ${err}`)
-          setState({ isEditing: false, editStatus: '', editError: err, result: null })
-          return
-        }
-
-        const videoPath = registerBlob(
-          res.mediaBlob,
-          'bernini-edit.mp4',
-          (res.mediaBlob as Blob).type || 'video/mp4',
-        )
-
-        setState({
-          isEditing: false,
-          editStatus: 'Edit complete!',
-          editError: null,
-          result: { videoPath },
-        })
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Bernini edit failed'
-        logger.error(`Bernini edit error: ${msg}`)
-        setState({ isEditing: false, editStatus: '', editError: msg, result: null })
-      } finally {
-        window.localStorage.removeItem(GENERATION_RECOVERY_KEY)
-        window.localStorage.removeItem(GENERATION_RECOVERY_TS_KEY)
-      }
-    })
-  }, [])
+      return editErrorMsg
+    },
+    [],
+  )
 
   const resetBerniniEdit = useCallback(() => {
     setState({

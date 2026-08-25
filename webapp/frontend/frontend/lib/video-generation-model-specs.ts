@@ -131,7 +131,51 @@ export function getVideoGenerationModelSpecs(
   const { useApiSpecs } = options
   if (!specs) return []
   const list = useApiSpecs ? specs.api_models : specs.local_models
-  return inheritLimitsFromFast(list)
+  return expandBerniniOptions(inheritLimitsFromFast(list))
+}
+
+/** The picker label for a Bernini engine option (fast 1.3B | detailed 14B). */
+const BERNINI_OPTION_LABELS: Record<string, string> = {
+  '1.3b': 'Bernini 1.3B',
+  '14b': 'Bernini 14B',
+}
+
+/**
+ * Expand the runner's single "bernini" pipeline (spec.options = engine ids) into
+ * one selectable model per engine option. The runner now advertises ONE "bernini"
+ * entry whose options list serves fast (1.3B) and detailed (14B); here we
+ * re-materialize them as distinct pipelines — each pipeline id IS the engine
+ * (settings.model = "1.3b"/"14b"), so the model picker offers both and the
+ * generate/edit paths can filter runners by the chosen option. A "bernini" entry
+ * with no options is kept as a bare marker fallback.
+ */
+function expandBerniniOptions(modelSpecs: VideoGenerationModelSpecItem[]): VideoGenerationModelSpecItem[] {
+  const out: VideoGenerationModelSpecItem[] = []
+  for (const item of modelSpecs) {
+    // The OpenAPI pipeline union is "fast" | "pro", but the runner also
+    // advertises a "bernini" pipeline at runtime — compare as string.
+    if ((item.pipeline as string) !== 'bernini') {
+      out.push(item)
+      continue
+    }
+    const spec = item.spec as unknown as { options?: string[] }
+    const opts = Array.isArray(spec.options) ? spec.options : []
+    if (opts.length === 0) {
+      out.push(item)
+      continue
+    }
+    for (const opt of opts) {
+      out.push({
+        ...item,
+        pipeline: opt as VideoGenerationModelSpecItem['pipeline'],
+        spec: {
+          ...(item.spec as object),
+          display_name: BERNINI_OPTION_LABELS[opt] ?? opt,
+        } as VideoGenerationModelSpecItem['spec'],
+      })
+    }
+  }
+  return out
 }
 
 /**

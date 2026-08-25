@@ -25,7 +25,7 @@ import {
 
 /** True when a GenerationSettings.model is a Bernini engine id. */
 function isBerniniModel(model: string): model is BerniniEngine {
-  return model === 'bernini-1.3b' || model === 'bernini-14b'
+  return model === '1.3b' || model === '14b'
 }
 
 
@@ -301,7 +301,7 @@ export function useGeneration(): UseGenerationReturn {
           if (isBerniniModel(settings.model)) {
             const engine: BerniniEngine = settings.model
             const spec = berniniTaskFor('t2v')
-            const runner = await resolveRunner([spec.capability])
+            const runner = await resolveRunner([spec.capability], { model: engine })
             if (!runner) {
               throw new Error('No available Livepeer runner for Bernini video generation')
             }

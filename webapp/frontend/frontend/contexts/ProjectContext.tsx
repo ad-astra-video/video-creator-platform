@@ -9,7 +9,7 @@ import {
   writeProjectIds,
 } from '../lib/project-storage'
 import { deleteAssetFromProjectFolder } from '../lib/runtime/fs-access'
-import { isWebPath } from '../lib/runtime/web-store'
+import { isWebPath, removeAsset } from '../lib/runtime/web-store'
 
 interface ProjectContextType {
   currentTab: ProjectTab
@@ -158,6 +158,18 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   }, [bumpProjectRevision])
 
   const deleteProject = useCallback((id: string) => {
+    // Free the project's asset bytes (in-memory store + IndexedDB mirror) before dropping
+    // the record, so deleting a project doesn't strand its web:// blobs in IndexedDB.
+    const proj = readProject(id)
+    const keys = new Set<string>()
+    proj?.assets.forEach(asset => {
+      if (isWebPath(asset.path)) keys.add(asset.path)
+      if (isWebPath(asset.bigThumbnailPath)) keys.add(asset.bigThumbnailPath)
+      if (isWebPath(asset.smallThumbnailPath)) keys.add(asset.smallThumbnailPath)
+      asset.takes?.forEach(take => { if (take && isWebPath(take.path)) keys.add(take.path) })
+    })
+    keys.forEach(key => removeAsset(key))
+
     const nextProjectIds = readProjectIds().filter(projectId => projectId !== id)
     writeProjectIds(nextProjectIds)
     setProjectIds(nextProjectIds)
@@ -191,8 +203,8 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   }, [mutateProject])
 
   const deleteAsset = useCallback((projectId: string, assetId: string) => {
-    // Remove the asset's files from the user's selected folder on disk (best-effort) so the
-    // filesystem stays consistent with the project.
+    // Remove the asset from the user's folder on disk (best-effort) AND free its bytes from
+    // the in-memory store + IndexedDB mirror, so deleting an asset releases all of its storage.
     const current = readProject(projectId)
     const asset = current?.assets.find(a => a.id === assetId)
     if (asset) {
@@ -201,7 +213,10 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
       if (isWebPath(asset.bigThumbnailPath)) keys.add(asset.bigThumbnailPath)
       if (isWebPath(asset.smallThumbnailPath)) keys.add(asset.smallThumbnailPath)
       asset.takes?.forEach(take => { if (take && isWebPath(take.path)) keys.add(take.path) })
-      keys.forEach(key => void deleteAssetFromProjectFolder(projectId, key).catch(() => {}))
+      keys.forEach(key => {
+        void deleteAssetFromProjectFolder(projectId, key).catch(() => {})
+        removeAsset(key)
+      })
     }
     mutateProject(projectId, project => ({
       ...project,

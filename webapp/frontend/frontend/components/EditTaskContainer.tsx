@@ -18,6 +18,8 @@ export interface EditTaskContainerProps {
   activeImagePath?: string | null
   /** Show the Images section (only Restyle uses a stylized frame today). */
   showImages?: boolean
+  /** Show the Videos section (hide for image-only tasks like Edit Image). */
+  showVideos?: boolean
   onPickVideo: (asset: Asset) => void
   onPickImage?: (asset: Asset) => void
   children: React.ReactNode
@@ -28,12 +30,13 @@ export const EditTaskContainer = ({
   activeVideoPath,
   activeImagePath,
   showImages = false,
+  showVideos = true,
   onPickVideo,
   onPickImage,
   children,
 }: EditTaskContainerProps) => {
   const [quickPickOpen, setQuickPickOpen] = useState(true)
-  const quickPickVideos = assets.filter(a => a.type === 'video')
+  const quickPickVideos = showVideos ? assets.filter(a => a.type === 'video') : []
   const quickPickImages = showImages ? assets.filter(a => a.type === 'image') : []
 
   return (

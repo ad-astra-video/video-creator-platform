@@ -8,6 +8,7 @@ import { Button } from '../components/ui/button'
 import { pathToFileUrl } from '../lib/file-url'
 import type { Project } from '../types/project-model'
 import { useProjectReferencesMigration } from '../hooks/useProjectReferencesMigration'
+import { deleteProjectFolder } from '../lib/runtime/fs-access'
 
 function formatDate(timestamp: number): string {
   const date = new Date(timestamp)
@@ -131,6 +132,7 @@ export function Home() {
   const [newProjectName, setNewProjectName] = useState('')
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [diskDeleteTarget, setDiskDeleteTarget] = useState<{ id: string; name: string } | null>(null)
   const migrationStartedRef = useRef(false)
 
   useEffect(() => {
@@ -165,6 +167,22 @@ export function Home() {
     }
     setRenamingId(null)
     setRenameValue('')
+  }
+
+  // Second, explicit confirmation for the destructive project delete. Deleting a project also
+  // permanently removes its files from the user's disk folder (deleteProjectFolder), so the
+  // user sees a dedicated modal with a destructive button before anything irreversible runs.
+  const requestProjectDelete = (id: string, name: string) => {
+    if (confirm(`Delete "${name}"?`)) {
+      setDiskDeleteTarget({ id, name })
+    }
+  }
+
+  const confirmProjectDelete = () => {
+    if (!diskDeleteTarget) return
+    void deleteProjectFolder(diskDeleteTarget.id).catch(() => {})
+    deleteProject(diskDeleteTarget.id)
+    setDiskDeleteTarget(null)
   }
 
   if (migrationStatus.status === 'needed' || migrationStatus.status === 'inProgress') {
@@ -282,11 +300,7 @@ export function Home() {
                   key={project.id}
                   project={project}
                   onOpen={() => openProject(project.id)}
-                  onDelete={() => {
-                    if (confirm(`Delete "${project.name}"?`)) {
-                      deleteProject(project.id)
-                    }
-                  }}
+                  onDelete={() => requestProjectDelete(project.id, project.name)}
                   onRename={() => handleRenameProject(project.id, project.name)}
                 />
               ))}
@@ -294,7 +308,36 @@ export function Home() {
           )}
         </div>
       </main>
-      
+
+      {/* Delete Project (permanent) Confirmation Modal */}
+      {diskDeleteTarget && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div className="bg-zinc-900 rounded-xl p-6 w-full max-w-md border border-zinc-800">
+            <h2 className="text-xl font-semibold text-white mb-2">Delete project permanently?</h2>
+            <p className="text-sm text-zinc-400 mb-1">
+              This removes &quot;{diskDeleteTarget.name}&quot; from your library and
+              <span className="text-red-400"> permanently deletes all of its files from your disk folder</span>.
+            </p>
+            <p className="text-xs text-zinc-500 mb-6">This cannot be undone.</p>
+            <div className="flex gap-3">
+              <Button
+                variant="outline"
+                onClick={() => setDiskDeleteTarget(null)}
+                className="flex-1 border-zinc-700"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={confirmProjectDelete}
+                className="flex-1 bg-red-600 hover:bg-red-500"
+              >
+                Delete
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Create Project Modal */}
       {isCreating && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">

@@ -50,7 +50,7 @@ export interface ImageEditPanelProps {
 
 export interface ImageEditPanelHandle {
   /** Run an edit of the layer-selected regions (or whole frame) with the given prompt. */
-  runEdit: (prompt: string, opts?: { engine?: ImageEditEngine; seed?: number; strength?: number; paddingMaskCrop?: number; enhance?: boolean; quality?: 'fast' | 'balanced' | 'high'; onProgress?: (p: { step: number; totalSteps: number }) => void }) => Promise<boolean>
+  runEdit: (prompt: string, opts?: { engine?: ImageEditEngine; seed?: number; strength?: number; paddingMaskCrop?: number; enhance?: boolean; quality?: 'fast' | 'balanced' | 'high'; referenceImages?: string[]; onProgress?: (p: { step: number; totalSteps: number }) => void }) => Promise<boolean>
   /** True when one or more layers are selected, so the next edit will be masked. */
   hasMaskedSelection: () => boolean
   /** Clear layers / selection / mask. */
@@ -304,7 +304,7 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
 
   const runEdit = useCallback(async (
     p: string,
-    opts?: { engine?: ImageEditEngine; seed?: number; strength?: number; paddingMaskCrop?: number; enhance?: boolean; quality?: 'fast' | 'balanced' | 'high'; onProgress?: (p: { step: number; totalSteps: number }) => void },
+    opts?: { engine?: ImageEditEngine; seed?: number; strength?: number; paddingMaskCrop?: number; enhance?: boolean; quality?: 'fast' | 'balanced' | 'high'; referenceImages?: string[]; onProgress?: (p: { step: number; totalSteps: number }) => void },
   ): Promise<boolean> => {
     if (!imageKey) return false
     if (!p.trim()) return false
@@ -332,6 +332,13 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
       const runner = eng === 'klein' && !maskedEdit ? await resolveRunner(['restyle']) : await resolveRunner(['edit'])
       if (!runner) { setEditError('No capable runner is available for this edit right now.'); return false }
       const b64 = await blobToBase64(blob)
+      // Extra reference images for multi-reference edits (Qwen-Image-Edit-2511 /
+      // HiDream-O1): web:// keys resolved to base64, sent as the trailing ref list.
+      const refB64s: string[] = []
+      for (const k of opts?.referenceImages ?? []) {
+        const rb = getBlob(k)
+        if (rb) refB64s.push(await blobToBase64(rb))
+      }
       const seed = opts?.seed ?? Math.floor(Math.random() * 2 ** 31)
       let newKey: string
       if (maskedEdit) {
@@ -358,7 +365,7 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
           runner,
           b64,
           p.trim(),
-          { engine: 'hidream', seed, enhance: opts?.enhance ?? false, maskImage: undefined, quality: opts?.quality, onProgress: opts?.onProgress },
+          { engine: 'hidream', seed, enhance: opts?.enhance ?? false, maskImage: undefined, quality: opts?.quality, referenceImages: refB64s, onProgress: opts?.onProgress },
         )
         newKey = r.imageUrl
       } else {
@@ -366,7 +373,7 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
           runner,
           b64,
           p.trim(),
-          { engine: 'qwen-edit', seed, enhance: opts?.enhance ?? false, maskImage: undefined, quality: opts?.quality, onProgress: opts?.onProgress },
+          { engine: 'qwen-edit', seed, enhance: opts?.enhance ?? false, maskImage: undefined, quality: opts?.quality, referenceImages: refB64s, onProgress: opts?.onProgress },
         )
         newKey = r.imageUrl
       }

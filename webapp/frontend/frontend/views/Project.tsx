@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, Sparkles, Film } from 'lucide-react'
 import { useProjects } from '../contexts/ProjectContext'
 import { useView } from '../contexts/ViewContext'
 import { LtxLogo } from '../components/LtxLogo'
 import { Button } from '../components/ui/button'
-import { GenSpace } from './GenSpace'
+import { GenSpace, type GenSpaceHandle } from './GenSpace'
 import { VideoEditor } from './VideoEditor'
 import type { ProjectTab } from '../types/project-model'
 import {
@@ -29,6 +29,7 @@ export function Project() {
   const [upgradePassProjectId, setUpgradePassProjectId] = useState<string | null>(null)
   const activeProjectId = activeProject?.id ?? null
   const activeProjectAssets = activeProject?.assets ?? null
+  const genSpaceRef = useRef<GenSpaceHandle>(null)
   const needsAssetMetadataMigration = activeProjectAssets
     ? hasVisualAssetMetadataForMigration(activeProjectAssets)
     : false
@@ -135,8 +136,17 @@ export function Project() {
           
           <LtxLogo className="h-5 w-auto text-white" />
           
-          {/* Project name */}
-          <span className="text-white font-medium">{activeProject.name}</span>
+          {/* Project name - click to return to the project asset listing (Gen Space) */}
+          <button
+            onClick={() => {
+            genSpaceRef.current?.returnToAssets()
+            setCurrentTab('gen-space')
+          }}
+            title="Back to project assets"
+            className="text-white font-medium px-2 py-1 -mx-2 rounded-md hover:bg-zinc-800 transition-colors"
+          >
+            {activeProject.name}
+          </button>
         </div>
         
         {/* Center - Tabs */}
@@ -163,7 +173,7 @@ export function Project() {
       
       <main className="flex-1 overflow-hidden relative">
         {currentTab === 'gen-space' ? (
-          <GenSpace />
+          <GenSpace ref={genSpaceRef} />
         ) : (
           <VideoEditor
             key={activeProject.id}

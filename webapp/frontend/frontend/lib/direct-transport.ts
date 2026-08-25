@@ -17,10 +17,11 @@
 import { ApiClient } from './api-client'
 import { getBillingProjectId } from './billing-context'
 import { getBlob, getBlobUrl, registerBlob, setDimensions } from './runtime/web-store'
+import { getCachedValue, setCachedValue } from './runtime/vision-cache'
 import { decodeMediaPayload } from './media-decode'
 import { readSSEStream } from './sse-stream'
 import { logger } from './logger'
-import { isWebPlatform, discoverRunners, getRunnerDiscoveryConfig, loadExcludedRunnerUrls } from './livepeer-discovery'
+import { isWebPlatform, discoverRunners, getRunnerDiscoveryConfig, loadExcludedRunnerUrls, type DiscoveredRunner } from './livepeer-discovery'
 
 /** Fetch with an AbortSignal.timeout guard so a hung hop surfaces as an error instead of a silent await. */
 function fetchWithTimeout(ms: number): RequestInit['signal'] {
@@ -148,6 +149,60 @@ export function makeJobId(): string {
   return 'job-' + Math.random().toString(36).slice(2) + Date.now().toString(36)
 }
 
+// ── Analysis-result cache keyed by image content hash ───────────────────────
+// Analysis-style runner calls (suggest-layers, SAM3 subject segmentation) are
+// deterministic given the INPUT IMAGE, so their results are cached keyed by a
+// SHA-256 of the image bytes. If the same unchanged image is submitted again
+// (re-opening the layer panel, or re-extracting the same restyle first frame),
+// the cached result is returned and the runner is NOT contacted again. Results
+// are persisted to disk (IndexedDB via runtime/vision-cache), so they survive
+// full reloads and app restarts. Uses crypto.subtle when available; falls back
+// to a no-op when it isn't (and IDB is guarded for non-browser envs).
+
+// In-flight dedupe only (a promise per key while the expensive runner call is
+// running). Settled results live in the persistent disk store (vision-cache).
+const inFlight = new Map<string, Promise<unknown>>()
+
+/** SHA-256 hex of a base64 image payload, or null when WebCrypto is unavailable. */
+async function imageHashHex(imageBase64: string): Promise<string | null> {
+  try {
+    if (typeof crypto === 'undefined' || !crypto.subtle) return null
+    const bin = atob(imageBase64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+    return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Return a cached result for `key`, running `run` on a miss. Backed by the
+ * persistent disk store (vision-cache): a hit is served WITHOUT contacting the
+ * runner, a miss runs once and is persisted so it survives full reloads and app
+ * restarts. Concurrent identical calls share one in-flight promise. Failures
+ * are never cached (the promise is dropped on reject).
+ */
+async function cached<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const hit = await getCachedValue<T>(key)
+  if (hit !== undefined) return hit
+  const running = inFlight.get(key)
+  if (running) return running as Promise<T>
+  const p = run()
+    .then((val) => {
+      inFlight.delete(key)
+      void setCachedValue(key, val)
+      return val
+    })
+    .catch((err) => {
+      inFlight.delete(key)
+      throw err
+    })
+  inFlight.set(key, p)
+  return p
+}
+
 /** Map a runner's price_info.unit to the Livepeer ticket `type`: hour/seconds -> live, 720p->lv2v, fixed->fixed. */
 export function ticketTypeForUnit(unit?: string): string {
   switch ((unit || '').toLowerCase()) {
@@ -181,6 +236,29 @@ function isFetchableRunnerUrl(url: string): boolean {
     return false
   }
 }
+
+
+/**
+ * True when a runner advertises a model/engine option matching ``model``. Reads the
+ * runner's advertised model_specs metadata: an entry matches when its ``pipeline``
+ * equals ``model`` (old two-entry Bernini layout) OR its ``spec.options`` includes
+ * ``model`` (new single "bernini" pipeline + options layout). A runner that
+ * advertises NO model specs carries no option information, so it is not filtered
+ * out (can't prove it lacks the option) — this keeps legacy runners usable.
+ */
+function runnerServesModel(runner: RunnerDto, model: string | undefined): boolean {
+  if (!model) return true
+  const specs = (runner as DiscoveredRunner).modelSpecs
+  if (!Array.isArray(specs) || specs.length === 0) return true // unknown -> don't over-filter
+  return specs.some((s) => {
+    if (!s || typeof s !== 'object') return false
+    const rec = s as Record<string, unknown>
+    if (rec.pipeline === model) return true
+    const spec = rec.spec && typeof rec.spec === 'object' ? (rec.spec as Record<string, unknown>) : null
+    return Array.isArray(spec?.options) && (spec.options as unknown[]).includes(model)
+  })
+}
+
 
 
 /**
@@ -272,13 +350,21 @@ export async function editImageViaRunner(
   runner: RunnerDto,
   imageBase64: string,
   prompt: string,
-  opts?: { engine?: string; seed?: number; strength?: number; paddingMaskCrop?: number; enhance?: boolean; maskImage?: string; quality?: 'fast' | 'balanced' | 'high'; signal?: AbortSignal; onProgress?: (p: LayerRunProgress) => void },
+  opts?: { engine?: string; seed?: number; strength?: number; paddingMaskCrop?: number; enhance?: boolean; maskImage?: string; quality?: 'fast' | 'balanced' | 'high'; referenceImages?: string[]; signal?: AbortSignal; onProgress?: (p: LayerRunProgress) => void },
 ): Promise<EditMediaResult> {
+  // Qwen-Image-Edit-2511 / HiDream-O1 accept a LIST of reference images. When the
+  // caller attached extra references and the engine is multi-capable, send
+  // [primary, ...refs]; masked / klein / zimage stay single-conditioning.
+  const multiCapable = opts?.engine === 'qwen-edit' || opts?.engine === 'hidream'
+  const image: string | string[] =
+    multiCapable && opts?.referenceImages?.length
+      ? [imageBase64, ...opts.referenceImages]
+      : imageBase64
   const res = await postToRunnerWithTicket(
     runner,
     'edit',
     {
-      image: imageBase64,
+      image,
       prompt,
       engine: opts?.engine ?? 'qwen-edit',
       seed: opts?.seed,
@@ -351,6 +437,17 @@ export interface Sam3MaskResult {
 }
 
 export async function sam3SelectViaRunner(
+  runner: RunnerDto,
+  imageBase64: string,
+  prompt: string,
+  opts?: { signal?: AbortSignal },
+): Promise<Sam3MaskResult> {
+  const hash = await imageHashHex(imageBase64)
+  if (hash) return cached(`sam3:${hash}:${prompt}`, () => sam3SelectRun(runner, imageBase64, prompt, opts))
+  return sam3SelectRun(runner, imageBase64, prompt, opts)
+}
+
+async function sam3SelectRun(
   runner: RunnerDto,
   imageBase64: string,
   prompt: string,
@@ -523,6 +620,16 @@ export async function suggestLayersViaRunner(
   imageBase64: string,
   opts?: { signal?: AbortSignal },
 ): Promise<{ layers: number | null; raw: string }> {
+  const hash = await imageHashHex(imageBase64)
+  if (hash) return cached(`suggest-layers:${hash}`, () => suggestLayersRun(runner, imageBase64, opts))
+  return suggestLayersRun(runner, imageBase64, opts)
+}
+
+async function suggestLayersRun(
+  runner: RunnerDto,
+  imageBase64: string,
+  opts?: { signal?: AbortSignal },
+): Promise<{ layers: number | null; raw: string }> {
   const res = await postToRunnerWithTicket(runner, 'suggest-layers', { image: imageBase64 }, opts)
   if (!res.ok) {
     let detail = `Layer-count suggestion failed (${res.status})`
@@ -539,7 +646,10 @@ export async function suggestLayersViaRunner(
   }
 }
 
-export async function resolveRunner(requiredCaps: string[]): Promise<RunnerDto | null> {
+export async function resolveRunner(
+  requiredCaps: string[],
+  opts?: { model?: string },
+): Promise<RunnerDto | null> {
   // Web build: discover straight against the user's configured Discovery URL. The Worker has no
   // runner/job knowledge here (its /api/providers is control-plane discovery for the desktop
   // backend), so the browser re-hits the orchestrator directly — the same CORS-proven host as the
@@ -567,7 +677,8 @@ export async function resolveRunner(requiredCaps: string[]): Promise<RunnerDto |
     if (!isFetchableRunnerUrl(p.url)) return false
     if (requiredCaps.length === 0) return true
     const ids = new Set((p.capabilities ?? []).map((c) => c.id))
-    return requiredCaps.every((c) => ids.has(c))
+    if (!requiredCaps.every((c) => ids.has(c))) return false
+    return runnerServesModel(p, opts?.model)
   })
   if (capable.length === 0) return null
   return capable.find((p) => p.selected) ?? capable[0]
@@ -908,6 +1019,19 @@ export async function segmentSubjectViaRunner(
   imageBase64: string,
   opts?: { mode?: 'auto' | 'text'; prompt?: string; signal?: AbortSignal },
 ): Promise<Sam3Result> {
+  const hash = await imageHashHex(imageBase64)
+  if (hash) {
+    const key = `segment-subject:${hash}:${opts?.mode ?? 'auto'}:${opts?.prompt ?? ''}`
+    return cached(key, () => segmentSubjectRun(runner, imageBase64, opts))
+  }
+  return segmentSubjectRun(runner, imageBase64, opts)
+}
+
+async function segmentSubjectRun(
+  runner: RunnerDto,
+  imageBase64: string,
+  opts?: { mode?: 'auto' | 'text'; prompt?: string; signal?: AbortSignal },
+): Promise<Sam3Result> {
   const res = await postToRunnerWithTicket(
     runner,
     'restyle:segment-subject',
@@ -1008,13 +1132,15 @@ export async function falGenerateI2I(
 /**
  * Prompt enhancement via a Livepeer runner (direct transport). Unlike media tasks this returns
  * TEXT (the rewritten prompt), so it parses the JSON body rather than a media blob. The runner's
- * `/video-creator/v1/prompt-enhance` returns { enhancedPrompt } (or { prompt }).
+ * `/video-creator/v1/prompt-enhance` returns { enhanced_prompt, reasoning_content }. The
+ * `reasoning` is surfaced (not dropped) so callers can render the trace-card's collapsed
+ * reasoning section; it is null when the runner produced none.
  */
 export async function enhancePromptViaRunner(
   runner: RunnerDto,
   body: unknown,
   opts?: { signal?: AbortSignal },
-): Promise<string> {
+): Promise<{ enhancedPrompt: string; reasoning: string | null }> {
   const res = await postToRunnerWithTicket(runner, 'enhance-prompt', body, opts)
   if (!res.ok) {
     let msg = `Enhance request failed (${res.status})`
@@ -1025,10 +1151,16 @@ export async function enhancePromptViaRunner(
     throw new Error(msg)
   }
   const data = (await res.json().catch(() => null)) as
-    | { enhanced_prompt?: unknown; enhancedPrompt?: unknown; prompt?: unknown } | null
+    | { enhanced_prompt?: unknown; enhancedPrompt?: unknown; prompt?: unknown; reasoning_content?: unknown } | null
   const enhanced = data?.enhanced_prompt ?? data?.enhancedPrompt ?? data?.prompt
-  if (typeof enhanced === 'string' && enhanced.trim()) return enhanced
-  throw new Error('Enhance completed without a rewritten prompt')
+  if (typeof enhanced !== 'string' || !enhanced.trim()) {
+    throw new Error('Enhance completed without a rewritten prompt')
+  }
+  const reasoning =
+    typeof data?.reasoning_content === 'string' && data.reasoning_content.trim()
+      ? data.reasoning_content
+      : null
+  return { enhancedPrompt: enhanced, reasoning }
 }
 
 /**

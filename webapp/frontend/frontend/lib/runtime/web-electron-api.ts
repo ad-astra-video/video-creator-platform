@@ -416,11 +416,16 @@ export function createWebElectronAPI(): ElectronAPI {
 
         // Persist the actual bytes into the user's selected project-assets folder (best-effort)
         // so saved images exist as real files on disk and can be rescanned after a reload.
+        // Once the bytes are on disk, drop the redundant IndexedDB mirror: reload re-derives
+        // this key from the folder rescan (registerPersistedAsset, which never re-mirrors),
+        // so saved-to-disk items don't also occupy IndexedDB. Only unpersist when the write
+        // actually succeeded — on failure the IndexedDB copy stays as the reload fallback.
         {
           const asset = store.getAsset(key)
           const data = store.getBlob(key)
           if (asset && data && projectId) {
-            void saveAssetToProjectFolder(projectId, key, data, asset.name, asset.mimeType).catch(() => {})
+            const saved = await saveAssetToProjectFolder(projectId, key, data, asset.name, asset.mimeType).catch(() => false)
+            if (saved) store.unpersistAsset(key)
           }
         }
 
@@ -441,7 +446,8 @@ export function createWebElectronAPI(): ElectronAPI {
         const asset = store.getAsset(srcPath)
         const data = store.getBlob(srcPath)
         if (asset && data && projectId) {
-          void saveAssetToProjectFolder(projectId, srcPath, data, asset.name, asset.mimeType).catch(() => {})
+          const saved = await saveAssetToProjectFolder(projectId, srcPath, data, asset.name, asset.mimeType).catch(() => false)
+          if (saved) store.unpersistAsset(srcPath)
         }
       }
       return { success: true, path: srcPath }

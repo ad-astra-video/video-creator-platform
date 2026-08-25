@@ -62,6 +62,9 @@ export interface RestyleFrameOptions {
    * uses the image-worker /edit whole-frame rail (HiDream-O1-Image).
    */
   engine?: 'qwen-edit' | 'klein' | 'hidream'
+  /** Extra reference images for multi-image first-frame edits (web:// keys). Honored
+   *  by qwen-edit / hidream (list-capable); klein is single-reference and ignores them. */
+  referenceImages?: string[]
 }
 
 export interface RestylePanelHandle {
@@ -299,6 +302,7 @@ export const RestylePanel = forwardRef<RestylePanelHandle, RestylePanelProps>(fu
           engine: opts.engine ?? 'qwen-edit',
           seed: opts.seed,
           enhance: opts.enhance,
+          referenceImages: opts.referenceImages,
           onProgress: (p) => setFrameEditProgress(p),
         })
         return ok

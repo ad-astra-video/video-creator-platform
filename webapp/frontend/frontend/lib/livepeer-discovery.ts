@@ -109,11 +109,15 @@ function parseMeta(v: unknown): Record<string, unknown> {
   }
 }
 
-/** Which discovery URLs to try for a base, mirroring OrchestratorClient.discoveryCandidates. */
+/** Which discovery URLs to try for a base. Only the caller's configured URL (and its `app=` form)
+ *  may be tried — we never append `/discovery` or `/api/discovery` onto an already-configured
+ *  endpoint. Doubled-path guesses (a base of `…/discovery` becoming `…/discovery/discovery` or
+ *  `…/discovery/api/discovery`) can't exist behind a real discovery URL and only produced 404/502
+ *  noise once the real endpoint answered. Discovery uses the URL exactly as configured. */
 function discoveryCandidates(base: string): string[] {
   const withApp = (u: string): string =>
     u.includes('app=') ? u : u + (u.includes('?') ? '&app=video-creator' : '?app=video-creator')
-  return [base, withApp(base), withApp(`${base}/discovery`), withApp(`${base}/api/discovery`)]
+  return [base, withApp(base)]
 }
 
 /** Normalize a discovery payload (go-livepeer `[{address, runners:[...]}]` + flat shapes) to DiscoveredRunner[]. */

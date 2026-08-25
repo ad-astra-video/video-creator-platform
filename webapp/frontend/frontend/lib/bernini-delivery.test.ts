@@ -18,7 +18,7 @@ import {
 
 describe('berniniDeliveryMatrix', () => {
   it('has exactly one native (480p @ 16) delivery requiring no post', () => {
-    const m = berniniDeliveryMatrix('bernini-1.3b', { rife: true, flashvsr: true })
+    const m = berniniDeliveryMatrix('1.3b', { rife: true, flashvsr: true })
     const native = m.filter((d) => d.native)
     expect(native).toHaveLength(1)
     expect(native[0]).toMatchObject({
@@ -29,32 +29,32 @@ describe('berniniDeliveryMatrix', () => {
   })
 
   it('hides rife-dependent rows when the rife rail is disabled', () => {
-    const withRife = berniniDeliveryMatrix('bernini-1.3b', { rife: true, flashvsr: true })
-    const noRife = berniniDeliveryMatrix('bernini-1.3b', { rife: false, flashvsr: true })
+    const withRife = berniniDeliveryMatrix('1.3b', { rife: true, flashvsr: true })
+    const noRife = berniniDeliveryMatrix('1.3b', { rife: false, flashvsr: true })
     expect(noRife.some((d) => d.fps > BERNINI_NATIVE_FPS)).toBe(false)
     expect(withRife.some((d) => d.fps > BERNINI_NATIVE_FPS)).toBe(true)
   })
 
   it('hides flashvsr-dependent rows when the vsr rail is disabled', () => {
-    const noVsr = berniniDeliveryMatrix('bernini-1.3b', { rife: true, flashvsr: false })
+    const noVsr = berniniDeliveryMatrix('1.3b', { rife: true, flashvsr: false })
     expect(noVsr.every((d) => d.resolution === BERNINI_NATIVE_RESOLUTION)).toBe(true)
   })
 
   it('raw-4x requires flashvsr but no ffmpeg', () => {
-    const m = berniniDeliveryMatrix('bernini-1.3b', { rife: true, flashvsr: true })
+    const m = berniniDeliveryMatrix('1.3b', { rife: true, flashvsr: true })
     const raw = m.find((d) => d.resolution === 'raw-4x' && d.fps === 16)
     expect(raw?.post).toEqual(['flashvsr'])
   })
 
   it('1080p at high fps chains rife + flashvsr + ffmpeg', () => {
-    const m = berniniDeliveryMatrix('bernini-14b', { rife: true, flashvsr: true })
+    const m = berniniDeliveryMatrix('14b', { rife: true, flashvsr: true })
     const row = m.find((d) => d.resolution === '1080p' && d.fps === 60)
     expect(row?.post).toEqual(['rife', 'flashvsr', 'ffmpeg'])
   })
 })
 
 describe('dropdown derivation', () => {
-  const matrix = berniniDeliveryMatrix('bernini-14b', { rife: true, flashvsr: true })
+  const matrix = berniniDeliveryMatrix('14b', { rife: true, flashvsr: true })
   it('fps options at 480p include native 16 plus rife-derived', () => {
     expect(berniniFpsOptions('480p', matrix)).toEqual([16, 24, 30, 60])
   })
@@ -87,14 +87,14 @@ describe('berniniPostFor', () => {
 
 describe('berniniDeliveryLabel', () => {
   it('renders a compact resolution-fps label', () => {
-    expect(berniniDeliveryLabel({ engine: 'bernini-1.3b', resolution: '1080p', fps: 24, duration: 3 }))
+    expect(berniniDeliveryLabel({ engine: '1.3b', resolution: '1080p', fps: 24, duration: 3 }))
       .toBe('1080p · 24fps')
   })
 })
 
 describe('berniniRunnerT2VBody', () => {
   const base: BerniniDeliveryTarget = {
-    engine: 'bernini-1.3b',
+    engine: '1.3b',
     resolution: '480p',
     fps: 16,
     duration: 3,
@@ -104,7 +104,7 @@ describe('berniniRunnerT2VBody', () => {
     const body = berniniRunnerT2VBody('a red fox', base)
     expect(body).toMatchObject({
       prompt: 'a red fox',
-      model: 'bernini-1.3b',
+      model: '1.3b',
       resolution: '480p',
       fps: 16,
       num_frames: 48,
@@ -149,11 +149,11 @@ describe('berniniTaskFor', () => {
 })
 
 describe('berniniRunnerV2VBody', () => {
-  const base: BerniniDeliveryTarget = { engine: 'bernini-1.3b', resolution: '480p', fps: 16, duration: 3 }
+  const base: BerniniDeliveryTarget = { engine: '1.3b', resolution: '480p', fps: 16, duration: 3 }
 
-  it('adds source_video to the t2v body at native delivery', () => {
+  it('sends the source clip under `video` (Bernini worker contract)', () => {
     const body = berniniRunnerV2VBody('make it sunset', 'AAABase64VideoAA', base)
-    expect(body.source_video).toBe('AAABase64VideoAA')
+    expect(body.video).toBe('AAABase64VideoAA')
     expect(body.resolution).toBe('480p')
     expect(body.fps).toBe(16)
     expect(body.post).toBeUndefined()
@@ -169,7 +169,7 @@ describe('berniniRunnerV2VBody', () => {
 })
 
 describe('berniniRunnerR2VBody', () => {
-  const base: BerniniDeliveryTarget = { engine: 'bernini-1.3b', resolution: '480p', fps: 16, duration: 3 }
+  const base: BerniniDeliveryTarget = { engine: '1.3b', resolution: '480p', fps: 16, duration: 3 }
 
   it('attaches reference images under references[]', () => {
     const refs = ['ref1base64', 'ref2base64']

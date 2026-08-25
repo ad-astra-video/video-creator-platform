@@ -241,6 +241,17 @@ export function removeAsset(key: string): void {
 }
 
 /**
+ * Discard ONLY the IndexedDB-persisted mirror of an asset while keeping it live in memory
+ * (object URL + bytes) for the current session. Inverse of persistRecord — used once the
+ * asset's bytes are durably written to the user's project-assets folder on disk, so disk
+ * items don't also occupy IndexedDB. Reload re-derives the key from the folder rescan
+ * (registerPersistedAsset, which never re-mirrors to IndexedDB).
+ */
+export function unpersistAsset(key: string): void {
+  void deletePersisted(key)
+}
+
+/**
  * Read a stored asset back as a data URL + mime, mirroring the old readLocalFile IPC.
  * Falls back to an empty result if the key is unknown (never throws).
  */
@@ -304,6 +315,7 @@ export const store = {
   registerPersistedAsset,
   listAssetKeys,
   removeAsset,
+  unpersistAsset,
   readDataUrl,
   setDimensions,
   setDuration,
