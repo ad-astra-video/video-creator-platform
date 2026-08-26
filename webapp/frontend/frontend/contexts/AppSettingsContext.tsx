@@ -13,8 +13,6 @@ export interface AppSettings {
   hasGeminiApiKey: boolean
   useLocalTextEncoder: boolean
   promptCacheSize: number
-  promptEnhancerEnabledT2V: boolean
-  promptEnhancerEnabledI2V: boolean
   // The user's explicit prompt-enhancer provider choice, persisted so it survives restarts.
   // null means no active choice yet — the enhancer defaults to whichever provider is available
   // without writing that default back here; only an explicit pick (never an automatic fallback
@@ -28,7 +26,6 @@ export interface AppSettings {
   livepeerVideoEnabled: boolean
   livepeerImageEnabled: boolean
   livepeerTextEncodingEnabled: boolean
-  livepeerPromptEnhanceEnabled: boolean
   livepeerDiscoveryUrl: string
   hasLivepeerDiscoveryUrl: boolean
   hasLivepeerApiKey: boolean
@@ -52,8 +49,6 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   hasGeminiApiKey: false,
   useLocalTextEncoder: false,
   promptCacheSize: 1,
-  promptEnhancerEnabledT2V: false,
-  promptEnhancerEnabledI2V: false,
   promptEnhancerProviderPreference: null,
   seedLocked: false,
   lockedSeed: 42,
@@ -62,7 +57,6 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   livepeerVideoEnabled: true,
   livepeerImageEnabled: true,
   livepeerTextEncodingEnabled: true,
-  livepeerPromptEnhanceEnabled: true,
   livepeerDiscoveryUrl: '',
   hasLivepeerDiscoveryUrl: false,
   hasLivepeerApiKey: false,
@@ -119,8 +113,6 @@ function normalizeAppSettings(data: Partial<AppSettings>): AppSettings {
     hasGeminiApiKey: data.hasGeminiApiKey ?? DEFAULT_APP_SETTINGS.hasGeminiApiKey,
     useLocalTextEncoder: data.useLocalTextEncoder ?? DEFAULT_APP_SETTINGS.useLocalTextEncoder,
     promptCacheSize: data.promptCacheSize ?? DEFAULT_APP_SETTINGS.promptCacheSize,
-    promptEnhancerEnabledT2V: data.promptEnhancerEnabledT2V ?? DEFAULT_APP_SETTINGS.promptEnhancerEnabledT2V,
-    promptEnhancerEnabledI2V: data.promptEnhancerEnabledI2V ?? DEFAULT_APP_SETTINGS.promptEnhancerEnabledI2V,
     promptEnhancerProviderPreference: data.promptEnhancerProviderPreference ?? DEFAULT_APP_SETTINGS.promptEnhancerProviderPreference,
     seedLocked: data.seedLocked ?? DEFAULT_APP_SETTINGS.seedLocked,
     lockedSeed: data.lockedSeed ?? DEFAULT_APP_SETTINGS.lockedSeed,
@@ -129,7 +121,6 @@ function normalizeAppSettings(data: Partial<AppSettings>): AppSettings {
     livepeerVideoEnabled: data.livepeerVideoEnabled ?? DEFAULT_APP_SETTINGS.livepeerVideoEnabled,
     livepeerImageEnabled: data.livepeerImageEnabled ?? DEFAULT_APP_SETTINGS.livepeerImageEnabled,
     livepeerTextEncodingEnabled: data.livepeerTextEncodingEnabled ?? DEFAULT_APP_SETTINGS.livepeerTextEncodingEnabled,
-    livepeerPromptEnhanceEnabled: data.livepeerPromptEnhanceEnabled ?? DEFAULT_APP_SETTINGS.livepeerPromptEnhanceEnabled,
     livepeerDiscoveryUrl: data.livepeerDiscoveryUrl ?? DEFAULT_APP_SETTINGS.livepeerDiscoveryUrl,
     hasLivepeerDiscoveryUrl: data.hasLivepeerDiscoveryUrl ?? DEFAULT_APP_SETTINGS.hasLivepeerDiscoveryUrl,
     hasLivepeerApiKey: data.hasLivepeerApiKey ?? DEFAULT_APP_SETTINGS.hasLivepeerApiKey,
@@ -353,7 +344,6 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       livepeerVideoEnabled: true,
       livepeerImageEnabled: true,
       livepeerTextEncodingEnabled: true,
-      livepeerPromptEnhanceEnabled: true,
     })
     if (!result.ok) {
       throw new Error(result.error.message)

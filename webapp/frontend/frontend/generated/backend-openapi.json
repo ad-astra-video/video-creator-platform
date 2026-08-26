@@ -139,17 +139,6 @@
             ],
             "title": "Livepeerimageenabled"
           },
-          "livepeerPromptEnhanceEnabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Livepeerpromptenhanceenabled"
-          },
           "livepeerSelectedRunnerId": {
             "anyOf": [
               {
@@ -270,28 +259,6 @@
               }
             ],
             "title": "Promptcachesize"
-          },
-          "promptEnhancerEnabledI2V": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Promptenhancerenabledi2V"
-          },
-          "promptEnhancerEnabledT2V": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Promptenhancerenabledt2V"
           },
           "promptEnhancerProviderPreference": {
             "anyOf": [
@@ -4075,11 +4042,6 @@
             "title": "Livepeerimageenabled",
             "type": "boolean"
           },
-          "livepeerPromptEnhanceEnabled": {
-            "default": true,
-            "title": "Livepeerpromptenhanceenabled",
-            "type": "boolean"
-          },
           "livepeerSelectedRunnerId": {
             "default": "",
             "title": "Livepeerselectedrunnerid",
@@ -4124,16 +4086,6 @@
             "default": 100,
             "title": "Promptcachesize",
             "type": "integer"
-          },
-          "promptEnhancerEnabledI2V": {
-            "default": false,
-            "title": "Promptenhancerenabledi2V",
-            "type": "boolean"
-          },
-          "promptEnhancerEnabledT2V": {
-            "default": true,
-            "title": "Promptenhancerenabledt2V",
-            "type": "boolean"
           },
           "promptEnhancerProviderPreference": {
             "anyOf": [

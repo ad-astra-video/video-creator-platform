@@ -986,8 +986,6 @@ export interface components {
             livepeerExcludedRunnerIds?: string[] | null;
             /** Livepeerimageenabled */
             livepeerImageEnabled?: boolean | null;
-            /** Livepeerpromptenhanceenabled */
-            livepeerPromptEnhanceEnabled?: boolean | null;
             /** Livepeerselectedrunnerid */
             livepeerSelectedRunnerId?: string | null;
             /** Livepeertextencodingenabled */
@@ -1010,10 +1008,6 @@ export interface components {
             platformUserId?: string | null;
             /** Promptcachesize */
             promptCacheSize?: number | null;
-            /** Promptenhancerenabledi2V */
-            promptEnhancerEnabledI2V?: boolean | null;
-            /** Promptenhancerenabledt2V */
-            promptEnhancerEnabledT2V?: boolean | null;
             /** Promptenhancerproviderpreference */
             promptEnhancerProviderPreference?: ("local" | "api") | null;
             /** Remoteinferenceenabled */
@@ -2494,10 +2488,8 @@ export interface components {
              */
             livepeerImageEnabled: boolean;
             /**
-             * Livepeerpromptenhanceenabled
              * @default true
              */
-            livepeerPromptEnhanceEnabled: boolean;
             /**
              * Livepeerselectedrunnerid
              * @default
@@ -2544,15 +2536,11 @@ export interface components {
              */
             promptCacheSize: number;
             /**
-             * Promptenhancerenabledi2V
              * @default false
              */
-            promptEnhancerEnabledI2V: boolean;
             /**
-             * Promptenhancerenabledt2V
              * @default true
              */
-            promptEnhancerEnabledT2V: boolean;
             /** Promptenhancerproviderpreference */
             promptEnhancerProviderPreference?: ("local" | "api") | null;
             /**

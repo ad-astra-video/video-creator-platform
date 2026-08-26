@@ -1,4 +1,4 @@
-﻿import { AlertCircle, Check, Download, Film, Folder, HardDrive, Info, KeyRound, Settings, Sparkles, Wallet, X, Zap } from 'lucide-react'
+import { AlertCircle, Check, Download, Film, Folder, HardDrive, Info, KeyRound, Settings, Sparkles, Wallet, X, Zap } from 'lucide-react'
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { RunnersSection } from './settings/RunnersSection'
@@ -17,7 +17,7 @@ interface SettingsModalProps {
   initialTab?: TabId
 }
 
-type TabId = 'general' | 'models' | 'apiKeys' | 'promptEnhancer' | 'account' | 'about'
+type TabId = 'general' | 'models' | 'apiKeys' | 'account' | 'about'
 
 /** Focuses an API Keys tab input once the modal has switched to that tab.
  *  Shared by the LTX and FAL key inputs — each call gets its own ref/pending state. */
@@ -314,70 +314,6 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     })
   }
 
-  // True when every prompt-enhancement path is off — the "No Enhancement" option.
-  const noEnhancement = !settings.livepeerPromptEnhanceEnabled
-    && !settings.promptEnhancerEnabledT2V
-    && !settings.promptEnhancerEnabledI2V
-
-  // True when prompt enhancement is set to the "Generate with Livepeer" option.
-  const livepeerMode = settings.livepeerPromptEnhanceEnabled === true
-
-  // True when prompt enhancement is set to the "Generate with LTX API" option —
-  // the LTX API T2V/I2V path is active AND Livepeer routing is off. Requires the
-  // LTX API key (hasLtxApiKey); the option is only shown when the key is present.
-  const ltxApiMode = settings.hasLtxApiKey === true
-    && settings.livepeerPromptEnhanceEnabled !== true
-    && (settings.promptEnhancerEnabledT2V === true || settings.promptEnhancerEnabledI2V === true)
-
-  // Select the "Generate with Livepeer" enhancement mode — mutually exclusive with
-  // "No Enhancement" (clears the LTX API T2V/I2V path so only one source is active).
-  const handleEnableLivepeerEnhancement = () => {
-    onSettingsChange({
-      ...settings,
-      livepeerPromptEnhanceEnabled: true,
-      promptEnhancerEnabledT2V: false,
-      promptEnhancerEnabledI2V: false,
-      promptEnhancerProviderPreference: null,
-    })
-  }
-
-  // Select the "Generate with LTX API" enhancement mode — mutually exclusive with
-  // "Generate with Livepeer" (turns Livepeer routing off and engages the LTX API
-  // T2V/I2V path). Keeps whichever T2V/I2V toggles were already on, defaulting T2V
-  // on so the selected mode is immediately active.
-  const handleEnableLTXApiEnhancement = () => {
-    const t2v = settings.promptEnhancerEnabledT2V ?? true
-    const i2v = settings.promptEnhancerEnabledI2V ?? false
-    onSettingsChange({
-      ...settings,
-      livepeerPromptEnhanceEnabled: false,
-      promptEnhancerEnabledT2V: t2v || i2v ? t2v : true,
-      promptEnhancerEnabledI2V: t2v || i2v ? i2v : false,
-      promptEnhancerProviderPreference: 'api',
-    })
-  }
-
-  // Disable ALL prompt enhancement (Livepeer + LTX API T2V/I2V). Selecting the
-  // "No Enhancement" option turns every path off; re-enable via the other options.
-  const handleDisablePromptEnhancement = () => {
-    if (noEnhancement) return
-    onSettingsChange({
-      ...settings,
-      livepeerPromptEnhanceEnabled: false,
-      promptEnhancerEnabledT2V: false,
-      promptEnhancerEnabledI2V: false,
-      promptEnhancerProviderPreference: null,
-    })
-  }
-
-  // Prompt Enhancer handlers
-  const handleTogglePromptEnhancer = (mode: 't2v' | 'i2v') => {
-    if (mode === 't2v') {
-      onSettingsChange({ ...settings, promptEnhancerEnabledT2V: !settings.promptEnhancerEnabledT2V })
-    } else {
-      onSettingsChange({ ...settings, promptEnhancerEnabledI2V: !settings.promptEnhancerEnabledI2V })
-    }
-  }
   // Seed handlers
   const handleToggleSeedLock = () => {
     onSettingsChange({
@@ -433,7 +369,6 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     // generation is forced through the API, so hide it in that mode.
     ...(!forceApiGenerations ? [{ id: 'models' as TabId, label: 'Models', icon: HardDrive }] : []),
     { id: 'apiKeys' as TabId, label: 'API Keys', icon: KeyRound },
-    { id: 'promptEnhancer' as TabId, label: 'Prompt Enhancer', icon: Sparkles },
     { id: 'account' as TabId, label: 'Account', icon: Wallet },
     { id: 'about' as TabId, label: 'About', icon: Info },
   ]
@@ -1251,135 +1186,6 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                     </a>
                   </div>
                 </div>
-              </div>
-            </>
-          )}
-
-          {activeTab === 'promptEnhancer' && (
-            <>
-              <div className="space-y-4">
-                <div className="flex items-center gap-2">
-                  <Sparkles className="h-4 w-4 text-blue-400" />
-                  <h3 className="text-sm font-semibold text-white">Prompt Enhancer</h3>
-                </div>
-
-                <p className="text-xs text-zinc-500 leading-relaxed">
-                  Automatically enhances your prompts via the LTX API with rich visual details, sound descriptions,
-                  and motion cues to help generate higher quality videos. Control independently for each generation type.
-                </p>
-
-                {/* Enhancement source — mutually-exclusive selectable options. */}
-                <div className="space-y-2">
-                  <button
-                    type="button"
-                    onClick={handleDisablePromptEnhancement}
-                    className={`w-full flex items-center justify-between rounded-lg px-4 py-3 border text-left transition-colors ${
-                      noEnhancement ? 'border-emerald-500/60 bg-emerald-500/5' : 'border-zinc-700/50 hover:border-zinc-600 bg-zinc-800/50'
-                    }`}
-                    title="Use prompts as-is (no rewrite) for every generation type."
-                  >
-                    <span className="text-sm text-zinc-200">No Enhancement</span>
-                    <span className={noEnhancement ? 'h-2.5 w-2.5 rounded-full bg-emerald-400 ring-2 ring-emerald-400/30' : 'h-2.5 w-2.5 rounded-full border border-zinc-600'} />
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleEnableLivepeerEnhancement}
-                    disabled={!settings.hasLivepeerDiscoveryUrl}
-                    className={`w-full flex items-center justify-between rounded-lg px-4 py-3 border text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                      livepeerMode ? 'border-emerald-500/60 bg-emerald-500/5' : 'border-zinc-700/50 hover:border-zinc-600 bg-zinc-800/50'
-                    }`}
-                    title="Route prompt enhancement to your own Livepeer orchestrator/runner, which runs its local Gemma model for the rewrite. Requires a Discovery URL in the API Keys tab."
-                  >
-                    <span className="text-sm text-zinc-200">Generate with Livepeer</span>
-                    <span className={livepeerMode ? 'h-2.5 w-2.5 rounded-full bg-emerald-400 ring-2 ring-emerald-400/30' : 'h-2.5 w-2.5 rounded-full border border-zinc-600'} />
-                  </button>
-
-                  {settings.hasLtxApiKey ? (
-                    <button
-                      type="button"
-                      onClick={handleEnableLTXApiEnhancement}
-                      className={`w-full flex items-center justify-between rounded-lg px-4 py-3 border text-left transition-colors ${
-                        ltxApiMode ? 'border-emerald-500/60 bg-emerald-500/5' : 'border-zinc-700/50 hover:border-zinc-600 bg-zinc-800/50'
-                      }`}
-                      title="Route prompt enhancement server-side through the LTX API. Requires an LTX API key."
-                    >
-                      <span className="text-sm text-zinc-200">Generate with LTX API</span>
-                      <span className={ltxApiMode ? 'h-2.5 w-2.5 rounded-full bg-emerald-400 ring-2 ring-emerald-400/30' : 'h-2.5 w-2.5 rounded-full border border-zinc-600'} />
-                    </button>
-                  ) : null}
-                </div>
-
-                {!settings.hasLtxApiKey ? (
-                  <div className="space-y-4 mt-2">
-                    <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-4 space-y-3">
-                      <div className="flex items-start gap-2.5">
-                        <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 flex-shrink-0" />
-                        <div className="space-y-2">
-                          <p className="text-sm text-amber-300 font-medium">LTX API key required</p>
-                          <p className="text-xs text-zinc-400 leading-relaxed">
-                            Prompt enhancement runs server-side on the LTX API. To use this feature, you need to configure
-                            an API key in the API Keys tab.
-                          </p>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => setActiveTab('apiKeys')}
-                        className="w-full mt-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors"
-                      >
-                        Set API Key
-                      </button>
-                    </div>
-                  </div>
-                ) : ltxApiMode ? (
-                  <>
-                    {/* T2V Toggle */}
-                    <div
-                      className="flex items-center justify-between bg-zinc-800/50 rounded-lg px-4 py-3 border border-zinc-700/50 cursor-pointer"
-                      onClick={() => handleTogglePromptEnhancer('t2v')}
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="text-xs font-semibold text-blue-400 bg-blue-400/10 px-1.5 py-0.5 rounded">T2V</span>
-                        <div>
-                          <span className="text-sm text-zinc-200">Text-to-Video</span>
-                          <p className="text-[10px] text-zinc-500 mt-0.5">
-                            {settings.promptEnhancerEnabledT2V ? 'Prompts will be enhanced before T2V generation' : 'T2V prompts used as-is'}
-                          </p>
-                        </div>
-                      </div>
-                      <div className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${
-                        settings.promptEnhancerEnabledT2V ? 'bg-blue-500' : 'bg-zinc-700'
-                      }`}>
-                        <div className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-sm transition-transform pointer-events-none ${
-                          settings.promptEnhancerEnabledT2V ? 'translate-x-5' : 'translate-x-0'
-                        }`} />
-                      </div>
-                    </div>
-
-                    {/* I2V Toggle */}
-                    <div
-                      className="flex items-center justify-between bg-zinc-800/50 rounded-lg px-4 py-3 border border-zinc-700/50 cursor-pointer"
-                      onClick={() => handleTogglePromptEnhancer('i2v')}
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="text-xs font-semibold text-emerald-400 bg-emerald-400/10 px-1.5 py-0.5 rounded">I2V</span>
-                        <div>
-                          <span className="text-sm text-zinc-200">Image-to-Video</span>
-                          <p className="text-[10px] text-zinc-500 mt-0.5">
-                            {settings.promptEnhancerEnabledI2V ? 'Prompts will be enhanced before I2V generation' : 'I2V prompts used as-is'}
-                          </p>
-                        </div>
-                      </div>
-                      <div className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${
-                        settings.promptEnhancerEnabledI2V ? 'bg-blue-500' : 'bg-zinc-700'
-                      }`}>
-                        <div className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-sm transition-transform pointer-events-none ${
-                          settings.promptEnhancerEnabledI2V ? 'translate-x-5' : 'translate-x-0'
-                        }`} />
-                      </div>
-                    </div>
-                  </>
-                ) : null}
               </div>
             </>
           )}
