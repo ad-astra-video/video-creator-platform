@@ -663,7 +663,7 @@ async def handle_bernini(request: web.Request) -> web.Response:
             "output_video": out_b64,
             "frames": result.get("frames"),
             "resolution": f"{body.get('width', 848)}x{body.get('height', 480)}",
-            "fps": body.get("fps", config.BERNINI_NATIVE_FPS),
+            "fps": result.get("out_fps") or body.get("fps", config.BERNINI_NATIVE_FPS),
         })
 
 

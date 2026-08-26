@@ -271,6 +271,7 @@ class BerniniManager:
                 if out and os.path.exists(out):
                     self._stage("gen: re-encode single-shot at src fps %s" % src_fps)
                     _reencode_fps(out, out, src_fps)
+                    result["out_fps"] = src_fps
             return result
 
     # -- single-shot resident CLI call ---------------------------------------
@@ -457,7 +458,8 @@ class BerniniManager:
             await asyncio.to_thread(_run_ffmpeg, concat_args)
             self._stage("gen: concatenated ok frames=%d" % total)
             return {"ok": True, "output": out_path,
-                    "frames": total, "task": job.get("task_name")}
+                    "frames": total, "task": job.get("task_name"),
+                    "out_fps": src_fps}
         finally:
             for pth in chunk_srcs + chunk_outs:
                 try:
