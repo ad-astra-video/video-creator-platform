@@ -139,20 +139,51 @@ const APPLIED_TO_LABEL: Record<NonNullable<LLMTraceMessage['appliedTo']>, string
 }
 
 /**
- * A read-only record of one LLM round-trip: what was sent, the response, and a
- * collapsed-by-default reasoning section when the model returned one. This is
- * an informational card — the response itself is routed to its real destination
- * (prompt bar, layer UI, gap prompt, assistant chat) by the caller, unchanged.
+ * Extract a readable "message sent" string from the raw `sent` payload. The
+ * payload can be either a list of OpenAI-style messages (most callers) or a
+ * request-inputs object whose primary field is the prompt (the Enhance rail).
+ * Falls back to a JSON string so nothing is ever lost from the visible record.
+ */
+function extractSentText(sent: unknown): string {
+  if (Array.isArray(sent)) {
+    const parts: string[] = []
+    for (const m of sent) {
+      if (!m || typeof m !== 'object') continue
+      const content = (m as { content?: unknown }).content
+      if (typeof content === 'string') {
+        if (content.trim()) parts.push(content)
+      } else if (Array.isArray(content)) {
+        // OpenAI content blocks: { type: 'text', text: ... }
+        const text = content
+          .map((b) => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : ''))
+          .join('\n')
+        if (text.trim()) parts.push(text)
+      }
+    }
+    if (parts.length) return parts.join('\n\n')
+    return JSON.stringify(sent)
+  }
+  if (sent && typeof sent === 'object') {
+    const prompt = (sent as { prompt?: unknown }).prompt
+    if (typeof prompt === 'string' && prompt.trim()) return prompt
+    return JSON.stringify(sent)
+  }
+  return sent === null || sent === undefined ? '' : String(sent)
+}
+
+/**
+ * A read-only record of one LLM round-trip — what was sent, the response, and a
+ * collapsed-by-default reasoning section when the model returned one. Rendered
+ * to read like a chat window: the message that went in (a "sent" bubble), the
+ * model's reasoning on its own collapsible toggle, and the response (a reply
+ * bubble). This is an informational card — the response itself is routed to its
+ * real destination (prompt bar, layer UI, gap prompt, assistant chat) by the
+ * caller, unchanged; this card just mirrors the round-trip.
  */
 function LLMTraceCard({ msg }: { msg: LLMTraceMessage }) {
   const [showReasoning, setShowReasoning] = useState(false)
   const dest = msg.appliedTo ? APPLIED_TO_LABEL[msg.appliedTo] : ''
-  let sentText: string
-  try {
-    sentText = JSON.stringify(msg.sent, null, 2)
-  } catch {
-    sentText = String(msg.sent)
-  }
+  const sentText = extractSentText(msg.sent)
   return (
     <div
       className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden flex flex-col"
@@ -166,36 +197,44 @@ function LLMTraceCard({ msg }: { msg: LLMTraceMessage }) {
         {dest && <span className="ml-auto text-[10px] text-zinc-500">{' '}{dest}</span>}
       </div>
       <div className="px-2.5 py-2 space-y-2">
-        <div>
-          <p className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Request</p>
-          <pre className="text-[10px] leading-snug text-zinc-400 whitespace-pre-wrap break-words bg-zinc-950/60 rounded-md p-2 max-h-28 overflow-hidden">
-            {sentText}
-          </pre>
+        {/* Message sent — the user-facing input to the model, as a bubble. */}
+        <div className="flex justify-end">
+          <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-emerald-700/70 text-white px-3 py-2 text-[11px] leading-snug whitespace-pre-wrap break-words">
+            {sentText || <span className="text-white/60">(empty request)</span>}
+          </div>
         </div>
-        <div>
-          <p className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Response</p>
-          <p className="text-[11px] text-zinc-200 leading-snug whitespace-pre-wrap break-words">
-            {msg.response}
-          </p>
-        </div>
+        {/* Collapsible reasoning (start collapsed). */}
         {msg.reasoning ? (
-          <div>
-            <button
-              type="button"
-              onClick={() => setShowReasoning((v) => !v)}
-              className="text-[10px] uppercase tracking-wide text-zinc-500 hover:text-zinc-300"
-            >
-              {showReasoning ? 'Hide reasoning' : 'Show reasoning'}
-            </button>
-            {showReasoning && (
-              <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950/40 p-2">
-                <pre className="text-[10px] leading-snug text-zinc-500 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
-                  {msg.reasoning}
-                </pre>
-              </div>
-            )}
+          <div className="flex justify-start">
+            <div className="max-w-[85%]">
+              <button
+                type="button"
+                onClick={() => setShowReasoning((v) => !v)}
+                className="text-[10px] uppercase tracking-wide text-zinc-500 hover:text-zinc-300 flex items-center gap-1"
+              >
+                <span
+                  className={`inline-block transition-transform ${showReasoning ? 'rotate-90' : ''}`}
+                >
+                  ▸
+                </span>
+                {showReasoning ? 'Hide reasoning' : 'Show reasoning'}
+              </button>
+              {showReasoning && (
+                <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950/40 p-2">
+                  <pre className="text-[10px] leading-snug text-zinc-500 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+                    {msg.reasoning}
+                  </pre>
+                </div>
+              )}
+            </div>
           </div>
         ) : null}
+        {/* Response — the model's reply, as a bubble. */}
+        <div className="flex justify-start">
+          <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-zinc-800 text-zinc-200 px-3 py-2 text-[11px] leading-snug whitespace-pre-wrap break-words">
+            {msg.response}
+          </div>
+        </div>
       </div>
     </div>
   )
