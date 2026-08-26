@@ -13,6 +13,7 @@ inference endpoint to the managed llama-server subprocess:
     POST /video-creator/v1/prompt-enhance — proxy: rewrite a generation prompt
     POST /video-creator/v1/chat           — proxy: general agent chat
     POST /video-creator/v1/suggest-layers — proxy: Qwen layer-count rubric
+    POST /video-creator/v1/suggest-gap-prompt — gap-fill clip prompt (prebuilt messages)
 
 Auth: every POST requires the shared `X-Worker-Token` header (WORKER_TOKEN env),
 which is also forwarded to llama-server as a Bearer token. Concurrency: at most
@@ -135,6 +136,9 @@ async def handle_info(_request: web.Request) -> web.Response:
 
 # ── Inference (proxied to llama-server) ──────────────────────────────────────
 
+# LEGACY local rubric — the client (webapp lib/llm-messages.ts) is the single source
+# of truth and sends prebuilt `messages`; this constant is kept only for internal
+# forwards that send raw {image} instead.
 # The rubric used to ask Gemma how many semantic layers an image decomposes into.
 # The model is asked to THINK through the scene before committing to a count, then
 # output only the number on the final line so the server's regex can extract it.
@@ -161,6 +165,17 @@ LAYER_SUGGEST_RUBRIC = (
 )
 
 
+def _messages_have_image(messages: list[dict[str, Any]]) -> bool:
+    """True when any message carries an image_url part (multimodal)."""
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
+
 def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
     """Build the OpenAI-style chat messages for prompt enhancement.
 
@@ -175,6 +190,10 @@ def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]],
     A caller-supplied `system_prompt` (body) always overrides the relevant default.
     llama-server accepts these OpenAI-format messages directly (incl. multimodal
     image_url data-URL parts).
+
+    LEGACY: message building now happens client-side (webapp's lib/llm-messages.ts,
+    the single source of truth). This builder is kept ONLY for internal/older
+    forwards that send raw fields instead of prebuilt `messages`.
     """
     prompt = str(body.get("prompt") or "").strip()
     system_prompt = body.get("system_prompt")
@@ -230,11 +249,20 @@ def _build_enhance_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]],
 async def handle_prompt_enhance(request: web.Request) -> web.Response:
     _require_token(request)
     body = await request.json()
-    prompt = str(body.get("prompt") or "").strip()
-    if not prompt:
-        return web.json_response({"error": "missing 'prompt'"}, status=400)
-    messages, has_image = _build_enhance_messages(body)
     seed = body.get("seed")
+    messages = body.get("messages")
+    prebuilt = isinstance(messages, list) and len(messages) > 0
+    if prebuilt:
+        # Client-authored messages (webapp lib/llm-messages.ts) execute verbatim —
+        # the browser is the single source of truth for every prompt.
+        has_image = _messages_have_image(messages)
+    else:
+        # LEGACY: build messages here for internal/older forwards only.
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            return web.json_response({"error": "missing 'prompt'"}, status=400)
+        messages, has_image = _build_enhance_messages(body)
+        seed = body.get("seed")
     async with _parallel:
         try:
             reasoning, enhanced = await llms.chat_with_reasoning(
@@ -281,41 +309,46 @@ async def handle_suggest_layers(request: web.Request) -> web.Response:
     Feeds the uploaded image + the Qwen-Image-Layered layer-count rubric to the
     multimodal llama-server chat and returns the parsed integer 2-8 (null when the
     LLM doesn't produce a parseable number, so the caller falls back to its default).
+    Prebuilt client `messages` (webapp lib/llm-messages.ts) execute verbatim when
+    present — the local RUBRIC builder below is the LEGACY path for internal forwards.
     """
     _require_token(request)
     body = await request.json()
-    image = body.get("image")
-    if not image:
-        return web.json_response({"error": "missing 'image'"}, status=400)
-    import base64 as _b64
-    image_bytes = _b64.b64decode(image)
-    # Normalize to PNG before handing to llama-server. Its multimodal reader
-    # only reliably decodes PNG (JPEG is flaky) and rejects WebP/other formats
-    # with "Failed to load image or audio file"; the worker's own JPEG-vs-PNG
-    # sniff would mislabel WebP bytes as PNG. Pillow (bundled) re-encodes any
-    # supported format, so suggest-layers works for browser-native WebP/JPEG
-    # imports too, not just generated PNGs.
-    try:
-        from io import BytesIO as _BytesIO
-        from PIL import Image as _PIL
-        with _PIL.open(_BytesIO(image_bytes)) as im:
-            with _BytesIO() as buf:
-                im.convert("RGB").save(buf, format="PNG")
-                image_bytes = buf.getvalue()
-        mime = "image/png"
-    except Exception:
-        # Not Pillow-decodable (unexpected bytes): keep the raw image and fall
-        # back to the old sniff so llama-server rejects cleanly rather than us
-        # 500ing on a corrupt/unsupported image here.
-        mime = "image/jpeg" if image_bytes[:3] == b"\xff\xd8\xff" else "image/png"
-    image_b64 = _b64.b64encode(image_bytes).decode()
-    messages = [
-        {"role": "system", "content": LAYER_SUGGEST_RUBRIC},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
-            {"type": "text", "text": "How many layers should this image be decomposed into?"},
-        ]},
-    ]
+    messages = body.get("messages")
+    prebuilt = isinstance(messages, list) and len(messages) > 0
+    if not prebuilt:
+        image = body.get("image")
+        if not image:
+            return web.json_response({"error": "missing 'image'"}, status=400)
+        import base64 as _b64
+        image_bytes = _b64.b64decode(image)
+        # Normalize to PNG before handing to llama-server. Its multimodal reader
+        # only reliably decodes PNG (JPEG is flaky) and rejects WebP/other formats
+        # with "Failed to load image or audio file"; the worker's own JPEG-vs-PNG
+        # sniff would mislabel WebP bytes as PNG. Pillow (bundled) re-encodes any
+        # supported format, so suggest-layers works for browser-native WebP/JPEG
+        # imports too, not just generated PNGs.
+        try:
+            from io import BytesIO as _BytesIO
+            from PIL import Image as _PIL
+            with _PIL.open(_BytesIO(image_bytes)) as im:
+                with _BytesIO() as buf:
+                    im.convert("RGB").save(buf, format="PNG")
+                    image_bytes = buf.getvalue()
+            mime = "image/png"
+        except Exception:
+            # Not Pillow-decodable (unexpected bytes): keep the raw image and fall
+            # back to the old sniff so llama-server rejects cleanly rather than us
+            # 500ing on a corrupt/unsupported image here.
+            mime = "image/jpeg" if image_bytes[:3] == b"\xff\xd8\xff" else "image/png"
+        image_b64 = _b64.b64encode(image_bytes).decode()
+        messages = [
+            {"role": "system", "content": LAYER_SUGGEST_RUBRIC},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
+                {"type": "text", "text": "How many layers should this image be decomposed into?"},
+            ]},
+        ]
     async with _parallel:
         try:
             reasoning, content = await llms.chat_with_reasoning(
@@ -335,6 +368,37 @@ async def handle_suggest_layers(request: web.Request) -> web.Response:
     return web.json_response({"layers": layers, "raw": blob})
 
 
+async def handle_suggest_gap_prompt(request: web.Request) -> web.Response:
+    """POST /video-creator/v1/suggest-gap-prompt.
+
+    Request:  {messages: [...]}            (client-authored, see lib/llm-messages.ts)
+    Response: {suggested_prompt: str}
+
+    Runs the prebuilt messages through the multimodal llama-server chat and returns
+    the suggested gap-fill clip prompt, stripping any inline thinking/reasoning tags
+    (Gemma may land the whole reply in the reasoning channel with content empty, or
+    emit <start_of_thinking>...</end_of_thinking> inline in content).
+    """
+    _require_token(request)
+    body = await request.json()
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return web.json_response({"error": "missing 'messages' (list)"}, status=400)
+    async with _parallel:
+        try:
+            reasoning, content = await llms.chat_with_reasoning(
+                messages, max_tokens=2048, temperature=0.7,
+            )
+        except Exception as exc:
+            logger.error("suggest-gap-prompt failed: %s", exc, exc_info=True)
+            return web.json_response({"error": str(exc)}, status=500)
+    import re
+    blob = f"{reasoning}\n{content}" if reasoning else (content or "")
+    blob = re.sub(r"<start_of_thinking>.*?</end_of_thinking>", "", blob, flags=re.S)
+    blob = blob.strip()
+    return web.json_response({"suggested_prompt": blob})
+
+
 # ── App factory ──────────────────────────────────────────────────────────────
 
 def create_app() -> web.Application:
@@ -352,6 +416,8 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/chat", handle_chat)
     app.router.add_post("/video-creator/v1/chat", handle_chat)
     app.router.add_post("/video-creator/v1/suggest-layers", handle_suggest_layers)
+    app.router.add_post("/v1/suggest-gap-prompt", handle_suggest_gap_prompt)
+    app.router.add_post("/video-creator/v1/suggest-gap-prompt", handle_suggest_gap_prompt)
     return app
 
 
