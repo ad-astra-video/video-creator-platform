@@ -972,12 +972,24 @@ export interface components {
         AppSettingsPatch: {
             /** Activeltxmodelid */
             activeLtxModelId?: ("ltx-2.3-22b-distilled-1.1" | "ltx-2.3-22b-distilled") | null;
+            /** Customprompts */
+            customPrompts?: object | null;
+            /** Custompromptskeyenc */
+            customPromptsKeyEnc?: string | null;
+            /** Custompromptskdfsalt */
+            customPromptsKdfSalt?: string | null;
+            /** Custompromptsenc */
+            customPromptsEnc?: string | null;
             /** Diffusionstagecacheenabled */
             diffusionStageCacheEnabled?: boolean | null;
             /** Falapikey */
             falApiKey?: string | null;
             /** Geminiapikey */
             geminiApiKey?: string | null;
+            /** Hasopenrouterapikey */
+            hasOpenRouterApiKey?: boolean | null;
+            /** Haspromptencryptionkey */
+            hasPromptEncryptionKey?: boolean | null;
             /** Livepeerapikey */
             livepeerApiKey?: string | null;
             /** Livepeerdiscoveryurl */
@@ -998,6 +1010,10 @@ export interface components {
             ltxApiKey?: string | null;
             /** Modelsdir */
             modelsDir?: string | null;
+            /** Openrouterapikey */
+            openrouterApiKey?: string | null;
+            /** Openroutermodel */
+            openrouterModel?: string | null;
             /** Platformapikey */
             platformApiKey?: string | null;
             /** Platformbaseurl */

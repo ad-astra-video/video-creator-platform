@@ -2,6 +2,9 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { resetBackendCredentials } from '../lib/backend'
 import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
 import { isWebPlatform, setRunnerDiscoveryConfig } from '../lib/livepeer-discovery'
+const CUSTOM_PROMPT_VAULT_KEY = 'custom-prompt-passphrase'
+import { encryptPromptsKeyed, decryptPromptsKeyed, newSalt } from '../lib/prompt-crypto'
+import type { CustomPrompts } from '../lib/llm-messages'
 
 export interface AppSettings {
   useTorchCompile: boolean
@@ -11,6 +14,13 @@ export interface AppSettings {
   hasFalApiKey: boolean
   userPrefersFalApiImageGenerations: boolean
   hasGeminiApiKey: boolean
+  hasOpenRouterApiKey: boolean
+  openrouterModel: string
+  hasPromptEncryptionKey: boolean
+  customPrompts: CustomPrompts | null
+  customPromptsEnc: string | null
+  customPromptsKeyEnc: string | null
+  customPromptsKdfSalt: string | null
   useLocalTextEncoder: boolean
   promptCacheSize: number
   // The user's explicit prompt-enhancer provider choice, persisted so it survives restarts.
@@ -47,6 +57,13 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   hasFalApiKey: false,
   userPrefersFalApiImageGenerations: false,
   hasGeminiApiKey: false,
+  hasOpenRouterApiKey: false,
+  openrouterModel: '',
+  hasPromptEncryptionKey: false,
+  customPrompts: null,
+  customPromptsEnc: null,
+  customPromptsKeyEnc: null,
+  customPromptsKdfSalt: null,
   useLocalTextEncoder: false,
   promptCacheSize: 1,
   promptEnhancerProviderPreference: null,
@@ -80,6 +97,9 @@ interface AppSettingsContextValue {
   saveLtxApiKey: (value: string) => Promise<void>
   saveFalApiKey: (value: string) => Promise<void>
   saveGeminiApiKey: (value: string) => Promise<void>
+  saveOpenRouterApiKey: (value: string) => Promise<void>
+  setOpenRouterModel: (value: string) => Promise<void>
+  saveCustomPrompts: (plain: CustomPrompts, opts?: { passphrase?: string }) => Promise<void>
   saveLivepeerDiscoveryUrl: (value: string) => Promise<void>
   saveLivepeerApiKey: (value: string) => Promise<void>
   forceApiGenerations: boolean
@@ -111,6 +131,13 @@ function normalizeAppSettings(data: Partial<AppSettings>): AppSettings {
     hasFalApiKey: data.hasFalApiKey ?? DEFAULT_APP_SETTINGS.hasFalApiKey,
     userPrefersFalApiImageGenerations: data.userPrefersFalApiImageGenerations ?? DEFAULT_APP_SETTINGS.userPrefersFalApiImageGenerations,
     hasGeminiApiKey: data.hasGeminiApiKey ?? DEFAULT_APP_SETTINGS.hasGeminiApiKey,
+    hasOpenRouterApiKey: data.hasOpenRouterApiKey ?? DEFAULT_APP_SETTINGS.hasOpenRouterApiKey,
+    openrouterModel: data.openrouterModel ?? DEFAULT_APP_SETTINGS.openrouterModel,
+    hasPromptEncryptionKey: data.hasPromptEncryptionKey ?? DEFAULT_APP_SETTINGS.hasPromptEncryptionKey,
+    customPrompts: data.customPrompts ?? DEFAULT_APP_SETTINGS.customPrompts,
+    customPromptsEnc: data.customPromptsEnc ?? DEFAULT_APP_SETTINGS.customPromptsEnc,
+    customPromptsKeyEnc: data.customPromptsKeyEnc ?? DEFAULT_APP_SETTINGS.customPromptsKeyEnc,
+    customPromptsKdfSalt: data.customPromptsKdfSalt ?? DEFAULT_APP_SETTINGS.customPromptsKdfSalt,
     useLocalTextEncoder: data.useLocalTextEncoder ?? DEFAULT_APP_SETTINGS.useLocalTextEncoder,
     promptCacheSize: data.promptCacheSize ?? DEFAULT_APP_SETTINGS.promptCacheSize,
     promptEnhancerProviderPreference: data.promptEnhancerProviderPreference ?? DEFAULT_APP_SETTINGS.promptEnhancerProviderPreference,
@@ -302,6 +329,31 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
     })
   }, [settings.livepeerDiscoveryUrl, settings.livepeerSelectedRunnerId])
 
+  // If prompts were stored encrypted (a passphrase exists in this browser's localStorage),
+  // decrypt them into local plaintext state so the Prompt Builder + dispatch can use them.
+  // Without a cached passphrase -> mark needsKey (hasPromptEncryptionKey false) so the UI
+  // prompts; the cloud copy is unrecoverable by design.
+  useEffect(() => {
+    if (!isLoaded) return
+    const e = settings.customPromptsEnc
+    if (!e || !settings.customPromptsKeyEnc || !settings.customPromptsKdfSalt) return
+    if (settings.customPrompts) return // already have local plaintext
+    let cancelled = false
+    let pass = ''
+    try { pass = localStorage.getItem(CUSTOM_PROMPT_VAULT_KEY) || '' } catch { /* non-fatal */ }
+    if (!pass) {
+      setSettings((prev) => ({ ...prev, hasPromptEncryptionKey: false }))
+      return
+    }
+    void decryptPromptsKeyed(pass, { enc: e, keyEnc: settings.customPromptsKeyEnc, kdfSalt: settings.customPromptsKdfSalt })
+      .then((plain) => {
+        if (cancelled) return
+        try { setSettings((prev) => ({ ...prev, customPrompts: JSON.parse(plain), hasPromptEncryptionKey: true })) } catch { /* unparseable */ }
+      })
+      .catch(() => { if (!cancelled) setSettings((prev) => ({ ...prev, hasPromptEncryptionKey: false })) })
+    return () => { cancelled = true }
+  }, [isLoaded, settings.customPrompts, settings.customPromptsEnc, settings.customPromptsKeyEnc, settings.customPromptsKdfSalt])
+
   const updateSettings = useCallback((patch: Partial<AppSettings> | ((prev: AppSettings) => AppSettings)) => {
     if (typeof patch === 'function') {
       setSettings((prev) => patch(prev))
@@ -332,6 +384,55 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       throw new Error(result.error.message)
     }
     await refreshSettings()
+  }, [refreshSettings])
+
+  const saveOpenRouterApiKey = useCallback(async (value: string) => {
+    const result = await ApiClient.updateSettings({ openrouterApiKey: value })
+    if (!result.ok) {
+      throw new Error(result.error.message)
+    }
+    await refreshSettings()
+  }, [refreshSettings])
+
+  const setOpenRouterModel = useCallback(async (value: string) => {
+    const result = await ApiClient.updateSettings({ openrouterModel: value })
+    if (!result.ok) {
+      throw new Error(result.error.message)
+    }
+    await refreshSettings()
+  }, [refreshSettings])
+
+  // Persist custom prompts. passphrase set -> envelope-encrypt and store ciphertext (the
+  // passphrase lives in THIS browser's localStorage only, never sent to the server);
+  // no passphrase -> store plaintext in D1 (server-readable). Always keeps a browser-local
+  // plaintext draft so the Prompt Builder can seed the editor without a network hit.
+  const saveCustomPrompts = useCallback(async (plain: CustomPrompts, opts?: { passphrase?: string }) => {
+    try { localStorage.setItem('custom-prompts-draft', JSON.stringify(plain)) } catch { /* non-fatal */ }
+    if (opts?.passphrase) {
+      const salt = newSalt()
+      const c = await encryptPromptsKeyed(opts.passphrase, salt, JSON.stringify(plain))
+      try { localStorage.setItem(CUSTOM_PROMPT_VAULT_KEY, opts.passphrase) } catch { /* non-fatal */ }
+      const result = await ApiClient.updateSettings({
+        customPrompts: null,
+        customPromptsEnc: c.enc,
+        customPromptsKeyEnc: c.keyEnc,
+        customPromptsKdfSalt: c.kdfSalt,
+        hasPromptEncryptionKey: true,
+      })
+      if (!result.ok) throw new Error(result.error.message)
+      await refreshSettings()
+    } else {
+      try { localStorage.setItem(CUSTOM_PROMPT_VAULT_KEY, '') } catch { /* non-fatal */ }
+      const result = await ApiClient.updateSettings({
+        customPrompts: plain,
+        customPromptsEnc: null,
+        customPromptsKeyEnc: null,
+        customPromptsKdfSalt: null,
+        hasPromptEncryptionKey: false,
+      })
+      if (!result.ok) throw new Error(result.error.message)
+      await refreshSettings()
+    }
   }, [refreshSettings])
 
   const saveLivepeerDiscoveryUrl = useCallback(async (value: string) => {
@@ -374,6 +475,9 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       saveLtxApiKey,
       saveFalApiKey,
       saveGeminiApiKey,
+      saveOpenRouterApiKey,
+      setOpenRouterModel,
+      saveCustomPrompts,
       saveLivepeerDiscoveryUrl,
       saveLivepeerApiKey,
       forceApiGenerations,
@@ -381,7 +485,7 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       shouldImageGenerateWithFalApi,
       cudaAvailable,
     }),
-    [cudaAvailable, forceApiGenerations, isLoaded, refreshSettings, runtimePolicyLoaded, saveFalApiKey, saveGeminiApiKey, saveLtxApiKey, saveLivepeerDiscoveryUrl, saveLivepeerApiKey, settings, shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, updateSettings],
+    [cudaAvailable, forceApiGenerations, isLoaded, refreshSettings, runtimePolicyLoaded, saveCustomPrompts, saveFalApiKey, saveGeminiApiKey, saveLtxApiKey, saveLivepeerDiscoveryUrl, saveLivepeerApiKey, saveOpenRouterApiKey, setOpenRouterModel, settings, shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, updateSettings],
   )
 
   return <AppSettingsContext.Provider value={contextValue}>{children}</AppSettingsContext.Provider>

@@ -44,6 +44,46 @@
       "AppSettingsPatch": {
         "additionalProperties": false,
         "properties": {
+          "customPrompts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Customprompts"
+          },
+          "customPromptsEnc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custompromptsenc"
+          },
+          "customPromptsKeyEnc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custompromptskeyenc"
+          },
+          "customPromptsKdfSalt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custompromptskdfsalt"
+          },
           "activeLtxModelId": {
             "anyOf": [
               {
@@ -91,6 +131,16 @@
               }
             ],
             "title": "Geminiapikey"
+          },
+          "hasOpenRouterApiKey": {
+            "type": "boolean",
+            "default": false,
+            "title": "Hasopenrouterapikey"
+          },
+          "hasPromptEncryptionKey": {
+            "type": "boolean",
+            "default": false,
+            "title": "Haspromptencryptionkey"
           },
           "livepeerApiKey": {
             "anyOf": [
@@ -204,6 +254,28 @@
               }
             ],
             "title": "Modelsdir"
+          },
+          "openrouterApiKey": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouterapikey"
+          },
+          "openrouterModel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openroutermodel"
           },
           "platformApiKey": {
             "anyOf": [
