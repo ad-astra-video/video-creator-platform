@@ -1,7 +1,15 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { AlertCircle, Check, KeyRound, Loader2, RotateCcw, Save } from 'lucide-react'
 import { useAppSettings } from '../../contexts/AppSettingsContext'
-import type { CustomPrompts } from '../../lib/llm-messages'
+import {
+  DEFAULT_T2V_SYSTEM_PROMPT,
+  DEFAULT_I2V_SYSTEM_PROMPT,
+  DEFAULT_EXTEND_SYSTEM_PROMPT,
+  DEFAULT_RETAKE_SYSTEM_PROMPT,
+  LAYER_SUGGEST_RUBRIC,
+  GAP_FILL_RUBRIC,
+  type CustomPrompts,
+} from '../../lib/llm-messages'
 
 const FEATURES: { key: keyof CustomPrompts; title: string; desc: string }[] = [
   { key: 'enhancerT2V', title: 'Text-to-video enhancement', desc: 'Prompt for turning text into a video.' },
@@ -12,18 +20,29 @@ const FEATURES: { key: keyof CustomPrompts; title: string; desc: string }[] = [
   { key: 'gapFillRubric', title: 'Timeline gap-fill', desc: 'Rubric for writing the clip that fills a timeline gap.' },
 ]
 
+/** The built-in default prompt used for each feature when you haven't customized it. */
+const DEFAULTS: Record<string, string> = {
+  enhancerT2V: DEFAULT_T2V_SYSTEM_PROMPT,
+  enhancerI2V: DEFAULT_I2V_SYSTEM_PROMPT,
+  enhancerExtend: DEFAULT_EXTEND_SYSTEM_PROMPT,
+  enhancerRetake: DEFAULT_RETAKE_SYSTEM_PROMPT,
+  layerSuggestRubric: LAYER_SUGGEST_RUBRIC,
+  gapFillRubric: GAP_FILL_RUBRIC,
+}
+
 /**
- * Prompt Builder tab — write/edit the exact system prompts every LLM feature uses.
+ * Prompt Builder tab — see AND edit the exact system prompt every LLM feature uses.
  *
- * Each field is optional: a blank field falls back to the built-in default prompt.
- * Written prompts are used by the browser's OpenRouter DIRECT path AND (byte-for-byte)
- * by the runner's gemma worker as pure executor, so a custom prompt takes effect
+ * Each feature shows the prompt it will actually send: the built-in default (read-only)
+ * or your custom text (editable). A two-option dropdown ("Default" / "Custom") picks
+ * which. Written prompts are used by the browser's OpenRouter DIRECT path AND
+ * (byte-for-byte) by the runner's gemma worker, so a custom prompt takes effect
  * everywhere at once.
  *
  * Storage is two-mode (user decision):
  *  - no encryption key  -> prompts saved as PLAINTEXT in D1 + browser localStorage
  *  - an encryption key  -> prompts ENVELOPE-encrypted (AES-GCM); the key lives ONLY in
- *    the browser (never sent to the server); server stores ciphertext it cannot read.
+ *    the browser (never sent to the server); the server stores ciphertext it can't read.
  */
 export function PromptBuilderTab() {
   const { settings, saveCustomPrompts } = useAppSettings()
@@ -35,14 +54,23 @@ export function PromptBuilderTab() {
 
   useEffect(() => {
     const init: Record<string, string> = {}
-    for (const f of FEATURES) {
-      init[f.key] = settings.customPrompts?.[f.key] ?? ''
-    }
+    for (const f of FEATURES) init[f.key] = settings.customPrompts?.[f.key] ?? ''
     setDrafts(init)
   }, [settings.customPrompts])
 
-  const setDraft = (key: string, value: string) => {
-    setDrafts((d) => ({ ...d, [key]: value }))
+  const customized = (key: string) => (drafts[key] ?? '').trim().length > 0
+  const activePrompt = (key: string) => (customized(key) ? drafts[key] : DEFAULTS[key])
+
+  const setDraft = (key: string, value: string) => setDrafts((d) => ({ ...d, [key]: value }))
+
+  const switchMode = (key: string, mode: 'default' | 'custom') => {
+    if (mode === 'custom') {
+      // Seed with the existing custom text, else the default as a starting point,
+      // so choosing Custom always gives you a non-empty prompt to edit.
+      setDraft(key, customized(key) ? drafts[key]! : DEFAULTS[key])
+    } else {
+      setDraft(key, '') // clear -> uses the built-in default
+    }
   }
 
   const persist = async () => {
@@ -50,7 +78,7 @@ export function PromptBuilderTab() {
     setError(null)
     try {
       const plain: CustomPrompts = {}
-      for (const f of FEATURES) if (drafts[f.key]) plain[f.key] = drafts[f.key]
+      for (const f of FEATURES) if (customized(f.key)) plain[f.key] = drafts[f.key]!
       await saveCustomPrompts(plain, passphrase ? { passphrase } : undefined)
       setPassphrase('')
       setSavedAt(Date.now())
@@ -112,37 +140,64 @@ export function PromptBuilderTab() {
       {/* Per-feature prompt cards */}
       <div className="space-y-3">
         {FEATURES.map((f) => {
-          const value = drafts[f.key] ?? ''
-          const customized = value.trim().length > 0
+          const custom = customized(f.key)
+          const prompt = activePrompt(f.key)
           return (
-            <div key={f.key} className="bg-zinc-800/50 rounded-lg p-4 space-y-2">
+            <div key={f.key} className="bg-zinc-800/50 rounded-lg p-4 space-y-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex-1">
                   <div className="flex items-center gap-2 mb-1">
                     <span className="text-sm font-semibold text-white">{f.title}</span>
-                    {customized && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 font-medium uppercase tracking-wide">Custom</span>
-                    )}
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide ${
+                      custom ? 'bg-blue-500/10 text-blue-400' : 'bg-zinc-800 text-zinc-500'
+                    }`}>
+                      {custom ? 'Custom' : 'Default'}
+                    </span>
                   </div>
                   <p className="text-xs text-zinc-500 leading-relaxed">{f.desc}</p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setDraft(f.key, customized ? '' : value || '')}
-                  className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
-                    customized ? 'bg-orange-500' : 'bg-zinc-700'
-                  }`}
+                <select
+                  value={custom ? 'custom' : 'default'}
+                  onChange={(e) => switchMode(f.key, e.target.value as 'default' | 'custom')}
+                  className="flex-shrink-0 px-2.5 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+                  title={custom ? 'Uses your custom prompt. Switch to Default to use the built-in prompt.' : 'Uses the built-in prompt. Switch to Custom to write your own.'}
                 >
-                  <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition duration-200 ${customized ? 'translate-x-4' : 'translate-x-0'}`} />
-                </button>
+                  <option value="default">Default</option>
+                  <option value="custom">Custom</option>
+                </select>
               </div>
-              {customized && (
+
+              {/* The exact prompt that will be used — always visible.
+                  Default: read-only. Custom: editable. */}
+              {custom ? (
                 <textarea
-                  value={value}
+                  value={drafts[f.key] ?? ''}
                   onChange={(e) => setDraft(f.key, e.target.value)}
                   rows={4}
                   className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-white placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+                  aria-label={`Custom ${f.title} prompt`}
                 />
+              ) : (
+                <div className="relative">
+                  <pre className="max-h-24 overflow-y-auto whitespace-pre-wrap px-3 py-2 bg-zinc-900/60 border border-zinc-800 rounded-lg text-xs text-zinc-400 leading-relaxed">
+                    {prompt}
+                  </pre>
+                  <span className="absolute top-1.5 right-2 text-[10px] text-zinc-600 uppercase tracking-wide">
+                    Built-in default
+                  </span>
+                </div>
+              )}
+
+              {custom && (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setDraft(f.key, '')}
+                    className="text-xs text-zinc-400 hover:text-zinc-200 inline-flex items-center gap-1 transition-colors"
+                  >
+                    <RotateCcw className="h-3 w-3" /> Reset to default
+                  </button>
+                </div>
               )}
             </div>
           )
