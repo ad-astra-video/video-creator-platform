@@ -26,6 +26,7 @@ import { GapGenerationModal } from './GapGenerationModal'
 import { ClipContextMenu, type ClipContextMenuState } from './ClipContextMenu'
 import type { TimelineClip, Track, SubtitleClip, Asset, TextOverlayStyle } from '../../types/project-model'
 import { ApiClient } from '../../lib/api-client'
+import { suggestGapPromptSmart } from '../../lib/direct-transport'
 import { pathToFileUrl } from '../../lib/file-url'
 import {
   areVideoGenerationSettingsEquivalent,
@@ -760,7 +761,7 @@ export function VideoEditorTimelineEditingPanel(props: VideoEditorTimelineEditin
         }
       }
 
-      const result = await ApiClient.suggestGapPrompt({
+      const smart = await suggestGapPromptSmart({
         gapDuration: gap.endTime - gap.startTime,
         mode,
         beforePrompt,
@@ -768,9 +769,31 @@ export function VideoEditorTimelineEditingPanel(props: VideoEditorTimelineEditin
         beforeFrame,
         afterFrame,
         ...(inputImagePath ? { inputImage: inputImagePath } : {}),
-      }, {
+        hasOpenRouterApiKey: settings.hasOpenRouterApiKey,
+        openRouterModel: settings.openrouterModel,
+        customPrompts: settings.customPrompts,
         signal: abortController.signal,
       })
+      let result:
+        | { ok: true; status: number; data: { suggested_prompt?: string } }
+        | { ok: false; status: number | string; error: { code: string; message: string } }
+      if (smart) {
+        result = { ok: true, status: 200, data: smart }
+      } else {
+        const res = await ApiClient.suggestGapPrompt({
+          gapDuration: gap.endTime - gap.startTime,
+          mode,
+          beforePrompt,
+          afterPrompt,
+          beforeFrame,
+          afterFrame,
+          ...(inputImagePath ? { inputImage: inputImagePath } : {}),
+        }, {
+          signal: abortController.signal,
+        })
+        if (res.ok) result = { ok: true, status: 200, data: res.data }
+        else result = { ok: false, status: res.status, error: res.error as { code: string; message: string } }
+      }
       if (!result.ok) {
         const errStr = (JSON.stringify(result.error) ?? '').toLowerCase()
         const isApiKeyError = result.status === 401 || result.status === 403

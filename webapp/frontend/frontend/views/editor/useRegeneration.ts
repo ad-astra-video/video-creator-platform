@@ -4,6 +4,8 @@ import type { GenerationSettings } from '../../components/SettingsPanel'
 import type { GenerationError } from '../../lib/generation-errors'
 import { addVisualAssetToProject } from '../../lib/asset-copy'
 import { ApiClient } from '../../lib/api-client'
+import { suggestGapPromptSmart } from '../../lib/direct-transport'
+import { useAppSettings } from '../../contexts/AppSettingsContext'
 import { logger } from '../../lib/logger'
 import {
   selectAssets,
@@ -89,6 +91,7 @@ export interface UseRegenerationParams {
 }
 
 export function useRegeneration(params: UseRegenerationParams) {
+  const { settings } = useAppSettings()
   const {
     projectId,
     regenGenerate,
@@ -145,14 +148,27 @@ export function useRegeneration(params: UseRegenerationParams) {
         }
 
         if (framePath) {
-          const result = await ApiClient.suggestGapPrompt({
+          const smart = await suggestGapPromptSmart({
             gapDuration: asset.duration || 5,
             mode: asset.type === 'image' ? 'text-to-image' : 'text-to-video',
             beforePrompt: '',
             afterPrompt: '',
             beforeFrame: framePath,
             afterFrame: '',
+            hasOpenRouterApiKey: settings.hasOpenRouterApiKey,
+            openRouterModel: settings.openrouterModel,
+            customPrompts: settings.customPrompts,
           })
+          const result = smart
+            ? { ok: true as const, data: smart }
+            : await ApiClient.suggestGapPrompt({
+                gapDuration: asset.duration || 5,
+                mode: asset.type === 'image' ? 'text-to-image' : 'text-to-video',
+                beforePrompt: '',
+                afterPrompt: '',
+                beforeFrame: framePath,
+                afterFrame: '',
+              })
           if (!result.ok) {
             throw new Error(result.error.message)
           }

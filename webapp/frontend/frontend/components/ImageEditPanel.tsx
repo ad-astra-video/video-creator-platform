@@ -3,6 +3,10 @@ import { createPortal } from 'react-dom'
 import { webAssetUrl } from '../lib/file-url'
 import { getBlob, isWebPath } from '../lib/runtime/web-store'
 import { resolveRunner, layerImageViaRunner, editImageViaRunner, styleFrameViaRunner, suggestLayersViaRunner, sam3SelectViaRunner, imageEditCapability } from '../lib/direct-transport'
+import { useAppSettings } from '../contexts/AppSettingsContext'
+import { ApiClient } from '../lib/api-client'
+import { getVisionModels, resolveOpenRouterModel, openRouterChat } from '../lib/openrouter'
+import { buildLayerSuggestMessages } from '../lib/llm-messages'
 import type { LayerRunProgress } from '../lib/direct-transport'
 import type { LayerPreview } from '../lib/direct-transport'
 import { Layers, Loader2, X, Image as ImageIcon, ChevronDown, Wand2 } from 'lucide-react'
@@ -172,6 +176,7 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
   },
   ref,
 ) {
+  const appSettings = useAppSettings()
   const [layers, setLayers] = useState<LayerPreview[]>([])
   const [selected, setSelected] = useState<number[]>([])
   const [invertMask, setInvertMask] = useState(false)
@@ -405,9 +410,32 @@ export const ImageEditPanel = forwardRef<ImageEditPanelHandle, ImageEditPanelPro
     ;(async () => {
       setLayerSuggestion(null)
       try {
+        const b64 = await blobToBase64(blob)
+        if (cancelled) return
+        // OpenRouter DIRECT path first (browser -> openrouter.ai); falls back to the runner.
+        if (appSettings.settings.hasOpenRouterApiKey) {
+          try {
+            const kr = await ApiClient.getOpenRouterApiKey()
+            const key = kr.ok ? (kr.data as { openrouterApiKey?: string })?.openrouterApiKey : undefined
+            if (key) {
+              const models = await getVisionModels(key)
+              const model = resolveOpenRouterModel(appSettings.settings.openrouterModel, models)
+              const msgs = buildLayerSuggestMessages(b64, appSettings.settings.customPrompts ?? undefined)
+              const { content } = await openRouterChat(key, model, msgs)
+              const m = /<(\d{1,2})>/.exec(content)
+              const n = m ? parseInt(m[1], 10) : null
+              if (!cancelled && n != null && n >= 2 && n <= 8) {
+                setLayerSuggestion(n)
+                setLayerCount(n)
+                logger.info(`OpenRouter suggests ${n} layers for this image`)
+                return
+              }
+            }
+          } catch { /* fall through to runner */ }
+        }
         const runner = await resolveRunner(['suggest-layers'])
         if (!runner || cancelled) return
-        const sug = await suggestLayersViaRunner(runner, await blobToBase64(blob))
+        const sug = await suggestLayersViaRunner(runner, b64)
         if (cancelled) return
         const n = sug.layers
         if (n != null && n >= 2 && n <= 8) {

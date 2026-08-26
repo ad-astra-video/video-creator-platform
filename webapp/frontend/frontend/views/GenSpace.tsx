@@ -1,4 +1,4 @@
-﻿import { useState, useRef, useEffect, useCallback, useMemo, forwardRef, useImperativeHandle, useId } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, forwardRef, useImperativeHandle, useId } from 'react'
 import {
   Trash2, Download, Image, Video, X,
   Heart, Film, Volume2, VolumeX, Sparkles, Sparkle,
@@ -15,6 +15,8 @@ import { setActiveGenerationOwner, hasValidBaselineId } from '../lib/generation-
 import { setBillingProjectId } from '../lib/billing-context'
 import { resolveRunner, enhancePromptViaRunner, pathToBase64 } from '../lib/direct-transport'
 import { isWebPlatform } from '../lib/livepeer-discovery'
+import { getVisionModels, resolveOpenRouterModel, openRouterChat } from '../lib/openrouter'
+import { buildEnhanceMessages } from '../lib/llm-messages'
 import { extractFrame } from '../lib/runtime/web-store'
 import { saveProjectTimeline, readProjectTimeline } from '../lib/runtime/fs-access'
 import { withGenerationActive } from '../lib/generation-active'
@@ -2149,7 +2151,7 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
     return `${extendResolutionKey}p`
   }, [extendResolutionKey, extendInput])
   const maxExtendSeconds = useMemo(() => {
-    const table = extendCapability?.max_duration_seconds
+    const table = extendCapability?.maxs
     if (!table) return MAX_EXTEND_SECONDS_RUNS
     const direct = table[effectiveExtendRes]
     if (typeof direct === 'number' && direct > 0) return direct
@@ -3214,6 +3216,32 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     // Gemini/LTX API via the Worker.
     const directEnhanceActive = (appSettings.livepeerDiscoveryUrl || '').trim().length > 0
     const result = await withGenerationActive(async () => {
+      // OpenRouter DIRECT path (browser -> openrouter.ai, no Livepeer ticket on this leg).
+      // Auto model is resolved LIVE to the most popular free+vision model in the CURRENT
+      // list (OpenRouter's returned order = popularity proxy); a user-set `openrouterModel`
+      // wins and is never probed. NO hardcoded model constant / env vars. If the auto model
+      // can't resolve (no key / no vision model / fetch fails), we degrade to the runner /
+      // local-Gemma path below instead of guessing.
+      if (appSettings.hasOpenRouterApiKey) {
+        try {
+          const kr = await ApiClient.getOpenRouterApiKey()
+          const key = kr.ok ? (kr.data as { openrouterApiKey?: string })?.openrouterApiKey : undefined
+          if (key) {
+            const models = await getVisionModels(key)
+            const model = resolveOpenRouterModel(appSettings.openrouterModel, models)
+            const msgs = buildEnhanceMessages(
+              { prompt: sourcePrompt, imageBase64, contextFrames, task: enhanceTask, direction: extendDir },
+              appSettings.customPrompts ?? undefined,
+            )
+            const { content, reasoning } = await openRouterChat(key, model, msgs)
+            if (content.trim()) {
+              return { ok: true, data: { enhancedPrompt: content, reasoning } as any }
+            }
+          }
+        } catch {
+          /* auto model unresolved or call failed -> runner / local Gemma */
+        }
+      }
       if (directEnhanceActive) {
         const runner = await resolveRunner(['prompt-enhance'])  // runner advertises prompt-enhance, not prompt
         if (!runner) return { ok: false, status: '4XX', error: { code: 'NO_RUNNER', message: 'No capable Livepeer runner available for prompt enhancement' } as any }

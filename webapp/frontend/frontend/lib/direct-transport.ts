@@ -22,6 +22,8 @@ import { decodeMediaPayload } from './media-decode'
 import { readSSEStream } from './sse-stream'
 import { logger } from './logger'
 import { isWebPlatform, discoverRunners, getRunnerDiscoveryConfig, loadExcludedRunnerUrls, type DiscoveredRunner } from './livepeer-discovery'
+import { getVisionModels, resolveOpenRouterModel, openRouterChat } from './openrouter'
+import { buildGapSuggestMessages, type CustomPrompts } from './llm-messages'
 
 /** Fetch with an AbortSignal.timeout guard so a hung hop surfaces as an error instead of a silent await. */
 function fetchWithTimeout(ms: number): RequestInit['signal'] {
@@ -52,6 +54,7 @@ const TASK_ENDPOINTS: Record<string, string> = {
   'generate-i2v': '/video-creator/v1/i2v',
   'generate-image': '/video-creator/v1/image',
   'enhance-prompt': '/video-creator/v1/prompt-enhance',
+  'suggest-gap-prompt': '/video-creator/v1/suggest-gap-prompt',
   extend: '/video-creator/v1/extend',
   retake: '/video-creator/v1/retake',
   restyle: '/video-creator/v1/restyle',
@@ -632,19 +635,24 @@ export async function layerImageViaRunner(
 export async function suggestLayersViaRunner(
   runner: RunnerDto,
   imageBase64: string,
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; messages?: Array<{ role: string; content: unknown }> },
 ): Promise<{ layers: number | null; raw: string }> {
-  const hash = await imageHashHex(imageBase64)
-  if (hash) return cached(`suggest-layers:${hash}`, () => suggestLayersRun(runner, imageBase64, opts))
-  return suggestLayersRun(runner, imageBase64, opts)
+  const body: Record<string, unknown> = { image: imageBase64 }
+  if (opts?.messages) body.messages = opts.messages
+  const run = () => suggestLayersRun(runner, body, opts)
+  if (!opts?.messages) {
+    const hash = await imageHashHex(imageBase64)
+    if (hash) return cached(`suggest-layers:${hash}`, run)
+  }
+  return run()
 }
 
 async function suggestLayersRun(
   runner: RunnerDto,
-  imageBase64: string,
-  opts?: { signal?: AbortSignal },
+  body: Record<string, unknown>,
+  opts?: { signal?: AbortSignal; messages?: Array<{ role: string; content: unknown }> },
 ): Promise<{ layers: number | null; raw: string }> {
-  const res = await postToRunnerWithTicket(runner, 'suggest-layers', { image: imageBase64 }, opts)
+  const res = await postToRunnerWithTicket(runner, 'suggest-layers', body, opts)
   if (!res.ok) {
     let detail = `Layer-count suggestion failed (${res.status})`
     try {
@@ -658,6 +666,97 @@ async function suggestLayersRun(
     layers: typeof data?.layers === 'number' ? data.layers : null,
     raw: typeof data?.raw === 'string' ? data.raw : '',
   }
+}
+/** Ask the runner's gemma worker (POST /video-creator/v1/suggest-gap-prompt) to write the
+ *  clip that fills a timeline gap. Passes prebuilt `messages` verbatim (client-authored)
+ *  and returns { suggestedPrompt }. */
+export async function suggestGapPromptViaRunner(
+  runner: RunnerDto,
+  body: unknown,
+  opts?: { signal?: AbortSignal },
+): Promise<{ suggestedPrompt: string }> {
+  const res = await postToRunnerWithTicket(runner, 'suggest-gap-prompt', body, opts)
+  if (!res.ok) {
+    let msg = `Gap-fill suggestion failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (typeof j?.error === 'string') msg = j.error
+    } catch { /* keep status message */ }
+    throw new Error(msg)
+  }
+  const data = (await res.json().catch(() => null)) as { suggested_prompt?: unknown; suggestedPrompt?: unknown } | null
+  const sp = data?.suggested_prompt ?? data?.suggestedPrompt
+  if (typeof sp !== 'string' || !sp.trim()) throw new Error('Gap-fill returned no prompt')
+  return { suggestedPrompt: sp }
+}
+
+
+/** Frame/path -> base64 body for the multimodal gap-fill call (web:// or file path -> bytes). */
+async function frameToBase64(v?: string): Promise<string | undefined> {
+  if (!v) return undefined
+  if (v.startsWith('data:')) return v.slice(v.indexOf(',') + 1)
+  return (await pathToBase64(v)) ?? undefined
+}
+
+/**
+ * Gap-fill suggestion with smart dispatch:
+ *  - OpenRouter DIRECT when a key is set (browser -> openrouter.ai, no Livepeer ticket),
+ *  - else the runner's gemma worker via suggestGapPromptViaRunner (prebuilt messages).
+ * Returns null when neither is available so the caller can fall back to the Worker API.
+ */
+export async function suggestGapPromptSmart(
+  input: {
+    gapDuration: number
+    mode: string
+    beforePrompt?: string
+    afterPrompt?: string
+    beforeFrame?: string
+    afterFrame?: string
+    inputImage?: string
+    hasOpenRouterApiKey: boolean
+    openRouterModel?: string
+    customPrompts?: CustomPrompts | null
+    signal?: AbortSignal
+  },
+): Promise<{ suggested_prompt: string } | null> {
+  const [beforeFrame, afterFrame, inputImage] = await Promise.all([
+    frameToBase64(input.beforeFrame),
+    frameToBase64(input.afterFrame),
+    frameToBase64(input.inputImage),
+  ])
+  const buildBody = () => ({
+    messages: buildGapSuggestMessages(
+      {
+        gapDuration: input.gapDuration,
+        mode: input.mode,
+        beforePrompt: input.beforePrompt,
+        afterPrompt: input.afterPrompt,
+        beforeFrame,
+        afterFrame,
+        inputImage,
+      },
+      input.customPrompts ?? undefined,
+    ),
+  })
+  if (input.hasOpenRouterApiKey) {
+    try {
+      const kr = await ApiClient.getOpenRouterApiKey()
+      const key = kr.ok ? (kr.data as { openrouterApiKey?: string })?.openrouterApiKey : undefined
+      if (key) {
+        const models = await getVisionModels(key)
+        const model = resolveOpenRouterModel(input.openRouterModel, models)
+        const { content } = await openRouterChat(key, model, buildBody().messages)
+        if (content.trim()) return { suggested_prompt: content.trim() }
+      }
+    } catch { /* fall through to runner/API */ }
+    return null
+  }
+  const runner = await resolveRunner(['suggest-gap-prompt'])
+  if (runner) {
+    const { suggestedPrompt } = await suggestGapPromptViaRunner(runner, buildBody(), { signal: input.signal })
+    return { suggested_prompt: suggestedPrompt }
+  }
+  return null
 }
 
 export async function resolveRunner(
