@@ -42,7 +42,7 @@ import {
   cryptoRandomHex,
 } from "./utils";
 import { getHealth } from "./routes/health";
-import { getSettingsRoute, postSettingsRoute, getSettingsFalKey } from "./routes/settings";
+import { getSettingsRoute, postSettingsRoute, getSettingsFalKey, getSettingsOpenRouterKey } from "./routes/settings";
 import { getPlatformHistory, getPlatformStatus } from "./routes/platform";
 
 async function handle(request: Request, env: Env): Promise<Response> {
@@ -122,6 +122,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       if (method === "POST" && path === "/api/settings") return await postSettingsRoute(request, env);
       // Raw FAL key for the DIRECT fal.run path (direct-transport design).
       if (method === "GET" && path === "/api/settings/fal-key") return await getSettingsFalKey(request, env);
+      if (method === "GET" && path === "/api/settings/openrouter-key") return await getSettingsOpenRouterKey(request, env);
 
       // Platform:
       if (method === "GET" && path === "/api/platform/status") return await getPlatformStatus(request, env);

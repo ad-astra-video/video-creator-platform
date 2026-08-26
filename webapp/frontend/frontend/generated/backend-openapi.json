@@ -4015,6 +4015,11 @@
             "title": "Hasltxapikey",
             "type": "boolean"
           },
+          "hasOpenRouterApiKey": {
+            "default": false,
+            "title": "Hasopenrouterapikey",
+            "type": "boolean"
+          },
           "hasPlatformApiKey": {
             "default": false,
             "title": "Hasplatformapikey",

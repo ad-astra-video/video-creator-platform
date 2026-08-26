@@ -2466,6 +2466,11 @@ export interface components {
              */
             hasLtxApiKey: boolean;
             /**
+             * Hasopenrouterapikey
+             * @default false
+             */
+            hasOpenRouterApiKey: boolean;
+            /**
              * Hasplatformapikey
              * @default false
              */

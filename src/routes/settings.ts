@@ -26,6 +26,7 @@ export async function getSettingsRoute(request: Request, env: Env): Promise<Resp
     hasLivepeerDiscoveryUrl: Boolean(stored.livepeerDiscoveryUrl),
     hasLtxApiKey: false,
     hasFalApiKey: false,
+    hasOpenRouterApiKey: Boolean((stored as Record<string, unknown>).openrouterApiKey),
   });
 }
 
@@ -67,4 +68,13 @@ export async function getSettingsFalKey(request: Request, env: Env): Promise<Res
   const stored = await getSettings(env.DB, u.userId);
   const key = (stored as Record<string, unknown>).falApiKey;
   return ok({ falApiKey: typeof key === "string" ? key : "", hasFalApiKey: typeof key === "string" && key.length > 0 });
+}
+
+export async function getSettingsOpenRouterKey(request: Request, env: Env): Promise<Response> {
+  const u = await resolveUserFromRequest(request, env);
+  if (!u.ok) return u.response;
+  if (!env.DB) return err("Server error", 500);
+  const stored = await getSettings(env.DB, u.userId);
+  const key = (stored as Record<string, unknown>).openrouterApiKey;
+  return ok({ openrouterApiKey: (typeof key === "string" ? key : ""), hasOpenRouterApiKey: (typeof key === "string" && key.length > 0) });
 }
