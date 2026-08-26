@@ -18,6 +18,7 @@ surface /load and /evict.
 """
 
 import asyncio
+import math
 import logging
 import os
 import sys
@@ -580,7 +581,21 @@ async def handle_bernini(request: web.Request) -> web.Response:
     if not prompt:
         return web.json_response({"error": "missing 'prompt'"}, status=400)
 
-    manager = await bernini_mod.get_manager(device=None)
+    # Resident/reuse the Bernini manager on the scheduler-assigned GPU. The
+    # live-runner's proxy forwards the assigned card as X-Worker-Device (see
+    # _post_worker); passing it here lets get_manager reuse a resident manager
+    # on that card OR create it on the spot — so the generation request itself
+    # can resident Bernini even if no /load landed (e.g. after a worker-container
+    # recreate the live-runner's residency tracking can be stale and never
+    # re-issues /load). Model comes from the body (resp. 14b).
+    bernini_model = config.resolve_model(body.get("model"))
+    if bernini_model not in config.BERNINI_MODELS:
+        bernini_model = "bernini-1.3b"
+    _dev_header = request.headers.get("X-Worker-Device", "")
+    manager = await bernini_mod.get_manager(
+        model=bernini_model,
+        device=_dev_header.strip() if _dev_header.strip() else None,
+    )
     # One resident video model per card: if the id-v2v diffsynth pipe is
     # resident, drop it before the Bernini subprocess allocates the shared GPU.
     if _model is not None and not run_mod.generation_active():
@@ -612,9 +627,20 @@ async def handle_bernini(request: web.Request) -> web.Response:
                 job[k] = body[k]
 
         run_mod.set_progress(job_id, 0.05, "bernini", "generating")
+        # Chunk-aware outer timeout: long v2v sources are split by the manager
+        # into ~NATIVE_FRAMES chunks, each rendered natively; the outer wait
+        # must cover ALL chunk renders, so scale it with the estimated chunk
+        # count (900s single-shot baseline + ~420s headroom per extra chunk).
+        _wanted = body.get("num_frames")
+        try:
+            _nf = int(_wanted) if _wanted else config.BERNINI_NATIVE_FPS * 5
+        except (TypeError, ValueError):
+            _nf = config.BERNINI_NATIVE_FPS * 5
+        _extra_chunks = max(0, math.ceil(_nf / bernini_mod.NATIVE_FRAMES) - 1)
+        _gen_timeout = 900 + _extra_chunks * 420
         try:
             result = await asyncio.wait_for(
-                manager.generate(job), timeout=900)
+                manager.generate(job), timeout=_gen_timeout)
         except bernini_mod.BerniniError as exc:
             run_mod.set_progress(job_id, -1, "failed", str(exc))
             return web.json_response({"error": str(exc), "job_id": job_id},
