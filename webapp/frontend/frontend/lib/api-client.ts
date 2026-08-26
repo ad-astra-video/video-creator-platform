@@ -1,4 +1,4 @@
-﻿import { backendFetch } from './backend'
+import { backendFetch } from './backend'
 import type { components, paths } from '../generated/backend-openapi'
 
 type HttpMethod = 'get' | 'post' | 'put' | 'patch' | 'delete'
@@ -674,6 +674,20 @@ export class ApiClient {
   }
 
   /** GET /api/settings/fal-key — the raw FAL key for the browser→fal.run DIRECT path. */
+
+  /** GET /api/settings/openrouter-key — the raw OpenRouter key for the browser→OpenRouter DIRECT path. */
+  static async getOpenRouterApiKey(): Promise<{ ok: true; data: { openrouterApiKey: string; hasOpenRouterApiKey: boolean } } | { ok: false; status: number; error: any }> {
+    try {
+      const res = await backendFetch('/api/settings/openrouter-key', { method: 'GET' })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) return { ok: true, data: json }
+      return { ok: false, status: res.status, error: json }
+    } catch (e) {
+      return { ok: false, status: 0, error: e instanceof Error ? e.message : 'network' }
+    }
+  }
+
+
   static async getFalApiKey(): Promise<{ ok: true; data: { falApiKey: string; hasFalApiKey: boolean } } | { ok: false; status: number; error: any }> {
     try {
       const res = await backendFetch('/api/settings/fal-key', { method: 'GET' })

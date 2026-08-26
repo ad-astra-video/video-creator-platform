@@ -10,6 +10,8 @@ import { logger } from '../lib/logger'
 import { ApiKeyHelperRow, LtxApiKeyInput, LtxApiKeyHelperRow } from './LtxApiKeyInput'
 import { useHfAuth } from '../hooks/use-hf-auth'
 import { useHfModelAccess } from '../hooks/use-hf-model-access'
+import { OpenRouterSection } from './settings/OpenRouterSection'
+import { PromptBuilderTab } from './settings/PromptBuilderTab'
 
 interface SettingsModalProps {
   isOpen: boolean
@@ -17,7 +19,7 @@ interface SettingsModalProps {
   initialTab?: TabId
 }
 
-type TabId = 'general' | 'models' | 'apiKeys' | 'account' | 'about'
+type TabId = 'general' | 'models' | 'apiKeys' | 'prompts' | 'account' | 'about'
 
 /** Focuses an API Keys tab input once the modal has switched to that tab.
  *  Shared by the LTX and FAL key inputs — each call gets its own ref/pending state. */
@@ -369,6 +371,7 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
     // generation is forced through the API, so hide it in that mode.
     ...(!forceApiGenerations ? [{ id: 'models' as TabId, label: 'Models', icon: HardDrive }] : []),
     { id: 'apiKeys' as TabId, label: 'API Keys', icon: KeyRound },
+    { id: 'prompts' as TabId, label: 'Prompts', icon: Sparkles },
     { id: 'account' as TabId, label: 'Account', icon: Wallet },
     { id: 'about' as TabId, label: 'About', icon: Info },
   ]
@@ -1187,7 +1190,13 @@ export function SettingsModal({ isOpen, onClose, initialTab }: SettingsModalProp
                   </div>
                 </div>
               </div>
+
+              <OpenRouterSection />
             </>
+          )}
+
+          {activeTab === 'prompts' && (
+              <PromptBuilderTab />
           )}
 
           {activeTab === 'account' && (
