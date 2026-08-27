@@ -2487,7 +2487,11 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
   // Only show assets that were generated (have generationParams), not imported files.
   // NOTE: project assets are stored NEWEST-FIRST (ProjectContext.addAsset prepends), so this
   // filtered view is newest-first too — assets[0] is the most recent result.
-  const assets = (activeProject?.assets || []).filter(a => a.generationParams)
+  // All project assets render in the library (generated + uploaded). Imported timeline-
+  // only files are embedded in clips, not project assets, so nothing needs hiding here.
+  // Generated-vs-uploaded only matters to the chat-dock watcher below, which keys off
+  // generationParams (never uploads) so an upload can't complete a running gen card.
+  const assets = activeProject?.assets || []
 
   // Resolve a still-running generation entry in the chat dock when a NEW asset
   // lands in the project (the submit flow adds the produced media via the
@@ -2501,7 +2505,7 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
       // which is the OLDEST generated asset (e.g. the project base image).
       const newest = assets[0]
       const runIdx = chat.messages.findIndex((m) => m.kind === 'generation' && m.status === 'running')
-      if (runIdx !== -1 && newest?.path) {
+      if (runIdx !== -1 && newest?.path && newest.generationParams) {
         // still = the precomputed frame thumbnail (falls back to the result path) so a
         // video result shows a real frame in history instead of a black <video> element.
         const stillPath = newest.smallThumbnailPath || newest.bigThumbnailPath || newest.path
