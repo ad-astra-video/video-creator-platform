@@ -1,8 +1,9 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicketSSE } from '../lib/direct-transport'
-import { getBlob, isWebPath, registerBlob } from '../lib/runtime/web-store'
+import { resolveRunner, postRunnerTaskWithTicketSSE, type RunnerProgressEvent } from '../lib/direct-transport'
+import { getBlob, getBlobUrl, isWebPath, registerBlob } from '../lib/runtime/web-store'
+import { probeVideoFrames } from '../lib/video-fps'
 import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY } from './use-generation'
 import {
   berniniRunnerV2VBody,
@@ -13,6 +14,7 @@ import {
   type BerniniEngine,
   type BerniniResolution,
   type BerniniOperation,
+  type BerniniDeliveryTarget,
 } from '../lib/bernini-delivery'
 
 // Edit-Video Bernini rail (use-restyle analog). The frontend decides the goal ->
@@ -64,6 +66,9 @@ export interface BerniniEditSubmitParams {
   duration?: number
   seed?: number
   negativePrompt?: string
+  // Live per-phase progress (message + progress + step/total_steps) forwarded to
+  // the caller so it can mirror the status into the chat-dock task card.
+  onProgress?: (ev: RunnerProgressEvent) => void
 }
 
 export interface BerniniEditResult {
@@ -140,11 +145,30 @@ export function useBerniniEdit() {
             return
           }
 
-          const target = {
+          const target: BerniniDeliveryTarget = {
             engine: params.engine,
             resolution: params.resolution ?? BERNINI_NATIVE_RESOLUTION,
             fps: params.fps ?? BERNINI_NATIVE_FPS,
             duration: Math.min(Math.max(params.duration ?? 3, 1), 5),
+          }
+
+          // v2v covers the ENTIRE source: probe the input video's total frame count and
+          // render that many frames (native, single shot for now — chunked processing is
+          // future work informed by the seam-overlap research). If the probe fails we
+          // fall back to the native 81-frame clip. r2v keeps the native clip (no source).
+          let editTarget = target
+          if (params.operation === 'v2v') {
+            const probe = await probeVideoFrames(
+              getBlobUrl(params.videoPath) ?? params.videoPath,
+            )
+            if (probe?.frameCount) {
+              editTarget = { ...target, numFrames: probe.frameCount }
+              logger.info(
+                `[bernini-edit] v2v source probe: ${probe.frameCount} frames @ ${probe.fps ?? '?'}fps (${probe.duration}s)`,
+              )
+            } else {
+              logger.warn('[bernini-edit] v2v frame probe failed; falling back to native clip')
+            }
           }
 
           const opts = {
@@ -166,9 +190,9 @@ export function useBerniniEdit() {
               setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
               return
             }
-            body = berniniRunnerR2VBody(params.prompt, refs, target, opts)
+            body = berniniRunnerR2VBody(params.prompt, refs, editTarget, opts)
           } else {
-            body = berniniRunnerV2VBody(params.prompt, videoB64, target, opts)
+            body = berniniRunnerV2VBody(params.prompt, videoB64, editTarget, opts)
           }
 
           logger.info(`[bernini-edit] rail=${spec.task} media=base64`)
@@ -178,10 +202,12 @@ export function useBerniniEdit() {
               const isBackbone = ev.stage === 'generating'
               const pct = typeof ev.progress === 'number' ? ev.progress : null
               const showPct = isBackbone && pct !== null
+              const display = showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg
               setState(prev => ({
                 ...prev,
-                editStatus: showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg,
+                editStatus: display,
               }))
+              params.onProgress?.({ ...ev, message: display })
             },
           })
 

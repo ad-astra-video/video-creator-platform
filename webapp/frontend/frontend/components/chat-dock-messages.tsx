@@ -97,22 +97,29 @@ function GenerationCard({ msg, onStopTrack }: { msg: GenerationMessage; onStopTr
       {/* Prompt */}
       <div className="px-2.5 py-2">
         <p className="text-[11px] text-zinc-200 leading-snug line-clamp-2">{msg.prompt}</p>
-        {msg.status === 'running' && msg.progress != null && (
+        {msg.status === 'running' && (msg.progress != null || msg.statusMessage) && (
           <div className="mt-1.5">
-            <div className="h-1 rounded-full bg-zinc-800 overflow-hidden">
-              <div
-                className="h-full bg-emerald-400 transition-all duration-300 ease-out"
-                style={{ width: `${Math.round(Math.min(Math.max(msg.progress, 0), 1) * 100)}%` }}
-              />
-            </div>
-            {(msg.step != null && msg.totalSteps != null) ? (
-              <p className="text-[9px] uppercase tracking-wide text-zinc-500 mt-1">
-                step {msg.step}/{msg.totalSteps}
-              </p>
-            ) : (
-              <p className="text-[9px] uppercase tracking-wide text-zinc-500 mt-1">
-                {Math.round(Math.min(Math.max(msg.progress, 0), 1) * 100)}%
-              </p>
+            {msg.statusMessage && (
+              <p className="text-[10px] text-zinc-400 leading-snug">{msg.statusMessage}</p>
+            )}
+            {msg.progress != null && (
+              <div className="mt-1">
+                <div className="h-1 rounded-full bg-zinc-800 overflow-hidden">
+                  <div
+                    className="h-full bg-emerald-400 transition-all duration-300 ease-out"
+                    style={{ width: `${Math.round(Math.min(Math.max(msg.progress, 0), 1) * 100)}%` }}
+                  />
+                </div>
+                {msg.step != null && msg.totalSteps != null ? (
+                  <p className="text-[9px] uppercase tracking-wide text-zinc-500 mt-1">
+                    step {msg.step}/{msg.totalSteps}
+                  </p>
+                ) : (
+                  <p className="text-[9px] uppercase tracking-wide text-zinc-500 mt-1">
+                    {Math.round(Math.min(Math.max(msg.progress, 0), 1) * 100)}%
+                  </p>
+                )}
+              </div>
             )}
           </div>
         )}

@@ -3497,8 +3497,19 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       await writeRecoveryContext({ prompt })
       // Surface a runner/transport failure on the chat-dock card that is waiting for a
       // response (created at the top of handleGenerate), instead of stranding it on
-      // 'running'. The inline error still shows in the Edit Video panel too.
-      const editErr = await editVideoPanelRef.current?.runEdit(prompt)
+      // 'running'. Because all status now lives on the task card (not the panel), every
+      // live progress event is mirrored in: phase message + progress bar + step/total.
+      const editErr = await editVideoPanelRef.current?.runEdit(prompt, {
+        onProgress: (ev) => {
+          if (!genId) return
+          const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string } = {}
+          if (typeof ev.progress === 'number') patch.progress = Math.min(Math.max(ev.progress, 0), 1)
+          if (typeof ev.step === 'number') patch.step = ev.step
+          if (typeof ev.total_steps === 'number') patch.totalSteps = ev.total_steps
+          if (ev.message) patch.statusMessage = ev.message
+          if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
+        },
+      })
       if (editErr && genId) chat.markGenerationError(genId, editErr)
       return
     }
@@ -3626,10 +3637,11 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           // request (e.g. Bernini per-denoise-step over SSE): a 0..1 value
           // plus the current step / total so the card can show a bar + "step X/Y".
           if (!genId) return
-          const patch: { progress?: number; step?: number; totalSteps?: number } = {}
+          const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string } = {}
           if (typeof ev.progress === 'number') patch.progress = Math.min(Math.max(ev.progress, 0), 1)
           if (typeof ev.step === 'number') patch.step = ev.step
           if (typeof ev.total_steps === 'number') patch.totalSteps = ev.total_steps
+          if (ev.message) patch.statusMessage = ev.message
           if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
         },
       )

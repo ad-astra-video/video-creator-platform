@@ -45,6 +45,8 @@ export interface GenerationMessage {
   /** Current denoising step / total, when the rail reports per-step progress. */
   step?: number
   totalSteps?: number
+  /** Human-readable phase status while running (e.g. 'Generating (Bernini)...'). */
+  statusMessage?: string
   createdAt: number
 }
 
@@ -87,7 +89,7 @@ export interface ChatDockState {
 
 export type ChatDockAction =
   | { type: 'add_generation'; prompt: string; mode: string; id?: string }
-  | { type: 'update_generation'; id: string; patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'deleted' | 'progress' | 'step' | 'totalSteps'>> }
+  | { type: 'update_generation'; id: string; patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'deleted' | 'progress' | 'step' | 'totalSteps' | 'statusMessage'>> }
   | { type: 'add_chat'; role: ChatMessage['role']; text: string }
   | {
       type: 'add_llm_trace'

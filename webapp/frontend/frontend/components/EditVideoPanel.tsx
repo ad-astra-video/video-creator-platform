@@ -2,9 +2,10 @@ import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHand
 import { VideoPreviewPanel } from './VideoPreviewPanel'
 import { PostProcessControls } from './PostProcessControls'
 import { useBerniniEdit } from '../hooks/use-bernini-edit'
+import type { RunnerProgressEvent } from '../lib/direct-transport'
 import { getBlobUrl, isWebPath, registerFile } from '../lib/runtime/web-store'
 import { measureVideoFps } from '../lib/video-fps'
-import { Loader2, Clapperboard, Wand2, Image as ImageIcon, Plus, Zap, Sparkles } from 'lucide-react'
+import { Clapperboard, Wand2, Image as ImageIcon, Plus, Zap, Sparkles } from 'lucide-react'
 import {
   BERNINI_NATIVE_FPS,
   BERNINI_NATIVE_RESOLUTION,
@@ -23,14 +24,19 @@ import {
 export type EditGoal = 'v2v' | 'r2v'
 
 export interface EditVideoPanelHandle {
-  runEdit: (prompt: string, opts?: { goal?: EditGoal; engine?: BerniniEngine }) => Promise<string | null>
+  runEdit: (prompt: string, opts?: {
+    goal?: EditGoal
+    engine?: BerniniEngine
+    // Forwarded to submitBerniniEdit so the chat-dock task card can mirror the
+    // live edit status (message + progress + step) instead of this panel showing it.
+    onProgress?: (ev: RunnerProgressEvent) => void
+  }) => Promise<string | null>
 }
 
 interface EditVideoPanelProps {
   initialVideoPath?: string | null
   resetKey?: number
   isProcessing?: boolean
-  processingStatus?: string
   fillHeight?: boolean
   // The 1.3B engine is the only one natively multi-reference (r2v); 14B rejects >1 ref.
   engine?: BerniniEngine
@@ -43,7 +49,6 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
     initialVideoPath,
     resetKey,
     isProcessing = false,
-    processingStatus = '',
     fillHeight = false,
     engine = '1.3b',
     onSourceChange,
@@ -51,7 +56,7 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
   },
   ref,
 ) {
-  const { submitBerniniEdit, isEditing, editStatus, editError, berniniEditResult } = useBerniniEdit()
+  const { submitBerniniEdit, isEditing, berniniEditResult } = useBerniniEdit()
   // Parent's onSourceChange may be an unstable inline callback (a fresh identity every
   // render). Holding it in a ref keeps handleSourceChange stable, so VideoPreviewPanel's
   // onSourceChange effect dep never churns and we avoid a setState-in-effect update loop.
@@ -103,7 +108,6 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
   }, [videoPath, initialVideoPath])
 
   const effectiveProcessing = isProcessing || isEditing
-  const effectiveStatus = processingStatus || editStatus
 
   useEffect(() => {
     if (berniniEditResult) onResult?.(berniniEditResult.videoPath)
@@ -158,6 +162,7 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
         fps,
         resolution,
         duration: 3,
+        onProgress: opts?.onProgress,
       })
     },
   }), [goal, eng, post, videoPath, initialVideoPath, referencePaths, sourceFps, submitBerniniEdit])
@@ -174,9 +179,6 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
           title="Edit Video"
           initialVideoPath={initialVideoPath ?? videoPath}
           resetKey={resetKey}
-          isProcessing={effectiveProcessing}
-          processingStatus={effectiveStatus}
-          processingDefault="Processing edit..."
           fillHeight={fillHeight}
           emptyTitle="Drop a video to edit"
           hint={{ title: 'Pick an edit goal, then describe the edit in the bar below' }}
@@ -277,12 +279,6 @@ export const EditVideoPanel = forwardRef<EditVideoPanelHandle, EditVideoPanelPro
       {/* Shared post-process rails */}
       <PostProcessControls value={post} onChange={setPost} disabled={effectiveProcessing} />
 
-      {isEditing && (
-        <div className="flex items-center gap-2 text-[11px] text-zinc-400">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" /> {editStatus || 'Editing...'}
-        </div>
-      )}
-      {editError && <p className="text-[11px] text-red-400">{editError}</p>}
     </div>
   )
 })
