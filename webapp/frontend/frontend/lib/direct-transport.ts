@@ -1064,6 +1064,8 @@ export async function postRunnerTaskWithTicketSSE(
           stage: typeof p.stage === 'string' ? p.stage : null,
           message: typeof p.message === 'string' ? p.message : null,
           progress: typeof p.progress === 'number' ? p.progress : null,
+          step: typeof p.step === 'number' ? p.step : null,
+          total_steps: typeof p.total_steps === 'number' ? p.total_steps : null,
         })
       } else if (event === 'complete') {
         settled = true
@@ -1324,6 +1326,10 @@ export interface RunnerProgressEvent {
   stage?: string | null
   message?: string | null
   progress?: number | null
+  /** Current denoising step the runner is on (per-step rails, e.g. Bernini). */
+  step?: number | null
+  /** Total denoising steps for the current job. */
+  total_steps?: number | null
 }
 
 

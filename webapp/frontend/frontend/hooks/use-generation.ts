@@ -11,14 +11,17 @@ import {
   postRunnerTaskWithTicketSSE,
   resolveRunner,
   type RunnerDto,
+  type RunnerProgressEvent,
 } from '../lib/direct-transport'
 import { createLocalGenerationError, type GenerationError } from '../lib/generation-errors'
 import { withGenerationActive } from '../lib/generation-active'
 import { useAppSettings } from '../contexts/AppSettingsContext'
 import {
   berniniRunnerT2VBody,
+  berniniRunnerR2VBody,
   berniniTaskFor,
   BERNINI_NATIVE_FPS,
+  BERNINI_NATIVE_FRAMES,
   type BerniniEngine,
   type BerniniResolution,
 } from '../lib/bernini-delivery'
@@ -86,7 +89,8 @@ interface GenerationState {
 
 
 interface UseGenerationReturn extends GenerationState {
-  generate: (prompt: string, imagePath: string | null, settings: GenerationSettings, audioPath?: string | null) => Promise<void>
+  generate: (prompt: string, imagePath: string | null, settings: GenerationSettings,
+              audioPath?: string | null, onProgress?: (ev: RunnerProgressEvent) => void) => Promise<void>
   generateImage: (prompt: string, settings: GenerationSettings, editSource?: string | null) => Promise<void>
   cancel: () => void
   reset: () => void
@@ -230,6 +234,7 @@ export function useGeneration(): UseGenerationReturn {
     imagePath: string | null,
     settings: GenerationSettings,
     audioPath?: string | null,
+    onProgress?: (ev: RunnerProgressEvent) => void,
   ) => {
     const statusMsg = settings.model === 'pro'
       ? 'Loading Pro model & generating...'
@@ -294,13 +299,17 @@ export function useGeneration(): UseGenerationReturn {
         // payment handshake + read the resulting media from the runner response.
         if (useDirectTransport) {
           // ── Bernini rail: when the user picks a Bernini engine, route to the
-          //    wan-worker /video-creator/v1/bernini-t2v rail. Native 480p@16 render;
-          //    above-native delivery is requested via the `post` payload the
+          //    wan-worker /video-creator/v1/bernini-{t2v,r2v} rail. Native 480p@16
+          //    render; above-native delivery is requested via the `post` payload the
           //    live-runner orchestrates on the vp-worker (/process). The runner (not
           //    the frontend) decides the upstream engine from `model`.
           if (isBerniniModel(settings.model)) {
             const engine: BerniniEngine = settings.model
-            const spec = berniniTaskFor('t2v')
+            // A start image attached => reference-image-to-video (r2v, multi-ref
+            // native to 1.3B) so the generation is actually conditioned on the image;
+            // otherwise plain text-to-video.
+            const isImageToVideo = !!imagePath
+            const spec = berniniTaskFor(isImageToVideo ? 'r2v' : 't2v')
             const runner = await resolveRunner([spec.capability], { model: engine })
             if (!runner) {
               throw new Error('No available Livepeer runner for Bernini video generation')
@@ -311,14 +320,30 @@ export function useGeneration(): UseGenerationReturn {
               fps: typeof body.fps === 'number' ? (body.fps as number) : BERNINI_NATIVE_FPS,
               duration: Math.min(Math.max(typeof body.duration === 'number' ? (body.duration as number) : 3, 1), 5),
             }
+            const negativePrompt = (settings as { negativePrompt?: string }).negativePrompt
+            // The start image MUST be sent as base64 bytes — a remote worker can't
+            // resolve a browser web:// or blob: path.
+            let berniniPayload: Record<string, unknown>
+            if (isImageToVideo) {
+              const image_b64 = await pathToBase64(imagePath)
+              if (!image_b64) {
+                throw new Error('Could not read the start image for Bernini image-to-video generation')
+              }
+              berniniPayload = berniniRunnerR2VBody(prompt, [image_b64], target, { negativePrompt })
+            } else {
+              berniniPayload = berniniRunnerT2VBody(prompt, target, { negativePrompt })
+            }
             const res = await postRunnerTaskWithTicketSSE(
               runner,
               spec.task,
               {
-                ...berniniRunnerT2VBody(prompt, target, {
-                  negativePrompt: (settings as { negativePrompt?: string }).negativePrompt,
-                }),
+                ...berniniPayload,
                 jobId: makeJobId(),
+                // Bernini's native output IS the 81-frame clip at 16fps (~5s). The model
+                // spec advertises fps=16 + a duration that represents those 81 frames;
+                // send the native frame count exactly so the delivered clip is the full
+                // render (duration*fps at 5s would give 80, not the intended 81).
+                num_frames: BERNINI_NATIVE_FRAMES,
               },
               {
                 signal: abortController.signal,
@@ -329,6 +354,7 @@ export function useGeneration(): UseGenerationReturn {
                     displayProgress = Math.min(Math.round(ev.progress * 95), 95)
                   }
                   setState(prev => ({ ...prev, progress: displayProgress, statusMessage: ev.message || 'Generating...' }))
+                  onProgress?.(ev)
                 },
               },
             )
@@ -387,6 +413,7 @@ export function useGeneration(): UseGenerationReturn {
                   progress: displayProgress,
                   statusMessage: ev.message || 'Generating...',
                 }))
+                onProgress?.(ev)
               },
             },
           )

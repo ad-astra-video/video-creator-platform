@@ -75,6 +75,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bernini_cli")
 
+
+def _progress_emitter():
+    """Return a (fraction, step, total) callback that writes one JSON progress
+    line per denoise step to stdout (the manager logs/skips these and relays
+    the terminal result line). Mirrors idv2v's per-step progress_cb."""
+    def _cb(fraction, step, total):
+        try:
+            sys.stdout.write(json.dumps({
+                "type": "progress",
+                "fraction": round(float(fraction), 4),
+                "step": int(step),
+                "total": int(total),
+            }) + "\n")
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001 - never let progress break a job
+            pass
+    return _cb
+
 # Standard Wan2.2 negative prompt (mirrors bernini.cli.DEFAULT_NEG_PROMPT).
 DEFAULT_NEG_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
@@ -187,26 +205,35 @@ def main() -> int:
         try:
             sys_prompt = resolve_system_prompt(task, ns)
             if isinstance(pipeline, BerniniPipeline):
-                pipeline(
-                    task_name,
-                    task["prompt"],
+                common = dict(
                     video=task["video"],
                     image=task["image"],
                     images=task["images"],
                     output_path=out,
                     system_prompt=sys_prompt,
-                    **generation_kwargs(ns),
-                )
+                    **generation_kwargs(ns))
+                try:
+                    # Per-step progress_cb is threaded in by the build-time
+                    # source patch; if the patch didn't apply upstream, fall
+                    # back to a call without it (never fail a generation just
+                    # because per-step progress is unavailable).
+                    pipeline(task_name, task["prompt"], **common,
+                             progress_cb=_progress_emitter())
+                except TypeError:
+                    pipeline(task_name, task["prompt"], **common)
             else:
-                pipeline(
-                    task["prompt"],
+                common = dict(
                     video=task["video"],
                     image=task["image"],
                     images=task["images"],
                     output_path=out,
                     system_prompt=sys_prompt,
-                    **generation_kwargs(ns),
-                )
+                    **generation_kwargs(ns))
+                try:
+                    pipeline(task["prompt"], **common,
+                             progress_cb=_progress_emitter())
+                except TypeError:
+                    pipeline(task["prompt"], **common)
             return {"ok": True, "output": out,
                     "frames": ns.num_frames, "task": task_name}
         except Exception as exc:  # noqa: BLE001 - report to the manager

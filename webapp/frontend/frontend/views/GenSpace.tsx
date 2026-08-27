@@ -788,6 +788,7 @@ function PromptBar({
   prompt,
   onPromptChange,
   onGenerate,
+  allowConcurrent,
   isGenerating,
   inputImage,
   onInputImageChange,
@@ -848,6 +849,7 @@ function PromptBar({
   onPromptChange: (prompt: string) => void
   onGenerate: () => void
   isGenerating: boolean
+  allowConcurrent?: boolean
   canGenerate: boolean
   buttonLabel: string
   buttonIcon: React.ReactNode
@@ -1732,9 +1734,9 @@ function PromptBar({
         {/* Generate button */}
         <button
           onClick={onGenerate}
-          disabled={isGenerating || !canGenerate || isEnhancingPrompt}
+          disabled={(isGenerating && !allowConcurrent) || !canGenerate || isEnhancingPrompt}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all flex-shrink-0 ${
-            isGenerating || !canGenerate || isEnhancingPrompt
+            (isGenerating && !allowConcurrent) || !canGenerate || isEnhancingPrompt
               ? 'bg-zinc-700 text-zinc-500 cursor-not-allowed'
               : 'bg-white text-black hover:bg-zinc-200'
           }`}
@@ -3614,7 +3616,23 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         inputImageUrl: imagePath ?? undefined,
         inputAudioUrl: audioPath ?? undefined,
       })
-      generate(prompt, imagePath, genSettings, audioPath)
+      generate(
+        prompt,
+        imagePath,
+        genSettings,
+        audioPath,
+        (ev) => {
+          // Push live generation progress into the chat-dock card for this
+          // request (e.g. Bernini per-denoise-step over SSE): a 0..1 value
+          // plus the current step / total so the card can show a bar + "step X/Y".
+          if (!genId) return
+          const patch: { progress?: number; step?: number; totalSteps?: number } = {}
+          if (typeof ev.progress === 'number') patch.progress = Math.min(Math.max(ev.progress, 0), 1)
+          if (typeof ev.step === 'number') patch.step = ev.step
+          if (typeof ev.total_steps === 'number') patch.totalSteps = ev.total_steps
+          if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
+        },
+      )
     }
   }
   
@@ -4376,6 +4394,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           onPromptChange={setPrompt}
           onGenerate={handleGenerate}
           isGenerating={promptGenerating}
+          allowConcurrent={appSettings.livepeerVideoEnabled !== false}
           canGenerate={canSubmit}
           buttonLabel={promptButtonLabel}
           buttonIcon={promptButtonIcon}

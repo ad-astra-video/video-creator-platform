@@ -39,6 +39,12 @@ export interface GenerationMessage {
   error?: string
   /** True once the produced result asset was deleted from the project. */
   deleted?: boolean
+  /** 0..1 overall progress while running (best-effort; only set when the rail
+   *  reports it — e.g. Bernini per-step denoise progress over SSE). */
+  progress?: number
+  /** Current denoising step / total, when the rail reports per-step progress. */
+  step?: number
+  totalSteps?: number
   createdAt: number
 }
 
@@ -81,7 +87,7 @@ export interface ChatDockState {
 
 export type ChatDockAction =
   | { type: 'add_generation'; prompt: string; mode: string; id?: string }
-  | { type: 'update_generation'; id: string; patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'deleted'>> }
+  | { type: 'update_generation'; id: string; patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'deleted' | 'progress' | 'step' | 'totalSteps'>> }
   | { type: 'add_chat'; role: ChatMessage['role']; text: string }
   | {
       type: 'add_llm_trace'

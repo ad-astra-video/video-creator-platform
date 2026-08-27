@@ -245,7 +245,7 @@ class BerniniManager:
 
     # -- generation ----------------------------------------------------------
     async def generate(self, job: dict[str, Any], timeout: float = JOB_TIMEOUT,
-                       ) -> dict[str, Any]:
+                       progress_cb: Optional[Any] = None) -> dict[str, Any]:
         """Run one Bernini task through the resident subprocess.
 
         For ``v2v`` jobs whose source video exceeds the native window
@@ -264,8 +264,9 @@ class BerniniManager:
                 self._stage("gen: chunked v2v total=%d native=%d src_fps=%s" %
                             (total, NATIVE_FRAMES, src_fps))
                 return await self._generate_chunked(job, total, timeout,
-                                                    src_fps=src_fps)
-            result = await self._run_one(job, timeout)
+                                                    src_fps=src_fps,
+                                                    progress_cb=progress_cb)
+            result = await self._run_one(job, timeout, progress_cb)
             if src_fps and job.get("task_name") == "v2v" and result.get("ok"):
                 out = result.get("output") or job.get("output")
                 if out and os.path.exists(out):
@@ -276,7 +277,7 @@ class BerniniManager:
 
     # -- single-shot resident CLI call ---------------------------------------
     async def _run_one(self, job: dict[str, Any], timeout: float = JOB_TIMEOUT,
-                       ) -> dict[str, Any]:
+                       progress_cb: Optional[Any] = None) -> dict[str, Any]:
         """Write one job to the resident CLI and read its JSONL result.
 
         Bounded by ``timeout``; evicts the worker (lock-free) on error/timeout
@@ -288,13 +289,13 @@ class BerniniManager:
         line = json.dumps(job, ensure_ascii=False) + "\n"
 
         async def _read_result() -> bytes:
-            # stdout is the JSONL result channel, but native CUDA extensions
-            # (VeOmni's kernel loader) print WARNING banners straight to
-            # fd 1 (bypassing Python logging-to-stderr). Skip any non-JSON
-            # line and keep reading until a real JSON result arrives (or the
-            # stream closes / we cap iterations so a pure-noise flood can't
-            # loop forever).
-            for _ in range(200):
+            # stdout is the JSONL result channel. Skip non-JSON noise (CUDA
+            # banners), AND interim {"type":"progress",...} JSON lines (the
+            # CLI's per-denoise-step progress) — those are forwarded through
+            # progress_cb and dropped, so we keep reading until the terminal
+            # result line arrives. Cap iterations so a pure-noise flood can't
+            # loop forever.
+            for _ in range(5000):
                 raw = await self._proc.stdout.readline()
                 if not raw:
                     return raw  # b"" EOF -> handled by caller
@@ -302,14 +303,21 @@ class BerniniManager:
                 if not text:
                     continue
                 try:
-                    json.loads(text)
+                    obj = json.loads(text)
                 except json.JSONDecodeError:
                     self._stage("gen: skip non-json stdout line (%d B) %r" %
                                 (len(raw), raw[:120]))
                     continue
+                if isinstance(obj, dict) and obj.get("type") == "progress":
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(obj)
+                        except Exception:  # noqa: BLE001 - never break the job
+                            pass
+                    continue
                 return raw
             raise BerniniError(
-                "Bernini stdout produced no JSON result after 200 lines")
+                "Bernini stdout produced no JSON result after 5000 lines")
 
         try:
             self._stage("gen: writing stdin")
@@ -395,7 +403,8 @@ class BerniniManager:
 
     async def _generate_chunked(self, job: dict[str, Any], total: int,
                                 timeout: float,
-                                src_fps: Optional[float] = None) -> dict[str, Any]:
+                                src_fps: Optional[float] = None,
+                                progress_cb: Optional[Any] = None) -> dict[str, Any]:
         """Split the source into NATIVE_FRAMES chunks, render each, concat.
 
         Each chunk renders its own source window [k*81, (k+1)*81) natively at
@@ -423,6 +432,12 @@ class BerniniManager:
                 out_k = os.path.join(base, f"out_chunk_{k:03d}.mp4")
                 self._stage("gen: chunk %d/%d frames [%d,%d) len=%d" %
                             (k + 1, n_chunks, start, end, length))
+                if progress_cb is not None:
+                    try:
+                        progress_cb({"chunk": k + 1, "chunks": n_chunks,
+                                     "frames_done": min((k + 1) * frames_per, total)})
+                    except Exception:  # noqa: BLE001 - never break the job
+                        pass
                 # extract the exact source window at native cadence
                 await asyncio.to_thread(_run_ffmpeg, [
                     "ffmpeg", "-y", "-i", src,
@@ -436,7 +451,7 @@ class BerniniManager:
                 sub_job["video"] = [src_k]
                 sub_job["num_frames"] = length
                 sub_job["output"] = out_k
-                await self._run_one(sub_job, timeout)
+                await self._run_one(sub_job, timeout, progress_cb)
             # concatenate the per-chunk outputs into the final file
             with open(listfile, "w") as f:
                 for o in chunk_outs:

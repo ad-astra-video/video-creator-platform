@@ -26,7 +26,9 @@ from livepeer_gateway.live_runner import (
 )
 
 from . import config
-from .routing import CAPABILITIES, MODELS, ROUTES, candidate_workers, proxy, proxy_worker_sse
+from .routing import (CAPABILITIES, MODELS, ROUTES, BERNINI_ENDPOINTS,
+                       candidate_workers, model_for_endpoint, proxy,
+                       proxy_worker_sse)
 from . import postchain
 from .scheduler import GPUScheduler, QueueTimeout
 from .specs import build_model_specs
@@ -326,6 +328,91 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
     finally:
         await _scheduler.release("idv2v-worker", idv2v_gpu)
 
+async def _bernini_post(session, wan_base: str, endpoint: str, rbody: dict, token: str):
+    """POST one Bernini job to the wan-worker. Returns parsed JSON or {"_error"}."""
+    from . import config as cfg
+    base = cfg.WORKERS["wan-worker"]
+    url = f"{base}/video-creator/v1/{endpoint}"
+    try:
+        async with session.post(url, json=rbody,
+                                headers={"X-Worker-Token": token},
+                                timeout=aiohttp.ClientTimeout(total=3600.0)) as r:
+            if r.status >= 400:
+                return {"_error": (await r.read())[:500].decode("utf-8", "replace")}
+            return await r.json()
+    except Exception as exc:  # noqa: BLE001
+        return {"_error": f"{type(exc).__name__}: {exc}"}
+
+
+async def _worker_progress(session, wan_base: str, job_id: str, token: str) -> dict:
+    """Poll the wan-worker's /progress/{job_id}; {} on any failure."""
+    try:
+        async with session.get(
+            f"{wan_base}/video-creator/v1/progress/{job_id}",
+            headers={"X-Worker-Token": token},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as r:
+            if r.status == 200:
+                return await r.json()
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+async def _bernini_chain(wm, session, token, endpoint: str, body: dict,
+                         progress_cb=None) -> dict:
+    """Run one Bernini task on the wan-worker, streaming per-step progress.
+
+    Mirrors _restyle_chain: the POST runs as a background task while we poll the
+    worker's /progress/{job_id} every ~1s and forward the REAL per-step denoise
+    progress (progress 0..1 + step/total_steps) through ``progress_cb``. Returns
+    the worker's JSON payload (media base64 + metadata) on success.
+    """
+    worker = "wan-worker"
+    wan_base = config.WORKERS["wan-worker"]
+    gpu = await _scheduler.acquire(worker)
+    try:
+        await wm.ensure(worker, device=_device_for(worker, gpu),
+                        model=model_for_endpoint(endpoint, body))
+        job_id = str(body.get("job_id") or uuid.uuid4().hex[:12])
+        rbody = {**body, "job_id": job_id}
+        task = asyncio.create_task(
+            _bernini_post(session, wan_base, endpoint, rbody, token))
+        last_step = -1
+        while not task.done():
+            try:
+                info = await _worker_progress(session, wan_base, job_id, token)
+                step = info.get("step")
+                total = info.get("total")
+                if isinstance(step, int) and step != last_step:
+                    last_step = step
+                    prog = info.get("progress")
+                    msg = f"Step {step}/{total}" if isinstance(total, int) and total else "Generating..."
+                    if progress_cb is not None:
+                        try:
+                            await progress_cb({
+                                "stage": "generating",
+                                "message": msg,
+                                "progress": prog if isinstance(prog, (int, float)) else None,
+                                "step": step,
+                                "total_steps": total if isinstance(total, int) else None,
+                            })
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        data = task.result()
+        if data.get("_error"):
+            raise RuntimeError(data["_error"])
+        return data
+    finally:
+        await _scheduler.release(worker, gpu)
+
+
 async def handle_ws(req: web.Request) -> web.Response:
     """WebSocket endpoint (orchestrator-proxied) for long-running generation jobs.
 
@@ -568,6 +655,50 @@ async def _ws_proxy(ws, wm, session, token, request_id, job_id, task_type, body,
                             "job_id": job_id, "payload": data})
 
 
+def _dump_tasks(tag: str) -> None:
+    """Log every running asyncio task's stack under ``tag`` (best-effort).
+
+    faulthandler's SIGALRM dump is useless here: an asyncio deadlock parks the
+    loop in the selector, so the main-thread stack only shows the poll(). The
+    suspended coroutine frames are reachable via Task.get_stack(), which this
+    dumps so a stuck SSE delivery is diagnosable from `docker logs` alone.
+    """
+    import traceback as _tb
+    task_list = []
+    try:
+        task_list = asyncio.all_tasks()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[%s] asyncio.all_tasks() unavailable: %r", tag, exc)
+        return
+    logger.warning("[%s] dumping %d live task stack(s)", tag, len(task_list))
+    for i, t in enumerate(task_list):
+        try:
+            frames = t.get_stack(limit=60)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] task %d stack unavailable: %r", tag, i, exc)
+            continue
+        if frames:
+            text = "".join(_tb.format_stack(frames))
+        else:
+            text = "<no frame> (done=%s cancelled=%s)" % (t.done(), t.cancelled())
+        logger.warning("[%s] --- task %d name=%s done=%s cancelled=%s ---\n%s",
+                       tag, i, t.get_name() if hasattr(t, "get_name") else "?",
+                       t.done(), t.cancelled(), text)
+
+
+async def _dump_after_delay(seconds: float, tag: str) -> None:
+    """Watchdog task: after ``seconds`` dump all live task stacks under ``tag``.
+
+    Caller MUST cancel this when the work it guards completes, so a normal
+    successful delivery never triggers a dump.
+    """
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        return
+    _dump_tasks(tag)
+
+
 async def handle_generic(req: web.Request) -> web.Response:
     """Proxy a /video-creator/v1/{endpoint} request to its worker.
 
@@ -677,6 +808,17 @@ async def handle_generic(req: web.Request) -> web.Response:
                 await _scheduler.release(worker, gpu)
             await resp.write_eof()
             return resp
+        elif endpoint in BERNINI_ENDPOINTS:
+            async def _prog(ev): await _ev("progress", ev)
+            try:
+                data = await _bernini_chain(wm, session, token, endpoint, body,
+                                            progress_cb=_prog)
+                await _ev("complete", data)
+            except Exception as exc:
+                logger.exception("bernini sse %s failed", endpoint)
+                await _ev("error", {"error": str(exc)})
+            await resp.write_eof()
+            return resp
         else:
             await _ev("progress", {"stage": "generating", "message": "Generating...", "progress": None})
             try:
@@ -696,16 +838,28 @@ async def handle_generic(req: web.Request) -> web.Response:
         stop_beat.set()
         beat.cancel()
 
-    if out.status >= 400:
-        await _ev("error", {"error": out.text or f"worker error {out.status}"})
-    else:
-        try:
-            data = json.loads(out.body.decode("utf-8"))
-        except Exception:
-            await _ev("error", {"error": "worker returned a non-JSON response"})
+    # [SSE-instrument] The worker's full response arrived. If relaying the
+    # terminal `complete` SSE event to the browser deadlocks (await never
+    # resolves while both loops stay alive and sockets go idle), dump live
+    # task stacks after a short delay to expose the exact stuck frame. It is
+    # cancelled on successful delivery so it never fires for a healthy job.
+    logger.info("SSE_WORKER_RESP_RECEIVED status=%s body_len=%s",
+                out.status, len(out.body) if out.body is not None else -1)
+    _stall_watch = asyncio.create_task(_dump_after_delay(
+        90, f"SSE_DELIVERY_STALL:{endpoint}"))
+    try:
+        if out.status >= 400:
+            await _ev("error", {"error": out.text or f"worker error {out.status}"})
         else:
-            await _ev("complete", data)
-    await resp.write_eof()
+            try:
+                data = json.loads(out.body.decode("utf-8"))
+            except Exception:
+                await _ev("error", {"error": "worker returned a non-JSON response"})
+            else:
+                await _ev("complete", data)
+        await resp.write_eof()
+    finally:
+        _stall_watch.cancel()
     return resp
 
 

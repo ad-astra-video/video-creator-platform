@@ -98,6 +98,7 @@ COPY runner/ ./runner/
 # Ship the pure-python `flash_attn` shim into the Bernini venv so
 # modeling_qwen2_5_vl.py's import guard is satisfied (SDPA-backed).
 COPY runner/idv2v/attn_shim/flash_attn/ /opt/bernini/venv/lib/python3.12/site-packages/flash_attn/
+RUN /opt/bernini/venv/bin/python /app/runner/idv2v/bernini_progress_patch.py
 RUN mkdir -p /models && chown runneruser:runneruser /models
 USER runneruser
 

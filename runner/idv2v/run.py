@@ -228,14 +228,20 @@ PROGRESS_LOCK = threading.Lock()
 _PROGRESS: dict = {}
 
 
-def set_progress(job_id, progress, stage="generating", message=""):
+def set_progress(job_id, progress, stage="generating", message="",
+                  step=None, total=None):
     if not job_id:
         return
+    rec = {
+        "progress": round(max(0.0, min(1.0, float(progress))), 4),
+        "stage": stage, "message": message, "done": False,
+    }
+    if step is not None:
+        rec["step"] = int(step)
+    if total is not None:
+        rec["total"] = int(total)
     with PROGRESS_LOCK:
-        _PROGRESS[job_id] = {
-            "progress": round(max(0.0, min(1.0, float(progress))), 4),
-            "stage": stage, "message": message, "done": False,
-        }
+        _PROGRESS[job_id] = rec
 
 
 def get_progress(job_id):

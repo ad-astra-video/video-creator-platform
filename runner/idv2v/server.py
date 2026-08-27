@@ -638,9 +638,30 @@ async def handle_bernini(request: web.Request) -> web.Response:
             _nf = config.BERNINI_NATIVE_FPS * 5
         _extra_chunks = max(0, math.ceil(_nf / bernini_mod.NATIVE_FRAMES) - 1)
         _gen_timeout = 900 + _extra_chunks * 420
+
+        # Per-step Bernini progress (mirrors the idv2v rail): the CLI emits one
+        # {"type":"progress"} line per denoise step (plus per-chunk frames for
+        # long v2v); we fold those into run_mod.set_progress so the live-runner
+        # /progress/{job_id} poll and the SSE rail see real 0..1 progress +
+        # step/total while "generating".
+        def _prog(info):
+            if not isinstance(info, dict):
+                return
+            if isinstance(info.get("step"), int) and                     isinstance(info.get("total"), int) and info.get("total"):
+                frac = 0.05 + 0.90 * (min(info["step"], info["total"]) / info["total"])
+                run_mod.set_progress(
+                    job_id, round(min(max(frac, 0.05), 0.95), 4), "bernini",
+                    f"step {info['step']}/{info['total']}",
+                    step=info["step"], total=info["total"])
+            elif isinstance(info.get("chunk"), int) and                     isinstance(info.get("chunks"), int):
+                run_mod.set_progress(
+                    job_id, 0.05, "bernini",
+                    f"chunk {info['chunk']}/{info['chunks']} "
+                    f"(frames {info.get('frames_done', '?')})")
+
         try:
             result = await asyncio.wait_for(
-                manager.generate(job), timeout=_gen_timeout)
+                manager.generate(job, progress_cb=_prog), timeout=_gen_timeout)
         except bernini_mod.BerniniError as exc:
             run_mod.set_progress(job_id, -1, "failed", str(exc))
             return web.json_response({"error": str(exc), "job_id": job_id},
