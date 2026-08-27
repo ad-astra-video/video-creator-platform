@@ -60,6 +60,27 @@ def _insert_after_each(src: str, anchor: str, text: str, what: str) -> tuple:
     return src.replace(anchor, anchor + "\n" + text), True
 
 
+def _insert_sig_param(src: str, anchor: str, text: str, what: str) -> tuple:
+    """Insert ``text`` as a NEW PARAM LINE just BEFORE the closing ``):`` of a
+    signature. ``anchor`` must be the unique '<lastparam>,\n    ):' (the end of
+    the signature INCLUDING the closing paren). The param lands between the last
+    param and ``):`` -- i.e. IN the signature, NOT in the function body.
+
+    (Using _insert_after with an anchor ending in ``):`` would drop the param
+    into the body as a harmless no-op and leave the signature unchanged --
+    exactly the bug that broke BerniniRendererModel.sample with an unexpected
+    keyword 'progress_cb'.)
+    """
+    want = anchor.replace(",\n    ):", ",\n" + text + "\n    ):")
+    if want in src:
+        return src, True  # already applied at this anchor
+    n = src.count(anchor)
+    if n != 1:
+        _log(f"WARN sig anchor for {what} not found/ambiguous (count={n}); skipping")
+        return src, False
+    return src.replace(anchor, want, 1), True
+
+
 def _patch_wan_diffusion() -> bool:
     try:
         src = open(WAN_DIFFUSION, encoding="utf-8").read()
@@ -75,11 +96,22 @@ def _patch_wan_diffusion() -> bool:
     if not ok:
         return False
 
-    # 14B sampler signature (sample_bernini_wvitcfg()).
-    src, ok = _insert_after(
-        src, "        **kwargs,\n    ):",
-        "        progress_cb=None,",
-        "sample_bernini_wvitcfg() signature")
+    # 14B sampler signature (sample_bernini_wvitcfg()). Its last param is the
+    # var-keyword **kwargs, and Python forbids a named param AFTER **kwargs
+    # (SyntaxError: arguments cannot follow var-keyword argument). So put
+    # progress_cb BEFORE the **kwargs line.
+    if "        progress_cb=None,\n        **kwargs," in src:
+        ok = True
+    else:
+        n = src.count("        **kwargs,\n    ):")
+        if n != 1:
+            _log(f"WARN sample_bernini_wvitcfg() sig anchor not found/ambiguous (count={n}); skipping")
+            ok = False
+        else:
+            src = src.replace(
+                "        **kwargs,\n    ):",
+                "        progress_cb=None,\n        **kwargs,\n    ):", 1)
+            ok = True
     if not ok:
         return False
 
@@ -125,7 +157,7 @@ def _patch_pipeline() -> bool:
 
         # 14B BerniniPipeline.__call__ -> sample_bernini_wvitcfg().
         sig2 = "        max_sequence_length: int = 512,\n    ):"
-        src, ok = _insert_after(
+        src, ok = _insert_sig_param(
             src, sig2, "        progress_cb=None,",
             "BerniniPipeline.__call__ signature")
         if not ok:
@@ -159,8 +191,9 @@ def _patch_renderer() -> bool:
         _log(f"SKIP (cannot read {RENDERER}: {exc})")
         return False
 
-    # Signature: add progress_cb after momentum.
-    src, ok = _insert_after(
+    # Signature: add progress_cb as the final param (BEFORE the closing '):',
+    # so it lands in the parameter list, not the function body).
+    src, ok = _insert_sig_param(
         src, "        momentum: float = -0.5,\n    ):",
         "        progress_cb=None,",
         "BerniniRendererModel.sample() signature")
