@@ -23,6 +23,7 @@ import sys
 
 WAN_DIFFUSION = "/opt/bernini/src/bernini/models/wan_diffusion.py"
 PIPELINE = "/opt/bernini/src/bernini/pipeline.py"
+RENDERER = "/opt/bernini/src/bernini/models/renderer.py"
 
 _HOOK = (
     "            if progress_cb is not None:\n"
@@ -142,9 +143,49 @@ def _patch_pipeline() -> bool:
     return True
 
 
+def _patch_renderer() -> bool:
+    """1.3B path: BerniniRendererModel.sample() forwards to self.diff_dec.sample().
+
+    BerniniRendererPipeline.__call__ forwards progress_cb into
+    BerniniRendererModel.sample() (models/renderer.py). That method has no
+    progress_cb param and tail-forwards to self.diff_dec.sample(), which is the
+    wan_diffusion.py::sample patched above. So add progress_cb here and forward
+    it into diff_dec.sample() to complete the chain (otherwise the renderer
+    path crashes with ``TypeError: unexpected keyword argument 'progress_cb'``).
+    """
+    try:
+        src = open(RENDERER, encoding="utf-8").read()
+    except OSError as exc:
+        _log(f"SKIP (cannot read {RENDERER}: {exc})")
+        return False
+
+    # Signature: add progress_cb after momentum.
+    src, ok = _insert_after(
+        src, "        momentum: float = -0.5,\n    ):",
+        "        progress_cb=None,",
+        "BerniniRendererModel.sample() signature")
+    if not ok:
+        return False
+
+    # Forward progress_cb into diff_dec.sample().
+    fwd = "            momentum=momentum,\n        )"
+    if "            momentum=momentum,\n            progress_cb=progress_cb,\n        )" not in src:
+        if src.count(fwd) != 1:
+            _log("WARN diff_dec.sample() forward anchor not found/ambiguous; skipping")
+            return False
+        src = src.replace(fwd,
+                          "            momentum=momentum,\n            progress_cb=progress_cb,\n        )",
+                          1)
+
+    open(RENDERER, "w", encoding="utf-8").write(src)
+    _log(f"OK ({RENDERER})")
+    return True
+
+
 def main() -> int:
     _patch_wan_diffusion()
     _patch_pipeline()
+    _patch_renderer()
     return 0
 
 
