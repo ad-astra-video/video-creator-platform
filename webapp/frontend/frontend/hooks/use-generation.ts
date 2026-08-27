@@ -78,6 +78,7 @@ export interface GenerationRecoveryContext {
 }
 
 interface GenerationState {
+  bindId: string | null
   isGenerating: boolean
   progress: number
   statusMessage: string
@@ -90,8 +91,9 @@ interface GenerationState {
 
 interface UseGenerationReturn extends GenerationState {
   generate: (prompt: string, imagePath: string | null, settings: GenerationSettings,
-              audioPath?: string | null, onProgress?: (ev: RunnerProgressEvent) => void) => Promise<void>
-  generateImage: (prompt: string, settings: GenerationSettings, editSource?: string | null) => Promise<void>
+              audioPath?: string | null, onProgress?: (ev: RunnerProgressEvent) => void,
+              bindId?: string | null) => Promise<void>
+  generateImage: (prompt: string, settings: GenerationSettings, editSource?: string | null, bindId?: string | null) => Promise<void>
   cancel: () => void
   reset: () => void
   resumeIfRunning: () => Promise<'running' | 'complete' | 'none'>
@@ -145,6 +147,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 export function useGeneration(): UseGenerationReturn {
   const { settings: appSettings, shouldImageGenerateWithFalApi, refreshSettings } = useAppSettings()
   const [state, setState] = useState<GenerationState>({
+    bindId: null,
     isGenerating: false,
     progress: 0,
     statusMessage: '',
@@ -235,12 +238,14 @@ export function useGeneration(): UseGenerationReturn {
     settings: GenerationSettings,
     audioPath?: string | null,
     onProgress?: (ev: RunnerProgressEvent) => void,
+    bindId?: string | null,
   ) => {
     const statusMsg = settings.model === 'pro'
       ? 'Loading Pro model & generating...'
       : 'Generating video...'
 
     setState({
+      bindId: bindId ?? null,
       isGenerating: true,
       progress: 0,
       statusMessage: statusMsg,
@@ -364,6 +369,7 @@ export function useGeneration(): UseGenerationReturn {
             }
             const objectUrl = URL.createObjectURL(res.mediaBlob)
             setState({
+              bindId: bindId ?? null,
               isGenerating: false,
               progress: 100,
               statusMessage: 'Complete!',
@@ -423,6 +429,7 @@ export function useGeneration(): UseGenerationReturn {
           }
           const objectUrl = URL.createObjectURL(res.mediaBlob)
           setState({
+            bindId: bindId ?? null,
             isGenerating: false,
             progress: 100,
             statusMessage: 'Complete!',
@@ -487,6 +494,7 @@ export function useGeneration(): UseGenerationReturn {
     prompt: string,
     settings: GenerationSettings,
     editSource?: string | null,
+    bindId?: string | null,
   ) => {
     const isEditing = !!editSource
 
@@ -504,6 +512,7 @@ export function useGeneration(): UseGenerationReturn {
     const numImages = settings.variations || 1
 
     setState({
+      bindId: bindId ?? null,
       isGenerating: true,
       progress: 0,
       statusMessage: isEditing
@@ -598,6 +607,7 @@ export function useGeneration(): UseGenerationReturn {
             latestImageSeedRef.current = typeof imgRes.seed === 'number' ? imgRes.seed : imageSeed
             const objectUrl = URL.createObjectURL(imgRes.blob)
             setState({
+              bindId: bindId ?? null,
               isGenerating: false,
               progress: 100,
               statusMessage: 'Complete!',
@@ -650,6 +660,7 @@ export function useGeneration(): UseGenerationReturn {
           }
           const objectUrl = URL.createObjectURL(blob)
           setState({
+            bindId: bindId ?? null,
             isGenerating: false,
             progress: 100,
             statusMessage: 'Complete!',
@@ -689,6 +700,7 @@ export function useGeneration(): UseGenerationReturn {
     clearRecoveryPolling()
     localStorage.removeItem(GENERATION_RECOVERY_KEY)
     setState({
+      bindId: null,
       isGenerating: false,
       progress: 0,
       statusMessage: '',

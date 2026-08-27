@@ -1934,6 +1934,7 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
     videoPath,
     imagePaths,
     error,
+    bindId,
     reset,
     resumeIfRunning,
   } = useGeneration()
@@ -2493,27 +2494,12 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
   // generationParams (never uploads) so an upload can't complete a running gen card.
   const assets = activeProject?.assets || []
 
-  // Resolve a still-running generation entry in the chat dock when a NEW asset
-  // lands in the project (the submit flow adds the produced media via the
-  // project store). Marking the oldest still-running card with the newest asset
-  // is a sound heuristic for the sequential, one-generation-at-a-time UI.
-  const prevAssetCount = useRef(0)
-  useEffect(() => {
-    const n = assets.length
-    if (n > prevAssetCount.current && n > 0) {
-      // assets[0] is the just-added result (prepend order) — NOT assets[n-1],
-      // which is the OLDEST generated asset (e.g. the project base image).
-      const newest = assets[0]
-      const runIdx = chat.messages.findIndex((m) => m.kind === 'generation' && m.status === 'running')
-      if (runIdx !== -1 && newest?.path && newest.generationParams) {
-        // still = the precomputed frame thumbnail (falls back to the result path) so a
-        // video result shows a real frame in history instead of a black <video> element.
-        const stillPath = newest.smallThumbnailPath || newest.bigThumbnailPath || newest.path
-        chat.markGenerationDone(chat.messages[runIdx].id, newest.path, stillPath)
-      }
-    }
-    prevAssetCount.current = n
-  }, [assets, chat])
+  // Complete running generation cards in the chat dock when generated assets land
+  // in the project (the submit flow adds the produced media via the project store).
+  // Resilient to MULTIPLE generations in flight: we watch the count of *generated*
+  // assets (uploads are excluded via the generationParams guard, so an upload never
+  // shifts the pairing), detect every newly-landed result — even several at once —
+  // and pair them FIFO to the still-running cards in creation order.
   const [lastPrompt, setLastPrompt] = useState('')
 
   // On mount: recover any generation that was still running when the frontend reloaded.
@@ -2657,13 +2643,17 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
           }],
           activeTakeIndex: 0,
         })
+        if (typeof bindId === 'string') {
+          const still = copied.smallThumbnailPath || copied.bigThumbnailPath || copied.path
+          chat.markGenerationDone(bindId, copied.path, still)
+        }
         reset()
       } catch (err) {
         persistedVideoKeyRef.current = null
         logger.error(`Failed to persist generated video asset: ${err}`)
       }
     })()
-  }, [videoPath, currentProjectId, isGenerating, sanitizeVideoSettings, settings, inputImage, inputAudio, lastPrompt, addAsset, reset, selectedLoras, isLocalMode, appSettings.modelsDir])
+  }, [videoPath, currentProjectId, isGenerating, sanitizeVideoSettings, settings, inputImage, inputAudio, lastPrompt, addAsset, reset, selectedLoras, isLocalMode, appSettings.modelsDir, bindId, chat])
 
   // When retake completes, add as take or new asset
   useEffect(() => {
@@ -3012,6 +3002,7 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
 
     ;(async () => {
       try {
+        let firstDone: { path: string; still: string } | null = null
         for (const imgPath of imagePaths) {
           if (importedImagePathsRef.current.has(imgPath)) continue
 
@@ -3023,6 +3014,12 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
             continue
           }
           importedImagePathsRef.current.add(imgPath)
+          if (!firstDone) {
+            firstDone = {
+              path: copied.path,
+              still: copied.smallThumbnailPath || copied.bigThumbnailPath || copied.path,
+            }
+          }
           addAsset(currentProjectId, {
             type: 'image',
             path: copied.path,
@@ -3057,6 +3054,9 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
             activeTakeIndex: 0,
           })
         }
+        if (typeof bindId === 'string' && firstDone) {
+          chat.markGenerationDone(bindId, firstDone.path, firstDone.still)
+        }
         reset()
       } catch (err) {
         logger.error(`Failed to persist generated image asset(s): ${err}`)
@@ -3064,7 +3064,7 @@ export const GenSpace = forwardRef<GenSpaceHandle>(function GenSpace(_props, ref
         addingImagesRef.current = false
       }
     })()
-  }, [imagePaths, currentProjectId, isGenerating, addAsset, lastPrompt, settings, reset])
+  }, [imagePaths, currentProjectId, isGenerating, addAsset, lastPrompt, settings, reset, bindId, chat])
   
   // Single writer for the recovery marker so the per-mode branches below can't drift. Captures
   // whatever generation id is active RIGHT NOW, before this generation starts, as baselineId —
@@ -3429,8 +3429,9 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   }, [currentProjectId, addAsset])
 
   const handleGenerate = async () => {
-    // Record a running generation in the chat dock; the assets-completion
-    // watcher flips it to done (with the produced media) once it lands.
+    // Record a running generation in the chat dock; the video/image completion
+    // effects flip it to done (with the produced media) once the result lands,
+    // keyed on the card's job id (bindId) — never an asset-watcher guess.
     const submittedPrompt = prompt.trim()
     // The image-tab restyle step (stylize the first frame) is an image-edit operation
     // whose progress lives on the edit panel — it has no runnable restyle job of its
@@ -3668,7 +3669,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         imageEditQuality: settings.imageEditQuality ?? 'balanced',
       }
       await writeRecoveryContext({ prompt, settings: imageSettings, genType: 'image', inputImageUrl: editSource ?? undefined })
-      generateImage(prompt, imageSettings, editSource)
+      generateImage(prompt, imageSettings, editSource, genId)
     } else {
       // Generate video (t2v if no image/audio, i2v if image, a2v if audio)
       const imagePath = inputImage || null
@@ -3713,6 +3714,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           if (ev.message) patch.statusMessage = ev.message
           if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
         },
+        genId,
       )
     }
   }
