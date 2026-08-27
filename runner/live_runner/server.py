@@ -328,11 +328,16 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
     finally:
         await _scheduler.release("idv2v-worker", idv2v_gpu)
 
-async def _bernini_post(session, wan_base: str, endpoint: str, rbody: dict, token: str):
-    """POST one Bernini job to the wan-worker. Returns parsed JSON or {"_error"}."""
-    from . import config as cfg
-    base = cfg.WORKERS["wan-worker"]
-    url = f"{base}/video-creator/v1/{endpoint}"
+async def _bernini_post(session, wan_base: str, endpoint: str, rbody: dict, token: str,
+                         job_id: str):
+    """POST one Bernini job to the wan-worker. Returns parsed JSON or {"_error"}.
+
+    The wan-worker's ``handle_bernini`` keys its progress store by
+    ``request.query.get("job_id")`` (NOT the body — unlike the idv2v worker which
+    reads it from the body). So ``job_id`` MUST be passed as a query param, or the
+    worker generates its own uuid and our ``/progress/{job_id}`` poll never matches.
+    """
+    url = f"{wan_base}/video-creator/v1/{endpoint}?job_id={job_id}"
     try:
         async with session.post(url, json=rbody,
                                 headers={"X-Worker-Token": token},
@@ -377,7 +382,7 @@ async def _bernini_chain(wm, session, token, endpoint: str, body: dict,
         job_id = str(body.get("job_id") or uuid.uuid4().hex[:12])
         rbody = {**body, "job_id": job_id}
         task = asyncio.create_task(
-            _bernini_post(session, wan_base, endpoint, rbody, token))
+            _bernini_post(session, wan_base, endpoint, rbody, token, job_id))
         last_step = -1
         while not task.done():
             try:
