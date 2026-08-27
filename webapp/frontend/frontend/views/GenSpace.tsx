@@ -3655,7 +3655,54 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         if (restyleOutcome?.error) {
           chat.markGenerationError(genId, restyleOutcome.error)
         } else if (restyleOutcome?.result?.videoPath) {
-          chat.markGenerationDone(genId, restyleOutcome.result.videoPath)
+          const videoPath = restyleOutcome.result.videoPath
+          // Auto-register + persist the VIDEO restyle output to the project library
+          // (mirrors the Bernini edit rail). Only the VIDEO restyle saves its asset —
+          // the image restyle (stylized first frame) never does. Marking
+          // restyleHandledPathRef here keeps the take-collection effect below from
+          // ALSO offering this already-saved output in the "pick a take, then Keep"
+          // gallery — that flow stays for REDO iterations only.
+          restyleHandledPathRef.current = videoPath
+          let savedPath = videoPath
+          if (currentProjectId) {
+            const copied = await addVisualAssetToProject(videoPath, currentProjectId, 'video')
+            if (copied) {
+              addAsset(currentProjectId, {
+                type: 'video',
+                path: copied.path,
+                bigThumbnailPath: copied.bigThumbnailPath,
+                smallThumbnailPath: copied.smallThumbnailPath,
+                width: copied.width,
+                height: copied.height,
+                prompt,
+                resolution: '',
+                duration: 0,
+                generationParams: {
+                  mode: 'restyle',
+                  prompt,
+                  model: restyleModel,
+                  duration: 0,
+                  resolution: '',
+                  fps: typeof restyleFps === 'number' ? restyleFps : 24,
+                  audio: false,
+                  cameraMotion: 'none',
+                },
+                takes: [{
+                  path: copied.path,
+                  bigThumbnailPath: copied.bigThumbnailPath,
+                  smallThumbnailPath: copied.smallThumbnailPath,
+                  width: copied.width,
+                  height: copied.height,
+                  createdAt: Date.now(),
+                }],
+                activeTakeIndex: 0,
+              })
+              savedPath = copied.path
+            } else {
+              logger.error('Could not persist restyle result to project storage')
+            }
+          }
+          chat.markGenerationDone(genId, savedPath)
         }
       }
       return
