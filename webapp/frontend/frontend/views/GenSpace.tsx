@@ -3389,7 +3389,12 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     // Record a running generation in the chat dock; the assets-completion
     // watcher flips it to done (with the produced media) once it lands.
     const submittedPrompt = prompt.trim()
-    const genId = submittedPrompt ? chat.addGeneration(submittedPrompt, mode) : null
+    // The image-tab restyle step (stylize the first frame) is an image-edit operation
+    // whose progress lives on the edit panel — it has no runnable restyle job of its
+    // own, so don't leave a stuck 'restyle' card for it. The real restyle card is
+    // created when the stylized frame is accepted and the video restyle is submitted.
+    const isImageOnlyRestyle = mode === 'restyle' && restyleTab === 'image'
+    const genId = submittedPrompt && !isImageOnlyRestyle ? chat.addGeneration(submittedPrompt, mode) : null
     if (mode === 'ic-lora') {
       if ((!prompt.trim() && !promptOptional) || !icLoraInput.videoPath || !icLoraInput.ready) return
 
@@ -3530,7 +3535,10 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       }
       if (!restyleInput.videoPath || !restyleInput.stylizedImagePath || !restyleInput.ready) return
       await writeRecoveryContext({ prompt })
-      await submitRestyle({
+      // Submit the restyle and mirror the runner's REAL per-step progress onto the
+      // chat-history generation card (the card is created above via addGeneration and
+      // starts 'running'; without this it would sit 'running' until the 30-min watchdog).
+      const restyleOutcome = await submitRestyle({
         videoPath: restyleInput.videoPath,
         stylizedImagePath: restyleInput.stylizedImagePath,
         prompt,
@@ -3538,7 +3546,25 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
         fps: restyleFps,
         enhancePrompt: false,
         seed: restyleSeed,
+        onProgress: (ev) => {
+          if (!genId) return
+          const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string } = {}
+          if (typeof ev.progress === 'number' && ev.progress >= 0 && ev.progress <= 1) {
+            patch.progress = ev.progress
+          }
+          if (typeof ev.step === 'number') patch.step = ev.step
+          if (typeof ev.totalSteps === 'number') patch.totalSteps = ev.totalSteps
+          if (ev.statusMessage) patch.statusMessage = ev.statusMessage
+          if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
+        },
       })
+      if (genId) {
+        if (restyleOutcome?.error) {
+          chat.markGenerationError(genId, restyleOutcome.error)
+        } else if (restyleOutcome?.result?.videoPath) {
+          chat.markGenerationDone(genId, restyleOutcome.result.videoPath)
+        }
+      }
       return
     }
 
