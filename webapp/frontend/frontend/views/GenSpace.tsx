@@ -3,7 +3,7 @@ import {
   Trash2, Download, Image, Video, X,
   Heart, Film, Volume2, VolumeX, Sparkles, Sparkle,
   Clock, Monitor, ChevronUp, ChevronDown, Scissors, Music, Undo2, Redo2, Loader2,
-  ChevronLeft, ChevronRight, Copy, Check, MoveHorizontal, Wand2, Play, Maximize2
+  ChevronLeft, ChevronRight, Copy, Check, MoveHorizontal, Wand2, Play, Maximize2, Upload
 } from 'lucide-react'
 import { useProjects } from '../contexts/ProjectContext'
 import type { GenSpaceRetakeSource } from '../contexts/ProjectContext'
@@ -17,7 +17,7 @@ import { resolveRunner, enhancePromptViaRunner, pathToBase64 } from '../lib/dire
 import { isWebPlatform } from '../lib/livepeer-discovery'
 import { getVisionModels, resolveOpenRouterModel, openRouterChat } from '../lib/openrouter'
 import { buildEnhanceMessages } from '../lib/llm-messages'
-import { extractFrame } from '../lib/runtime/web-store'
+import { extractFrame, store } from '../lib/runtime/web-store'
 import { saveProjectTimeline, readProjectTimeline } from '../lib/runtime/fs-access'
 import { withGenerationActive } from '../lib/generation-active'
 import { useVideoGenerationModelSpecs } from '../hooks/use-video-generation-model-specs'
@@ -3385,6 +3385,45 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []) // mount only
 
+  // Upload local images/videos into the project asset library. Each picked file is
+  // registered in the browser asset store, measured + thumbnailed via
+  // addVisualAssetToProject (the web impl reads the registered blob, extracts a video
+  // first-frame poster, and best-effort persists bytes to the project-assets folder),
+  // then added to the project so it renders in the library and works as a reference.
+  const uploadFileInputRef = useRef<HTMLInputElement>(null)
+  const handleUploadClick = useCallback(() => {
+    uploadFileInputRef.current?.click()
+  }, [])
+
+  const handleUploadFiles = useCallback(async (files: FileList | File[] | null) => {
+    if (!files || files.length === 0 || !currentProjectId) return
+    const projectId = currentProjectId
+    for (const file of Array.from(files)) {
+      const isVideo = file.type.startsWith('video/')
+      const isImage = file.type.startsWith('image/')
+      if (!isVideo && !isImage) continue
+      const type = isVideo ? 'video' : 'image'
+      try {
+        const key = store.registerFile(file)
+        const copied = await addVisualAssetToProject(key, projectId, type)
+        if (!copied) continue
+        addAsset(projectId, {
+          type,
+          path: copied.path,
+          bigThumbnailPath: copied.bigThumbnailPath,
+          smallThumbnailPath: copied.smallThumbnailPath,
+          width: copied.width,
+          height: copied.height,
+          prompt: '',
+          resolution: '',
+          favorite: false,
+        })
+      } catch (e) {
+        logger.error(`Could not import asset ${file.name}: ${e instanceof Error ? e.message : e}`)
+      }
+    }
+  }, [currentProjectId, addAsset])
+
   const handleGenerate = async () => {
     // Record a running generation in the chat dock; the assets-completion
     // watcher flips it to done (with the produced media) once it lands.
@@ -3941,9 +3980,6 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   // advanced side panel beside the prompt.
   const icLoraControlsProps: IcLoraControlsProps = {
     icLoraCondType,
-    icLoraSelectorValue,
-    icLoraSelectorOptions,
-    onIcLoraSelectorChange: handleIcLoraSelectorChange,
     icLoraStrength,
     onIcLoraStrengthChange: setIcLoraStrength,
     availableIcLoras: installedIcLoras,
@@ -4016,6 +4052,21 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
               )}
             </div>
             <div className="flex items-center gap-2">
+            <input
+              ref={uploadFileInputRef}
+              type="file"
+              accept="image/*,video/*"
+              multiple
+              className="hidden"
+              onChange={(e) => { void handleUploadFiles(e.target.files); e.target.value = '' }}
+            />
+            <button
+              onClick={handleUploadClick}
+              title="Upload images or videos to your project"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+            >
+              <Upload className="h-4 w-4" /> Upload
+            </button>
             <button
               onClick={() => setShowFavorites(!showFavorites)}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
@@ -4343,6 +4394,9 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
             onConditioningTypeChange={handleIcLoraCondTypeChange}
             conditioningStrength={icLoraStrength}
             onConditioningStrengthChange={setIcLoraStrength}
+            icLoraSelectorValue={icLoraSelectorValue}
+            icLoraSelectorOptions={icLoraSelectorOptions}
+            onIcLoraSelectorChange={handleIcLoraSelectorChange}
             outputVideoPath={icLoraResult?.videoPath || null}
             onChange={setIcLoraInput}
           />
