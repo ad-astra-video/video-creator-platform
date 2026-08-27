@@ -3544,11 +3544,15 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       if (!editVideoInitial.videoPath) return
       setPrompt(prompt)
       await writeRecoveryContext({ prompt })
-      // Surface a runner/transport failure on the chat-dock card that is waiting for a
-      // response (created at the top of handleGenerate), instead of stranding it on
-      // 'running'. Because all status now lives on the task card (not the panel), every
-      // live progress event is mirrored in: phase message + progress bar + step/total.
-      const editErr = await editVideoPanelRef.current?.runEdit(prompt, {
+      // Mirror the runner's REAL per-step progress onto the chat-dock task card
+      // (created at the top of handleGenerate) so it never sits 'running' silently:
+      // every live progress event is reflected as phase message + progress bar +
+      // step/total. A runner/transport failure surfaces as card 'error' too. On
+      // SUCCESS the delivered result videoPath returns here (submitBerniniEdit now
+      // returns it), so the result is persisted to the project library and the card
+      // flips to 'done' — previously the videoPath only arrived through the panel's
+      // unwired onResult, so the video was never saved and the card stuck 'running'.
+      const outcome = await editVideoPanelRef.current?.runEdit(prompt, {
         onProgress: (ev) => {
           if (!genId) return
           const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string } = {}
@@ -3559,7 +3563,52 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
         },
       })
-      if (editErr && genId) chat.markGenerationError(genId, editErr)
+      if (outcome?.error) {
+        if (genId) chat.markGenerationError(genId, outcome.error)
+        return
+      }
+      if (outcome?.videoPath && currentProjectId) {
+        const copied = await addVisualAssetToProject(outcome.videoPath, currentProjectId, 'video')
+        if (!copied) {
+          logger.error('Could not persist edit result to project storage')
+          setLocalError(createLocalGenerationError('Failed to save edit output to project storage.'))
+          return
+        }
+        addAsset(currentProjectId, {
+          type: 'video',
+          path: copied.path,
+          bigThumbnailPath: copied.bigThumbnailPath,
+          smallThumbnailPath: copied.smallThumbnailPath,
+          width: copied.width,
+          height: copied.height,
+          prompt,
+          resolution: '',
+          duration: 0,
+          generationParams: {
+            mode: 'edit',
+            prompt,
+            model: settings.model || 'bernini',
+            duration: 0,
+            resolution: '',
+            fps: 16,
+            audio: false,
+            cameraMotion: 'none',
+          },
+          takes: [{
+            path: copied.path,
+            bigThumbnailPath: copied.bigThumbnailPath,
+            smallThumbnailPath: copied.smallThumbnailPath,
+            width: copied.width,
+            height: copied.height,
+            createdAt: Date.now(),
+          }],
+          activeTakeIndex: 0,
+        })
+        if (genId) {
+          const still = copied.smallThumbnailPath || copied.bigThumbnailPath || copied.path
+          chat.markGenerationDone(genId, copied.path, still)
+        }
+      }
       return
     }
 

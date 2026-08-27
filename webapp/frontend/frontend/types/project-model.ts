@@ -10,6 +10,7 @@ export const generationModeValues = [
   'extend',
   'ic-lora',
   'restyle',
+  'edit',
 ] as const
 
 export const assetTypeValues = ['image', 'video', 'audio', 'adjustment'] as const

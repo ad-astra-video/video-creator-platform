@@ -75,6 +75,16 @@ export interface BerniniEditResult {
   videoPath: string
 }
 
+/** What a submitBerniniEdit submission resolves to: the error (if any) that ended
+ *  it, plus the delivered result video path on success. The GenSpace edit handler
+ *  needs BOTH the error (to mark the card 'error') and the videoPath (to persist
+ *  to the project + mark the card 'done') — before, the videoPath only surfaced
+ *  through the panel's unwired onResult and the result was never saved. */
+export interface BerniniEditOutcome {
+  error: string | null
+  videoPath: string | null
+}
+
 interface UseBerniniEditState {
   isEditing: boolean
   editStatus: string
@@ -111,8 +121,8 @@ export function useBerniniEdit() {
   })
 
   const submitBerniniEdit = useCallback(
-    async (params: BerniniEditSubmitParams): Promise<string | null> => {
-      if (!params.videoPath || !params.prompt) return null
+    async (params: BerniniEditSubmitParams): Promise<BerniniEditOutcome> => {
+      if (!params.videoPath || !params.prompt) return { error: null, videoPath: null }
 
       setState({
         isEditing: true,
@@ -125,6 +135,9 @@ export function useBerniniEdit() {
       // GenSpace task card can be marked 'error' with the REAL runner message instead
       // of being stranded on 'running'.
       let editErrorMsg: string | null = null
+      // The delivered result video path on success (registered blob web:// key), so
+      // the caller can persist it to the project and mark the card 'done'.
+      let successVideoPath: string | null = null
 
       await withGenerationActive(async () => {
         try {
@@ -223,6 +236,7 @@ export function useBerniniEdit() {
             'bernini-edit.mp4',
             (res.mediaBlob as Blob).type || 'video/mp4',
           )
+          successVideoPath = videoPath
 
           setState({
             isEditing: false,
@@ -240,7 +254,7 @@ export function useBerniniEdit() {
         }
       })
 
-      return editErrorMsg
+      return { error: editErrorMsg, videoPath: successVideoPath }
     },
     [],
   )

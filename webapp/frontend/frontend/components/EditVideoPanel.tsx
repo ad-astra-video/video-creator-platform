@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle } from 'react'
 import { VideoPreviewPanel } from './VideoPreviewPanel'
 import { PostProcessControls } from './PostProcessControls'
-import { useBerniniEdit } from '../hooks/use-bernini-edit'
+import { useBerniniEdit, type BerniniEditOutcome } from '../hooks/use-bernini-edit'
 import type { RunnerProgressEvent } from '../lib/direct-transport'
 import { getBlobUrl, isWebPath, registerFile } from '../lib/runtime/web-store'
 import { measureVideoFps } from '../lib/video-fps'
@@ -30,7 +30,7 @@ export interface EditVideoPanelHandle {
     // Forwarded to submitBerniniEdit so the chat-dock task card can mirror the
     // live edit status (message + progress + step) instead of this panel showing it.
     onProgress?: (ev: RunnerProgressEvent) => void
-  }) => Promise<string | null>
+  }) => Promise<BerniniEditOutcome>
 }
 
 interface EditVideoPanelProps {
