@@ -111,8 +111,8 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
         keyframe_specs.append((idx, img))
 
     set_progress(job_id, 0.01, "preprocessing", "decoding source + conditioning")
-    def _prog(progress, stage, message):
-        set_progress(job_id, progress, stage, message)
+    def _prog(progress, stage, message, step=None, total=None):
+        set_progress(job_id, progress, stage, message, step=step, total=total)
 
     # Optional Gemma LLM stage: automatically caption the source video when the
     # prompt is blank/placeholder, and/or run prompt enhancement on the final
@@ -453,7 +453,11 @@ def _segment_foreground(source_path, stylized_path, tmpdir, width, height):
                                                sam3_max_side)
 
     gpu_id = "0"
-    model_dev = os.environ.get("GPU_DEVICE", config.GPU_DEVICE)
+    # Use the LIVE /load-assigned device (config.GPU_DEVICE is kept in sync by
+    # server.handle_load) — NOT the stale GPU_DEVICE env, which pins this worker
+    # to GPU 0 and OOMs SAM3 against the resident image-worker on that card.
+    # SAM3's subprocess must land on the same card the engine was /load'd onto.
+    model_dev = config.GPU_DEVICE
     if model_dev.startswith("cuda:"):
         gpu_id = model_dev.split(":", 1)[1] or "0"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu_id)

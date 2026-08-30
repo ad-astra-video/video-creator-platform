@@ -205,6 +205,13 @@ class ModelManager:
         """
         self.evict()
         self.device = self._normalize_device(device or config.GPU_DEVICE)
+        # Pin the process CUDA device to the relocated card so every subsequent
+        # default-device op (and empty_cache) lands on the new GPU, never leaving
+        # a parked context on the vacated card.
+        try:
+            torch.cuda.set_device(int(str(self.device).replace("cuda:", "")))
+        except Exception:  # pragma: no cover - best-effort
+            pass
         logger.info("ModelManager relocated -> %s", self.device)
 
     def evict(self) -> None:
@@ -226,6 +233,12 @@ class ModelManager:
             except Exception:
                 pass
             gc.collect()
+            # Pin the process CUDA device before empty_cache() so it releases the
+            # card this model owns (not the process default device).
+            try:
+                torch.cuda.set_device(int(str(self.device).replace("cuda:", "")))
+            except Exception:  # pragma: no cover - best-effort
+                pass
             torch.cuda.empty_cache()
 
     def _build_pipeline(self):
@@ -979,15 +992,17 @@ class ModelManager:
                 logger.info("Clip %d/%d frames=[%d,%d) seed=%d",
                             clip_idx + 1, len(clip_schedule), frame_start, frame_end,
                             clip_seed)
-                def _prog(within, stage="generating", message=None):
+                def _prog(within, stage="generating", message=None, step=None, total=None):
                     if progress_cb is None:
                         return
                     overall = (clip_idx + within) / len(clip_schedule)
                     if message is None:
                         step_no = min(num_inference_steps, int(round(within * num_inference_steps)))
+                        step = step_no
+                        total = num_inference_steps
                         message = f"clip {clip_idx+1}/{len(clip_schedule)} step {step_no}/{num_inference_steps}"
                     try:
-                        progress_cb(overall, stage, message)
+                        progress_cb(overall, stage, message, step=step, total=total)
                     except Exception:
                         pass
                 generated = self._run_staged_clip(

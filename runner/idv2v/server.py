@@ -114,6 +114,12 @@ async def handle_load(request: web.Request) -> web.Response:
             status=400,
         )
     device_str = f"cuda:{device_idx}"
+    # The scheduler's device is AUTHORITATIVE for this worker — keep
+    # config.GPU_DEVICE in sync so every downstream consumer (the SAM3
+    # subprocess in run.py, gemma/bernini device selection) targets the
+    # assigned card rather than the stale startup/env value (which pinned this
+    # worker to GPU 0 and OOM'd SAM3 against the resident image-worker).
+    config.GPU_DEVICE = device_str
     model_arg = body.get("model") or ""
     kind = config.resolve_model(model_arg)  # idv2v | bernini-1.3b | bernini-14b
     async with _model_lock:
@@ -622,7 +628,7 @@ async def handle_bernini(request: web.Request) -> web.Response:
         for k in ("num_frames", "max_image_size", "height", "width",
                   "num_inference_steps", "fps", "seed", "guidance_mode",
                   "omega_vid", "omega_img", "omega_txt", "omega_scale",
-                  "flow_shift", "eta", "momentum", "system_prompt"):
+                  "flow_shift", "eta", "momentum", "system_prompt", "turbo"):
             if body.get(k) is not None:
                 job[k] = body[k]
 
@@ -905,6 +911,24 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s",
                         stream=sys.stdout)
+
+    # The live-runner + health probes poll /health, /info and /progress many
+    # times a second; demote those three access-log lines to VERBOSE/DEBUG so the
+    # INFO log isn't flooded with polling noise (job / bernini / evict request
+    # logs stay at INFO). Only visible when the aiohttp.access logger is lowered
+    # to DEBUG.
+    _QUIET_ACCESS_PATHS = ("/health", "/info", "/progress")
+
+    class _QuietAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - never drop logs on a format error
+                return True
+            return not any(p in msg for p in _QUIET_ACCESS_PATHS)
+
+    logging.getLogger("aiohttp.access").addFilter(_QuietAccessFilter())
+
     # Resolve auth token eagerly so a blank one is generated + logged once.
     _resolve_token()
     # Gemma shares the video model's GPU -> wire eviction into the enhancer so

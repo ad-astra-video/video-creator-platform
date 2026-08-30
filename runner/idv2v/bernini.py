@@ -47,9 +47,24 @@ STARTUP_TIMEOUT = 900
 JOB_TIMEOUT = 900
 
 # Native Bernini window (frames) — v2v inputs longer than this are split into
-# consecutive no-overlap chunks of this size, each rendered natively, then
-# concatenated. Keep aligned with BERNINI_NATIVE_FRAMES in the frontend.
-NATIVE_FRAMES = 81
+# consecutive chunks of this size, each rendered natively, then concatenated.
+# Keep aligned with BERNINI_NATIVE_FRAMES in the frontend. Each chunk after
+# the first is anchored to the previous chunk's last output frame (reference
+# image) so the edit's scene content carries across chunk boundaries instead
+# of being re-hallucinated per chunk.
+NATIVE_FRAMES = 33
+
+# Native Bernini cadence (fps) — the model renders at this fixed rate, and the
+# pipeline derives each chunk's output frame count from the INPUT clip's
+# duration at this fps (smart_video_nframes, vae_fps). So a chunk extracted at
+# the SOURCE fps (e.g. 25) is seen as "81 frames @25fps = 3.24s" and returns
+# only floor(3.24*16/4)*4+1 = 49 frames, not 81. To make every chunk come back
+# with its full source frame count, we re-time the extracted window onto this
+# native 16fps grid before the Bernini pass; the final concat re-time back to
+# src_fps (setpts=N/(src_fps*TB)) restores the source rate, so the round-trip
+# is speed-preserving and yields the correct duration. Keep aligned with
+# BERNINI_NATIVE_FPS in the frontend.
+NATIVE_FPS = 16
 
 
 class BerniniError(RuntimeError):
@@ -407,10 +422,21 @@ class BerniniManager:
                                 progress_cb: Optional[Any] = None) -> dict[str, Any]:
         """Split the source into NATIVE_FRAMES chunks, render each, concat.
 
-        Each chunk renders its own source window [k*81, (k+1)*81) natively at
-        ``num_frames=len``; the last chunk holds the remainder. Outputs are
-        concatenated into ``job['output']``. No overlap / no blending (the
-        simple "split + process" mode).
+        Each chunk renders its own source window [k*81, (k+1)*81). The window
+        is re-timed onto the native 16fps grid (NATIVE_FPS) before the render so
+        the Bernini pass returns all ``length`` frames (without this, a chunk
+        extracted at a higher source fps returns only duration*16 frames — see
+        NATIVE_FPS). The last chunk holds the remainder; a remainder that is not
+        1 mod 4 (the VAE's 4-frame temporal grid) returns the nearest grid count
+        (e.g. 30 -> 29), a sub-frame error. Outputs are concatenated back to
+        src_fps by the final concat remap, restoring the source rate.
+
+        Consistency across chunks: chunk 0 anchors on the raw source; every
+        later chunk is additionally conditioned on the PREVIOUS chunk's last
+        OUTPUT frame, passed as a reference image (``images=[prev_last.png]``),
+        so scene content the edit introduces (e.g. a restyled background)
+        carries across the boundary instead of being re-hallucinated per chunk.
+        The chunk's own source window still drives motion via v2v control.
         """
         video = job["video"]
         src = video[0] if isinstance(video, (list, tuple)) else video
@@ -418,12 +444,19 @@ class BerniniManager:
         base = os.path.dirname(out_path) or "."
         frames_per = NATIVE_FRAMES
         n_chunks = math.ceil(total / frames_per)
+        # Per-chunk generation budget scales with the chunk count (900s x the
+        # number of chunks), so chunk-1's model-build time is absorbed without
+        # a false manager eviction on a multi-chunk native render.
+        timeout = JOB_TIMEOUT * n_chunks
         chunk_srcs: list[str] = []
         chunk_outs: list[str] = []
+        ref_files: list[str] = []
         listfile = os.path.join(base, "concat.list")
         try:
             self._stage("gen: chunks=%d total=%d fpc=%d src=%s" %
                         (n_chunks, total, frames_per, src))
+            prev_out: Optional[str] = None
+            prev_frames: int = 0
             for k in range(n_chunks):
                 start = k * frames_per
                 end = min((k + 1) * frames_per, total)
@@ -438,11 +471,16 @@ class BerniniManager:
                                      "frames_done": min((k + 1) * frames_per, total)})
                     except Exception:  # noqa: BLE001 - never break the job
                         pass
-                # extract the exact source window at native cadence
+                # extract the exact source window, re-timed onto the native
+                # 16fps grid so the Bernini pass returns all `length` frames
+                # (see NATIVE_FPS). `N` here is the post-select output frame
+                # counter, so the selected `length` frames are laid out at
+                # N/16s -> src_k is `length` frames @ NATIVE_FPS.
                 await asyncio.to_thread(_run_ffmpeg, [
                     "ffmpeg", "-y", "-i", src,
                     "-vf", f"select='between(n,{start},{end - 1})',"
-                           f"setpts=N/(FRAME_RATE*TB)",
+                           f"setpts=N/({NATIVE_FPS}*TB)",
+                    "-r", str(NATIVE_FPS),
                     "-an", src_k,
                 ])
                 chunk_srcs.append(src_k)
@@ -451,7 +489,25 @@ class BerniniManager:
                 sub_job["video"] = [src_k]
                 sub_job["num_frames"] = length
                 sub_job["output"] = out_k
-                await self._run_one(sub_job, timeout, progress_cb)
+                if prev_out and prev_frames > 0:
+                    # Anchor appearance to the PREVIOUS chunk's last OUTPUT
+                    # frame so the restyled scene (e.g. the warehouse) persists
+                    # across the boundary instead of being re-hallucinated.
+                    ref = os.path.join(base, f"ref_chunk_{k:03d}.png")
+                    try:
+                        await asyncio.to_thread(
+                            _export_last_frame, prev_out, prev_frames, ref)
+                        sub_job["images"] = [ref]
+                        ref_files.append(ref)
+                        self._stage("gen: chunk %d anchored -> %s" % (k + 1, ref))
+                    except Exception as exc:  # noqa: BLE001
+                        # A failed anchor export must not kill the whole
+                        # multi-chunk job; render this chunk unanchored.
+                        self._stage("gen: anchor export failed (%r) - unanchored" %
+                                    (exc,))
+                result = await self._run_one(sub_job, timeout, progress_cb)
+                prev_out = out_k
+                prev_frames = result.get("frames") or length
             # concatenate the per-chunk outputs into the final file
             with open(listfile, "w") as f:
                 for o in chunk_outs:
@@ -476,7 +532,7 @@ class BerniniManager:
                     "frames": total, "task": job.get("task_name"),
                     "out_fps": src_fps}
         finally:
-            for pth in chunk_srcs + chunk_outs:
+            for pth in chunk_srcs + chunk_outs + ref_files:
                 try:
                     if os.path.exists(pth):
                         os.remove(pth)
@@ -523,21 +579,24 @@ async def get_manager(model: str = "bernini-1.3b",
     """
     global _manager
     async with _manager_lock:
+        target = _normalize_target_device(device)
         if _manager is not None:
-            if device is None:
-                # No device requested (a generation reusing whatever the
-                # scheduler already placed via /load) — return the resident
-                # manager as-is rather than forcing a device match + evict.
-                # Without this, a resident cuda:N manager was torn down and
-                # the call re-raised "requires a device" whenever GPU_DEVICE
-                # was unset in the container.
+            if _manager.model == model and (_manager.device == target or not target):
+                # Same model already resident (on this device, or on whatever the
+                # scheduler placed) — reuse it. When no device was requested we
+                # deliberately do NOT force a device match + evict: a resident
+                # cuda:N manager would otherwise be torn down and the re-load
+                # re-raise "requires a device" whenever GPU_DEVICE is unset.
                 return _manager
-            target = _normalize_target_device(device)
-            if _manager.model == model and _manager.device == target:
-                return _manager
+            # Resident model/device differs from what's asked — evict and load the
+            # requested model. If no device was provided, reuse the resident card's
+            # device (the scheduler already placed one), so a request is NEVER
+            # silently served by the wrong family (previously a 14b request with
+            # device=None ran on a resident 1.3b manager).
+            if not target:
+                target = _normalize_target_device(_manager.device)
             await _manager.evict()
             _manager = None
-        target = _normalize_target_device(device)
         if not target:
             raise BerniniError(
                 "bernini load requires a 'device' from the live-runner scheduler "
@@ -575,6 +634,22 @@ def _run_ffmpeg(args: list, timeout: float = 300) -> None:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "")[-800:]
         raise BerniniError(f"ffmpeg failed ({proc.returncode}): {detail}")
+
+
+def _export_last_frame(src: str, nframes: int, out_png: str) -> None:
+    """Write the last frame (index ``nframes-1``) of ``src`` to ``out_png``.
+
+    Used to build the cross-chunk reference image (Option A anchor): the last
+    OUTPUT frame of chunk k becomes the ``images`` reference for chunk k+1, so
+    the edit's scene content (e.g. a restyled background) persists instead of
+    being re-hallucinated. Mirrors the existing ``select='between(n,...)'``
+    quoting style already used for chunk extraction.
+    """
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-i", src,
+        "-vf", f"select='eq(n\,{max(nframes - 1, 0)})'",
+        "-frames:v", "1", out_png,
+    ])
 
 
 def _probe_frames(path: str) -> Optional[int]:

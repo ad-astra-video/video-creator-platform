@@ -88,5 +88,17 @@ huggingface-cli download --token "$HF_TOKEN" \
 huggingface-cli download --token "$HF_TOKEN" \
     Qwen/Qwen3-4B || true
 
+# rzgar 4-step LightX2V distill LoRA — drives the Bernini 14B `turbo` toggle
+# (bernini_cli --turbo-lora-dir). The 14b fp8 renderer loads BOTH files at
+# startup and applies/restores them per job; the exact filename match matters
+# (bernini_cli resolves Bernini-R_LightX2V_{high,low}_noise.safetensors here).
+echo ">>> Downloading rzgar Bernini-R LightX2V 4-step LoRA (turbo)"
+mkdir -p "$MODEL_DIR/bernini-turbo-lora"
+huggingface-cli download --token "$HF_TOKEN" \
+    rzgar/Bernini-R-LightX2V-4step-loras \
+    Bernini-R_LightX2V_high_noise.safetensors \
+    Bernini-R_LightX2V_low_noise.safetensors \
+    --local-dir "$MODEL_DIR/bernini-turbo-lora" || true
+
 echo ">>> Model download complete"
 ls -lh "$MODEL_DIR"

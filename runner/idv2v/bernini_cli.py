@@ -27,8 +27,8 @@ Request field reference (all optional except ``prompt``/``output``):
       "height": 0, "width": 0,               # 0/0 => follow source media / native
       "num_inference_steps": 40, "fps": 16, "seed": 42,
       "guidance_mode": null,                 # default derived from task_name
-      "omega_vid": 1.25, "omega_img": 4.5, "omega_txt": 4.0, "omega_tgt": 0.5,
-      "omega_scale": 0.8, "flow_shift": 5.0, "eta": 0.5, "momentum": 0,
+      "omega_vid": 1.25, "omega_img": 6.5, "omega_txt": 4.0, "omega_tgt": 0.5,
+      "omega_scale": 1.0, "flow_shift": 5.0, "eta": 0.5, "momentum": 0,
       "planning_step": 25, "vit_txt_cfg": 1.2, "vit_img_cfg": 1.0,
       "vit_denoising_step": 5
     }
@@ -104,6 +104,19 @@ DEFAULT_NEG_PROMPT = (
 # Default guidance mode derived from the requested task type.
 TASK_GUIDANCE = {"t2v": "t2v", "v2v": "v2v", "r2v": "rv2v"}
 
+# The 14b fp8 checkpoint drives the WIT-CFG sampler (`sample_bernini_wvitcfg`),
+# whose accepted guidance-mode set differs from the plain 1.3b sampler
+# (`sample_one_step`): the WIT-CFG sampler accepts `vae_txt_vit`,
+# `vae_txt_vit_wapg`, `rv2v_wapg`, `r2v_wapg`, `v2v_apg` — NOT the plain
+# `t2v`/`v2v`/`rv2v`. These mirror the upstream `BERNINI_V2_TASK_DEFAULTS`
+# mapping (gradio_demo.py), which uses `vae_txt_vit_wapg` for every task
+# except the dedicated `rv2v` (video + ref-images) task.
+FP8_TASK_GUIDANCE = {
+    "t2v": "vae_txt_vit_wapg",
+    "v2v": "vae_txt_vit_wapg",
+    "r2v": "vae_txt_vit_wapg",
+}
+
 
 def _arg_defaults() -> argparse.Namespace:
     """Base argparse Namespace mirroring infer_single_gpu.py common args.
@@ -129,13 +142,13 @@ def _arg_defaults() -> argparse.Namespace:
     ns.max_image_size = 848
     ns.height = 480
     ns.width = 848
-    ns.num_inference_steps = 40
+    ns.num_inference_steps = 20
     ns.guidance_mode = "rv2v"
     ns.omega_vid = 1.25
-    ns.omega_img = 4.5
+    ns.omega_img = 6.5
     ns.omega_txt = 4.0
     ns.omega_tgt = 0.5
-    ns.omega_scale = 0.8
+    ns.omega_scale = 1.0
     ns.planning_step = 25
     ns.vit_txt_cfg = 1.2
     ns.vit_img_cfg = 1.0
@@ -172,6 +185,8 @@ def main() -> int:
     ap.add_argument("--model-dir", required=True, help="Bernini Diffusers dir")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--guidance", default="rv2v", choices=("t2v", "v2v", "rv2v"))
+    ap.add_argument("--turbo-lora-dir", default="/models/bernini-turbo-lora",
+                    help="dir with rzgar high/low noise LoRA safetensors (optional)")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -180,20 +195,124 @@ def main() -> int:
     ns = _arg_defaults()
     ns.config = args.model_dir
 
-    logger.info("Building Bernini pipeline from %s (device=%s)", args.model_dir, args.device)
-    pipeline = build_pipeline(ns, device)
+    is_fp8 = os.path.exists(os.path.join(args.model_dir, "quantization_config.json"))
+    logger.info("Building Bernini pipeline from %s (device=%s, fp8=%s)",
+                args.model_dir, args.device, is_fp8)
+    if is_fp8:
+        import bernini_fp8  # runner-local fp8-aware loader (14b/quantized checkpoints)
+        pipeline = bernini_fp8.build_fp8_pipeline(args.model_dir, device)
+    else:
+        pipeline = build_pipeline(ns, device)
     logger.info("Pipeline built: %s", type(pipeline).__name__)
 
+    # 14B fp8 memory fit: the combined renderer (diff_dec high + diff_dec_low) is
+    # ~28.6 GiB fp8, too big to hold BOTH legs plus WIT-CFG activations (~7.4 GiB)
+    # on the 32 GB card. The sampler already supports a local_device_moves mode
+    # that keeps ONE leg resident on GPU at a time and streams the other on demand
+    # (high leg during high-timestep phase, low leg after the boundary swap) --
+    # but it only engages when self.transformer is on CPU at sample start. Our fp8
+    # build leaves the renderer wherever the pipeline placed it (GPU), which keeps
+    # BOTH legs resident -> OOM. Offload both legs to CPU so the sampler streams
+    # them per phase (peak ~14.3 GiB leg + activations, fits). No sampler change.
+    if is_fp8:
+        try:
+            pm = pipeline.model
+            off = 0
+            for attr in ("diff_dec", "diff_dec_low"):
+                m = getattr(pm, attr, None)
+                if m is None:
+                    continue
+                for leg in ("transformer", "transformer_2"):
+                    t = getattr(m, leg, None)
+                    if t is not None:
+                        t.to("cpu")
+                        off += 1
+            torch.cuda.empty_cache()
+            logger.info("fp8 renderer legs CPU-resident (%d legs), sampler streams "
+                        "one leg to GPU per phase", off)
+        except Exception:  # noqa: BLE001 - never block startup on the offload
+            logger.warning("Could not offload fp8 renderer legs to CPU", exc_info=True)
+
+    # Optional rzgar 4-step LoRA for the turbo toggle. Load once at startup;
+    # per-job `turbo` flips it on/off via TurboLora.apply()/restore().
+    tl = None
+    if is_fp8 and args.turbo_lora_dir and os.path.isdir(args.turbo_lora_dir):
+        high = os.path.join(args.turbo_lora_dir, "Bernini-R_LightX2V_high_noise.safetensors")
+        low = os.path.join(args.turbo_lora_dir, "Bernini-R_LightX2V_low_noise.safetensors")
+        if os.path.exists(high) and os.path.exists(low):
+            import bernini_lora
+            tl = bernini_lora.TurboLora(pipeline.model, high, low, device=args.device)
+            logger.info("rzgar 4-step LoRA loaded for turbo toggle (linears=%d patches=%d)",
+                        len(tl.linear), len(tl.patch))
+
     def handle(job: dict) -> dict:
+        if not job.get("prompt"):
+            return {"ok": False, "error": "missing 'prompt'"}
+        try:
+            import torch as _torch
+            m = pipeline.model
+            def _dev(o):
+                if o is None:
+                    return "None"
+                try:
+                    return str(next(o.parameters()).device)
+                except StopIteration:
+                    return "no-params"
+            _alloc = _torch.cuda.memory_allocated() / 1e9
+            _ldm = _dev(m.diff_dec.transformer) == "cpu"
+            print(f"DIAG alloc_GB={_alloc:.2f} "
+                  f"diff_dec.tr={_dev(m.diff_dec.transformer)} "
+                  f"diff_dec.tr2={_dev(m.diff_dec.transformer_2)} "
+                  f"low.tr={_dev(m.diff_dec_low.transformer)} "
+                  f"low.tr2={_dev(m.diff_dec_low.transformer_2)} "
+                  f"ldm={_ldm}", flush=True)
+        except Exception as _e:  # noqa: BLE001 - diagnostic never blocks a job
+            print(f"DIAG_FAIL {type(_e).__name__}: {_e}", flush=True)
         if not job.get("prompt"):
             return {"ok": False, "error": "missing 'prompt'"}
         out = job.get("output")
         if not out:
             return {"ok": False, "error": "missing 'output'"}
         _apply_job(ns, job)
+        # TURBO DISABLED 2026-08-30: the 4-step LoRA renders GREEN on both UniPC
+        # and DPM++2M-SDE (fp8 weight-only x LoRA is the remaining suspect, not
+        # the sampler). Force native 20-step until the turbo path is fixed;
+        # re-enable by restoring turbo = bool(job.get("turbo")).
+        turbo = False
+        if tl is not None:
+            if turbo and not tl.active:
+                tl.apply()
+                logger.info("turbo LoRA APPLIED")
+            elif (not turbo) and tl.active:
+                tl.restore()
+                logger.info("turbo LoRA restored")
+        if turbo and "num_inference_steps" not in job:
+            ns.num_inference_steps = 4
+        # The turbo (4-step) LoRA is validated against DPM++2M-SDE + sgm_uniform
+        # noise, NOT UniPC; running it through UniPC produces green output.
+        # Install the recipe sampler when turbo, restore UniPC when not. All
+        # wrapped so a scheduler-swap failure never breaks a generation.
+        pm = getattr(pipeline, "model", None)
+        if pm is not None and hasattr(pm, "use_unipc"):
+            try:
+                if turbo:
+                    from diffusers import DPMSolverMultistepScheduler
+                    pm.scheduler = DPMSolverMultistepScheduler.from_pretrained(
+                        ns.config, subfolder="scheduler",
+                        algorithm_type="sde-dpmsolver++",
+                        use_karras_sigmas=False,
+                    )
+                    pm.use_unipc = False
+                    logger.info("turbo: DPM++2M-SDE scheduler installed (use_unipc=False)")
+                elif not pm.use_unipc:
+                    pm.use_unipc = True  # native UniPC; sampler rebuilds it each call
+                    logger.info("non-turbo: restored UniPC sampler")
+            except Exception as _e:  # noqa: BLE001 - never break a job on sampler swap
+                logger.warning("turbo sampler swap failed (%s); leaving current sampler", _e)
         task_name = job.get("task_name") or ns.task_type
         if not job.get("guidance_mode"):
-            ns.guidance_mode = TASK_GUIDANCE.get(task_name, ns.guidance_mode)
+            mapping = FP8_TASK_GUIDANCE if is_fp8 else TASK_GUIDANCE
+            ns.guidance_mode = mapping.get(task_name, ns.guidance_mode)
         task = {
             "prompt": job["prompt"],
             "task_type": task_name,
