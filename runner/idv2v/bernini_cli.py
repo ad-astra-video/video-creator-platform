@@ -274,11 +274,12 @@ def main() -> int:
         if not out:
             return {"ok": False, "error": "missing 'output'"}
         _apply_job(ns, job)
-        # TURBO DISABLED 2026-08-30: the 4-step LoRA renders GREEN on both UniPC
-        # and DPM++2M-SDE (fp8 weight-only x LoRA is the remaining suspect, not
-        # the sampler). Force native 20-step until the turbo path is fixed;
-        # re-enable by restoring turbo = bool(job.get("turbo")).
-        turbo = False
+        # Turbo (4-step rzgar LoRA + DPM++2M-SDE sgm_uniform) re-enabled
+        # 2026-08-30: the green was NOT the LoRA/sampler/fp8 — it was the
+        # scale_shift_table uint8-plain-copy bug in stream_fill (bernini_fp8.py,
+        # fixed). Native 20-step UniPC stays the default; a job with
+        # "turbo": true goes 4-step via TurboLora + DPM++2M-SDE below.
+        turbo = bool(job.get("turbo"))
         if tl is not None:
             if turbo and not tl.active:
                 tl.apply()
