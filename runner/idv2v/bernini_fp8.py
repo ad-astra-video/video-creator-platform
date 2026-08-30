@@ -30,6 +30,7 @@ import gc
 import glob
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 import torch
@@ -278,6 +279,76 @@ def collect_scale_keys(shards: List[str]) -> set:
     return scales
 
 
+def _read_shard(sh: str):
+    """Load every tensor of one safetensors shard into a dict (CPU).
+
+    Runs in a worker thread for the parallel path. Returns (shard_path,
+    {name: tensor}) dict. With mmap-backed safe_open this is mostly zero-copy
+    views; the real disk->host reads happen when the main thread copies each
+    tensor into the model (device transfer), so the window of host RAM held is
+    bounded by the number of shards in flight (= jobs).
+    """
+    from safetensors import safe_open
+
+    with safe_open(sh, framework="pt", device="cpu") as f:
+        return sh, {k: f.get_tensor(k) for k in f.keys()}
+
+
+def _fill_shard(params: Dict, tens: Dict, counts: Dict, device: Optional[str],
+                layout: str, in_scope, scale_keys: set) -> None:
+    """Copy one already-loaded shard's tensors into the model params.
+
+    Shared by the serial and parallel fill paths so both produce identical
+    results; counts is mutated in place.
+    """
+    for k in sorted(tens.keys()):
+        if not in_scope(k):
+            continue
+        if k.endswith("_scale"):
+            continue  # handled with its weight
+        p = params.get(k)
+        if p is None:
+            counts["skipped"] += 1
+            continue
+        # fp8 marker is the `_scale` sibling, not a `.weight` suffix:
+        # non-Linear fp8 weights (e.g. `scale_shift_table`, an nn.Parameter
+        # with an adaLN `_scale`) have keys that do NOT end in `.weight`.
+        # The old `k.endswith(".weight")` gate plain-copied their raw uint8
+        # e4m3 BYTES into the bf16 param, corrupting the modulation table
+        # -> every block's adaLN scale/shift (incl. timestep conditioning)
+        # was garbage -> ~186x velocity / flat-green latent.
+        is_fp8 = (k + "_scale") in scale_keys
+        if is_fp8:
+            w = tens[k]
+            s = tens[k + "_scale"]
+            if p.dtype == torch.float8_e4m3fn:
+                wq = w.view(torch.float8_e4m3fn)
+                # FP8Linear stores (K,N) = transpose of the legacy
+                # checkpoint's (N,K) so _scaled_mm needs no runtime
+                # transpose/dup; only 2-D linear weights are transposed
+                # (convs stay as-is). Pre-baked ("k_n") shards are already
+                # (K,N) -> straight copy, no transpose (a shape heuristic
+                # can't distinguish square K==N orientations; the manifest
+                # `layout` field disambiguates).
+                if layout != "k_n" and p.dim() == 2 and p.shape[0] == w.shape[1] and p.shape[1] == w.shape[0]:
+                    wq = wq.t().contiguous()
+                # fp8-resident wrapper: weight + separate per-channel scale
+                p.data.copy_(wq.to(device or p.device))
+                sp = params.get(k[: -len(".weight")] + ".scale")
+                if sp is not None:
+                    sp.data.copy_(s.to(sp.dtype).to(device or sp.device))
+                    counts["fp8scale"] += 1
+                counts["fp8"] += 1
+            else:
+                # plain param that was fp8-quantized: dequant -> bf16
+                p.data.copy_(decode_fp8_weight(w, s).to(p.dtype).to(device or p.device))
+                counts["dequant"] += 1
+            del w, s
+        else:
+            p.data.copy_(tens[k].to(p.dtype).to(device or p.device))
+            counts["plain"] += 1
+
+
 def stream_fill(
     model: nn.Module,
     shards: List[str],
@@ -285,6 +356,7 @@ def stream_fill(
     device: Optional[str] = None,
     prefixes: Optional[List[str]] = None,
     layout: str = "n_k",
+    jobs: Optional[int] = None,
 ) -> Dict[str, int]:
     """Fill the (renderer) module weights directly from the fp8 safetensors shards.
 
@@ -292,11 +364,17 @@ def stream_fill(
       separate scale), or dequant to bf16 when the param isn't an fp8 wrapper.
     - everything else -> plain copy into the matching bf16 param.
     Returns counts (skipped = ckpt keys with no matching model param).
+
     ``prefixes`` (e.g. ["diff_dec","diff_dec_low"]) restrict which keys are
     considered; by default all keys that map to a model param are filled.
-    """
-    from safetensors import safe_open
 
+    ``jobs``: >1 enables a bounded-parallel load. Disk read + safe_open +
+    deserialize for up to jobs shards run in worker threads while the main
+    thread copies completed shards into the model (device transfer), which is
+    the throughput limiter on a big checkpoint. Defaults to the runner's core
+    count minus 2. jobs=1 is the exact legacy serial path (identical results,
+    just no parallelism).
+    """
     if scale_keys is None:
         scale_keys = collect_scale_keys(shards)
     params = {name: p for name, p in model.named_parameters()}
@@ -305,56 +383,26 @@ def stream_fill(
     def _in_scope(k: str) -> bool:
         return prefixes is None or k.split(".")[0] in prefixes
 
+    if jobs is None:
+        # Parallel depth derived from the runner's core count minus 2 (the two
+        # reserved for the model/GPU pipelines). Sensible always-on default, not
+        # a config toggle.
+        jobs = max(1, (os.cpu_count() or 2) - 2)
+
+    need_fill = len(shards) > 1 and jobs and jobs > 1
+    if need_fill:
+        # Parallel: read shards on up to jobs worker threads; consume in
+        # submission order (deterministic, matches serial bit-for-bit).
+        with ThreadPoolExecutor(max_workers=min(jobs, len(shards))) as ex:
+            for _sh, tens in ex.map(_read_shard, shards):
+                _fill_shard(params, tens, counts, device, layout, _in_scope, scale_keys)
+                del tens
+        return counts
+    # Serial (legacy) path: one shard at a time in the main thread.
     for sh in shards:
-        with safe_open(sh, framework="pt", device="cpu") as f:
-            keys = sorted(f.keys())
-            for k in keys:
-                if not _in_scope(k):
-                    continue
-                if k.endswith("_scale"):
-                    continue  # handled with its weight
-                p = params.get(k)
-                if p is None:
-                    counts["skipped"] += 1
-                    continue
-                # fp8 marker is the `_scale` sibling, not a `.weight` suffix:
-                # non-Linear fp8 weights (e.g. `scale_shift_table`, an nn.Parameter
-                # with an adaLN `_scale`) have keys that do NOT end in `.weight`.
-                # The old `k.endswith(".weight")` gate plain-copied their raw uint8
-                # e4m3 BYTES into the bf16 param, corrupting the modulation table
-                # -> every block's adaLN scale/shift (incl. timestep conditioning)
-                # was garbage -> ~186x velocity / flat-green latent.
-                is_fp8 = (k + "_scale") in scale_keys
-                if is_fp8:
-                    w = f.get_tensor(k)
-                    s = f.get_tensor(k + "_scale")
-                    if p.dtype == torch.float8_e4m3fn:
-                        wq = w.view(torch.float8_e4m3fn)
-                        # FP8Linear stores (K,N) = transpose of the legacy
-                        # checkpoint's (N,K) so _scaled_mm needs no runtime
-                        # transpose/dup; only 2-D linear weights are transposed
-                        # (convs stay as-is). Pre-baked ("k_n") shards are already
-                        # (K,N) -> straight copy, no transpose (a shape heuristic
-                        # can't distinguish square K==N orientations; the manifest
-                        # `layout` field disambiguates).
-                        if layout != "k_n" and p.dim() == 2 and p.shape[0] == w.shape[1] and p.shape[1] == w.shape[0]:
-                            wq = wq.t().contiguous()
-                        # fp8-resident wrapper: weight + separate per-channel scale
-                        p.data.copy_(wq.to(device or p.device))
-                        sp = params.get(k[: -len(".weight")] + ".scale")
-                        if sp is not None:
-                            sp.data.copy_(s.to(sp.dtype).to(device or sp.device))
-                            counts["fp8scale"] += 1
-                        counts["fp8"] += 1
-                    else:
-                        # plain param that was fp8-quantized: dequant -> bf16
-                        p.data.copy_(decode_fp8_weight(w, s).to(p.dtype).to(device or p.device))
-                        counts["dequant"] += 1
-                    del w, s
-                else:
-                    p.data.copy_(f.get_tensor(k).to(p.dtype).to(device or p.device))
-                    counts["plain"] += 1
-            del keys
+        _sh, tens = _read_shard(sh)
+        _fill_shard(params, tens, counts, device, layout, _in_scope, scale_keys)
+        del tens
         gc.collect()
     return counts
 
