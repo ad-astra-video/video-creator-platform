@@ -518,7 +518,29 @@ def build_fp8_model(
     """Construct BerniniModel(config) and swap the renderer to fp8. Returns model."""
     from bernini.models.bernini import BerniniModel
 
-    model = BerniniModel(config)
+    # Constructing the graph (MLLM + Wan transformers + connector) runs default
+    # random init over ~14B params (~128s of kaiming_uniform_/uniform_/normal_),
+    # and every value is overwritten from the checkpoint by stream_fill below
+    # (missing:0) - so that init is pure wasted work. No-op the random
+    # initializers for the construction window; keep cheap deterministic inits
+    # (zeros_/ones_/constant_) so buffers etc. still init. torch.nn.init.* IS the
+    # feed-through for Linear/embedding reset and _initialize_weights, so this
+    # covers the RNG cost. (The meta-device construct trick is NOT used here:
+    # BerniniModel internally from_pretrains the T5 text encoder, which refuses
+    # to run under a meta default device.)
+    import torch.nn.init as _torch_init
+    _skip_init = ("uniform_", "normal_", "kaiming_uniform_", "kaiming_normal_",
+                  "xavier_uniform_", "xavier_normal_", "trunc_normal_")
+    _saved_init = {n: getattr(_torch_init, n) for n in _skip_init}
+    def _noop_init(*a, **k):
+        return None
+    for _n in _skip_init:
+        setattr(_torch_init, _n, _noop_init)
+    try:
+        model = BerniniModel(config)
+    finally:
+        for _n, _f in _saved_init.items():
+            setattr(_torch_init, _n, _f)
     # Swap quantisable layers inside the two renderer /GEN_Wanx22/ containers only
     # (mllm/t5/connector/vit_decoder stay bf16 plain weights).
     for attr in ("diff_dec", "diff_dec_low"):
