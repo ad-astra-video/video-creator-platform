@@ -284,6 +284,7 @@ def stream_fill(
     scale_keys: Optional[set] = None,
     device: Optional[str] = None,
     prefixes: Optional[List[str]] = None,
+    layout: str = "n_k",
 ) -> Dict[str, int]:
     """Fill the (renderer) module weights directly from the fp8 safetensors shards.
 
@@ -329,10 +330,14 @@ def stream_fill(
                     s = f.get_tensor(k + "_scale")
                     if p.dtype == torch.float8_e4m3fn:
                         wq = w.view(torch.float8_e4m3fn)
-                        # FP8Linear stores (K,N) = transpose of the checkpoint's
-                        # (N,K) so _scaled_mm needs no runtime transpose/dup; only
-                        # 2-D linear weights are transposed (convs stay as-is).
-                        if p.dim() == 2 and p.shape[0] == w.shape[1] and p.shape[1] == w.shape[0]:
+                        # FP8Linear stores (K,N) = transpose of the legacy
+                        # checkpoint's (N,K) so _scaled_mm needs no runtime
+                        # transpose/dup; only 2-D linear weights are transposed
+                        # (convs stay as-is). Pre-baked ("k_n") shards are already
+                        # (K,N) -> straight copy, no transpose (a shape heuristic
+                        # can't distinguish square K==N orientations; the manifest
+                        # `layout` field disambiguates).
+                        if layout != "k_n" and p.dim() == 2 and p.shape[0] == w.shape[1] and p.shape[1] == w.shape[0]:
                             wq = wq.t().contiguous()
                         # fp8-resident wrapper: weight + separate per-channel scale
                         p.data.copy_(wq.to(device or p.device))
@@ -423,6 +428,34 @@ def _enable_attention(model: nn.Module, impl: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _load_fp8_manifest(config_dir: str, shards: List[str]):
+    """Read the baked fp8 manifest (fp8 key list + ``k_n`` layout) if present.
+
+    Returns ``(scale_keys, layout)``. When a manifest exists the caller skips
+    ``collect_scale_keys`` (the per-shard header scan) AND knows the 2-D fp8
+    linears are already ``(K,N)`` (no ambiguous, square-unsafe transpose).
+    Falls back to a header scan + legacy ``"n_k"`` layout for stock/pre-bake
+    repos so old checkpoints still load unchanged.
+    """
+    import json as _json
+    mpath = os.path.join(config_dir, "fp8_manifest.json")
+    if os.path.exists(mpath):
+        try:
+            with open(mpath) as fh:
+                m = _json.load(fh)
+            fw = m.get("fp8_weights")
+            if fw:
+                layout = m.get("layout", "n_k")
+                keys = {k + "_scale" for k in fw}
+                logger.info(
+                    "bernini_fp8: fp8_manifest layout=%s fp8_weights=%d (no shard scan)",
+                    layout, len(keys))
+                return keys, layout
+        except Exception as exc:  # noqa: BLE001 - never fail load on a bad manifest
+            logger.warning("bernini_fp8: manifest read failed (%s); falling back to scan", exc)
+    return collect_scale_keys(shards), "n_k"
+
+
 def bernini_shards(model_dir: str) -> List[str]:
     sub = "bernini"
     return sorted(glob.glob(os.path.join(model_dir, sub, "model-*.safetensors")))
@@ -446,8 +479,9 @@ def build_fp8_model(
             n = replace_quantisable_layers(m, device)
             logger.info("bernini_fp8: replaced %d layers in %s", n, attr)
     shards = bernini_shards(config_dir)
-    scale_keys = collect_scale_keys(shards)
-    counts = stream_fill(model, shards, scale_keys, device=device, prefixes=prefixes)
+    scale_keys, layout = _load_fp8_manifest(config_dir, shards)
+    counts = stream_fill(model, shards, scale_keys, device=device, prefixes=prefixes,
+                         layout=layout)
     logger.info("bernini_fp8: fill %s", counts)
     for attr in ("diff_dec", "diff_dec_low"):
         m = getattr(model, attr, None)
