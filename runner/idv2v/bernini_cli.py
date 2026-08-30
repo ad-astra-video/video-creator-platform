@@ -289,27 +289,17 @@ def main() -> int:
                 logger.info("turbo LoRA restored")
         if turbo and "num_inference_steps" not in job:
             ns.num_inference_steps = 4
-        # The turbo (4-step) LoRA is validated against DPM++2M-SDE + sgm_uniform
-        # noise, NOT UniPC; running it through UniPC produces green output.
-        # Install the recipe sampler when turbo, restore UniPC when not. All
-        # wrapped so a scheduler-swap failure never breaks a generation.
+        # Sampler: UniPC everywhere. The 4-step turbo LoRA is recipe-tuned for
+        # DPM++2M-SDE + sgm_uniform, but that path renders garbage post-fix
+        # ("not all green, but not a real video"). UniPC is our validated
+        # native sampler (20-step produces valid output since the
+        # scale_shift_table fix), so run the 4-step turbo on UniPC too. If
+        # UniPC+4step is also garbage, the fault is the fp8 x LoRA merge, not
+        # the sampler. (DPM++2M-SDE swap removed 2026-08-30.)
         pm = getattr(pipeline, "model", None)
-        if pm is not None and hasattr(pm, "use_unipc"):
-            try:
-                if turbo:
-                    from diffusers import DPMSolverMultistepScheduler
-                    pm.scheduler = DPMSolverMultistepScheduler.from_pretrained(
-                        ns.config, subfolder="scheduler",
-                        algorithm_type="sde-dpmsolver++",
-                        use_karras_sigmas=False,
-                    )
-                    pm.use_unipc = False
-                    logger.info("turbo: DPM++2M-SDE scheduler installed (use_unipc=False)")
-                elif not pm.use_unipc:
-                    pm.use_unipc = True  # native UniPC; sampler rebuilds it each call
-                    logger.info("non-turbo: restored UniPC sampler")
-            except Exception as _e:  # noqa: BLE001 - never break a job on sampler swap
-                logger.warning("turbo sampler swap failed (%s); leaving current sampler", _e)
+        if pm is not None and hasattr(pm, "use_unipc") and not pm.use_unipc:
+            pm.use_unipc = True
+            logger.info("sampler: UniPC (turbo=%s)", turbo)
         task_name = job.get("task_name") or ns.task_type
         if not job.get("guidance_mode"):
             mapping = FP8_TASK_GUIDANCE if is_fp8 else TASK_GUIDANCE
