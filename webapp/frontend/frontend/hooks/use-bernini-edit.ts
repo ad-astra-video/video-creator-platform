@@ -1,21 +1,34 @@
-import { useCallback, useState } from 'react'
-import { withGenerationActive } from '../lib/generation-active'
-import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicketSSE, type RunnerProgressEvent } from '../lib/direct-transport'
-import { getBlob, getBlobUrl, isWebPath, registerBlob } from '../lib/runtime/web-store'
-import { probeVideoFrames } from '../lib/video-fps'
-import { GENERATION_RECOVERY_KEY, GENERATION_RECOVERY_TS_KEY } from './use-generation'
+import { useCallback, useState } from "react";
+import { withGenerationActive } from "../lib/generation-active";
+import { logger } from "../lib/logger";
+import {
+  resolveRunner,
+  postRunnerTaskWithTicketSSE,
+  type RunnerProgressEvent,
+} from "../lib/direct-transport";
+import {
+  getBlob,
+  getBlobUrl,
+  isWebPath,
+  registerBlob,
+} from "../lib/runtime/web-store";
+import { probeVideoFrames } from "../lib/video-fps";
+import {
+  GENERATION_RECOVERY_KEY,
+  GENERATION_RECOVERY_TS_KEY,
+} from "./use-generation";
 import {
   berniniRunnerV2VBody,
   berniniRunnerR2VBody,
   berniniTaskFor,
+  berniniV2VMaxDurationMs,
   BERNINI_NATIVE_FPS,
   BERNINI_NATIVE_RESOLUTION,
   type BerniniEngine,
   type BerniniResolution,
   type BerniniOperation,
   type BerniniDeliveryTarget,
-} from '../lib/bernini-delivery'
+} from "../lib/bernini-delivery";
 
 // Edit-Video Bernini rail (use-restyle analog). The frontend decides the goal ->
 // endpoint (v2v motion-preserving edit | r2v reference-image -> video) and the
@@ -25,54 +38,64 @@ import {
 
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
-    const fr = new FileReader()
+    const fr = new FileReader();
     fr.onload = () => {
-      const url = fr.result
-      if (typeof url === 'string') {
-        const comma = url.indexOf(',')
-        resolve(comma >= 0 ? url.slice(comma + 1) : url)
+      const url = fr.result;
+      if (typeof url === "string") {
+        const comma = url.indexOf(",");
+        resolve(comma >= 0 ? url.slice(comma + 1) : url);
       } else {
-        reject(new Error('Could not read media blob'))
+        reject(new Error("Could not read media blob"));
       }
-    }
-    fr.onerror = () => reject(fr.error ?? new Error('Could not read media blob'))
-    fr.readAsDataURL(blob)
-  })
+    };
+    fr.onerror = () =>
+      reject(fr.error ?? new Error("Could not read media blob"));
+    fr.readAsDataURL(blob);
+  });
 }
 
 /** Resolve a browser asset path (web://key → Blob) to base64, or null if not resolvable. */
-async function assetToBase64(path: string | null | undefined): Promise<string | null> {
-  if (!path) return null
+async function assetToBase64(
+  path: string | null | undefined,
+): Promise<string | null> {
+  if (!path) return null;
   if (isWebPath(path)) {
-    const blob = getBlob(path)
-    return blob ? blobToBase64(blob) : null
+    const blob = getBlob(path);
+    return blob ? blobToBase64(blob) : null;
   }
-  return null
+  return null;
 }
 
 export interface BerniniEditSubmitParams {
   // The operation/goal determines the endpoint (v2v | r2v).
-  operation: Exclude<BerniniOperation, 't2v'>
+  operation: Exclude<BerniniOperation, "t2v">;
   // Source video (v2v edits it in place).
-  videoPath: string
+  videoPath: string;
   // Reference images (r2v, 1.3B multi-reference). web:// asset paths.
-  referencePaths?: string[]
-  prompt: string
-  engine: BerniniEngine
+  referencePaths?: string[];
+  prompt: string;
+  engine: BerniniEngine;
   // Native render fps; >16 asks the runner for a RIFE fps-boost post rail.
-  fps?: number
+  fps?: number;
   // Delivery resolution; above native asks for the FlashVSR post rail.
-  resolution?: BerniniResolution
-  duration?: number
-  seed?: number
-  negativePrompt?: string
+  resolution?: BerniniResolution;
+  duration?: number;
+  seed?: number;
+  negativePrompt?: string;
+  // 4-step LightX2V distill (rzgar LoRA) instead of the default 40-step render.
+  // 14B-only: the backend loads the LoRA only on the fp8 14B renderer.
+  turbo?: boolean;
+  // Explicit native denoise step count for the non-turbo path (40 = full quality).
+  // When set, threaded into the runner body so the renderer doesn't fall back to
+  // its 20-step default.
+  numInferenceSteps?: number;
   // Live per-phase progress (message + progress + step/total_steps) forwarded to
   // the caller so it can mirror the status into the chat-dock task card.
-  onProgress?: (ev: RunnerProgressEvent) => void
+  onProgress?: (ev: RunnerProgressEvent) => void;
 }
 
 export interface BerniniEditResult {
-  videoPath: string
+  videoPath: string;
 }
 
 /** What a submitBerniniEdit submission resolves to: the error (if any) that ended
@@ -81,81 +104,95 @@ export interface BerniniEditResult {
  *  to the project + mark the card 'done') — before, the videoPath only surfaced
  *  through the panel's unwired onResult and the result was never saved. */
 export interface BerniniEditOutcome {
-  error: string | null
-  videoPath: string | null
+  error: string | null;
+  videoPath: string | null;
 }
 
 interface UseBerniniEditState {
-  isEditing: boolean
-  editStatus: string
-  editError: string | null
-  result: BerniniEditResult | null
+  isEditing: boolean;
+  editStatus: string;
+  editError: string | null;
+  result: BerniniEditResult | null;
 }
 
 function getPhaseMessage(phase: string): string {
   switch (phase) {
-    case 'connecting_remote':
-    case 'sending_to_remote':
-      return 'Connecting to remote runner...'
-    case 'preprocessing':
-      return 'Preparing frames...'
-    case 'generating':
-      return 'Generating (Bernini)...'
-    case 'decoding':
-      return 'Decoding video...'
-    case 'finalizing':
-      return 'Finalizing output...'
-    case 'complete':
-      return 'Complete!'
+    case "connecting_remote":
+    case "sending_to_remote":
+      return "Connecting to remote runner...";
+    case "preprocessing":
+      return "Preparing frames...";
+    case "generating":
+      return "Generating (Bernini)...";
+    case "decoding":
+      return "Decoding video...";
+    case "finalizing":
+      return "Finalizing output...";
+    case "complete":
+      return "Complete!";
     default:
-      return 'Editing...'
+      return "Editing...";
   }
 }
 
 export function useBerniniEdit() {
   const [state, setState] = useState<UseBerniniEditState>({
     isEditing: false,
-    editStatus: '',
+    editStatus: "",
     editError: null,
     result: null,
-  })
+  });
 
   const submitBerniniEdit = useCallback(
     async (params: BerniniEditSubmitParams): Promise<BerniniEditOutcome> => {
-      if (!params.videoPath || !params.prompt) return { error: null, videoPath: null }
+      if (!params.videoPath || !params.prompt)
+        return { error: null, videoPath: null };
 
       setState({
         isEditing: true,
-        editStatus: 'Connecting to remote runner...',
+        editStatus: "Connecting to remote runner...",
         editError: null,
         result: null,
-      })
+      });
 
       // The error (if any) this submission ends with. Returned to the caller so the
       // GenSpace task card can be marked 'error' with the REAL runner message instead
       // of being stranded on 'running'.
-      let editErrorMsg: string | null = null
+      let editErrorMsg: string | null = null;
       // The delivered result video path on success (registered blob web:// key), so
       // the caller can persist it to the project and mark the card 'done'.
-      let successVideoPath: string | null = null
+      let successVideoPath: string | null = null;
 
       await withGenerationActive(async () => {
         try {
-          const spec = berniniTaskFor(params.operation)
-          const runner = await resolveRunner([spec.capability], { model: params.engine })
+          const spec = berniniTaskFor(params.operation);
+          const runner = await resolveRunner([spec.capability], {
+            model: params.engine,
+          });
           if (!runner) {
-            editErrorMsg = 'No capable Livepeer runner is currently available for Bernini editing.'
-            logger.error(`Bernini edit error: ${editErrorMsg}`)
-            setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
-            return
+            editErrorMsg =
+              "No capable Livepeer runner is currently available for Bernini editing.";
+            logger.error(`Bernini edit error: ${editErrorMsg}`);
+            setState({
+              isEditing: false,
+              editStatus: "",
+              editError: editErrorMsg,
+              result: null,
+            });
+            return;
           }
 
-          const videoB64 = await assetToBase64(params.videoPath)
+          const videoB64 = await assetToBase64(params.videoPath);
           if (!videoB64) {
-            editErrorMsg = 'Could not read the source video for this edit.'
-            logger.error(`Bernini edit error: ${editErrorMsg}`)
-            setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
-            return
+            editErrorMsg = "Could not read the source video for this edit.";
+            logger.error(`Bernini edit error: ${editErrorMsg}`);
+            setState({
+              isEditing: false,
+              editStatus: "",
+              editError: editErrorMsg,
+              result: null,
+            });
+            return;
           }
 
           const target: BerniniDeliveryTarget = {
@@ -163,110 +200,161 @@ export function useBerniniEdit() {
             resolution: params.resolution ?? BERNINI_NATIVE_RESOLUTION,
             fps: params.fps ?? BERNINI_NATIVE_FPS,
             duration: Math.min(Math.max(params.duration ?? 3, 1), 5),
-          }
+          };
 
-          // v2v covers the ENTIRE source: probe the input video's total frame count and
-          // render that many frames (native, single shot for now — chunked processing is
-          // future work informed by the seam-overlap research). If the probe fails we
-          // fall back to the native 81-frame clip. r2v keeps the native clip (no source).
-          let editTarget = target
-          if (params.operation === 'v2v') {
+          // v2v covers the ENTIRE source: probe the input video's total frame count so
+          // the backend renders that many frames. The backend auto-chunks sources longer
+          // than BERNINI_V2V_CHUNK_FRAMES (each chunk a separate native pass) - which is
+          // why v2v needs the chunk-scaled watchdog below. If the probe fails we fall
+          // back to the native 81-frame clip. r2v keeps the native clip (no source).
+          let editTarget = target;
+          // Long v2v (chunked backend): the manager splits the source into
+          // ~BERNINI_V2V_CHUNK_FRAMES windows, each its own near-native pass, so
+          // a length-N job runs ~N passes and can exceed the default 25-min SSE
+          // max-duration. Scale the watchdog ceiling by the chunk count (only
+          // here; t2v/r2v are single native clips and keep the default).
+          let v2vMaxDurationMs: number | undefined;
+          if (params.operation === "v2v") {
             const probe = await probeVideoFrames(
               getBlobUrl(params.videoPath) ?? params.videoPath,
-            )
+            );
             if (probe?.frameCount) {
-              editTarget = { ...target, numFrames: probe.frameCount }
+              editTarget = { ...target, numFrames: probe.frameCount };
+              v2vMaxDurationMs = berniniV2VMaxDurationMs(probe.frameCount);
               logger.info(
-                `[bernini-edit] v2v source probe: ${probe.frameCount} frames @ ${probe.fps ?? '?'}fps (${probe.duration}s)`,
-              )
+                `[bernini-edit] v2v watchdog maxDurationMs=${v2vMaxDurationMs} (${probe.frameCount} frames -> ${Math.ceil(probe.frameCount / 33)} chunks)`,
+              );
+              logger.info(
+                `[bernini-edit] v2v source probe: ${probe.frameCount} frames @ ${probe.fps ?? "?"}fps (${probe.duration}s)`,
+              );
             } else {
-              logger.warn('[bernini-edit] v2v frame probe failed; falling back to native clip')
+              logger.warn(
+                "[bernini-edit] v2v frame probe failed; falling back to native clip",
+              );
             }
           }
 
           const opts = {
             negativePrompt: params.negativePrompt,
             seed: params.seed,
-          }
+            turbo: params.turbo,
+            numInferenceSteps: params.numInferenceSteps,
+          };
 
-          let body: Record<string, unknown>
-          if (params.operation === 'r2v') {
-            const refB64 = (params.referencePaths ?? []).filter(Boolean)
-            const refs: string[] = []
+          let body: Record<string, unknown>;
+          if (params.operation === "r2v") {
+            const refB64 = (params.referencePaths ?? []).filter(Boolean);
+            const refs: string[] = [];
             for (const p of refB64) {
-              const b = await assetToBase64(p)
-              if (b) refs.push(b)
+              const b = await assetToBase64(p);
+              if (b) refs.push(b);
             }
             if (refs.length === 0) {
-              editErrorMsg = 'Reference-image editing (r2v) requires at least one reference image.'
-              logger.error(`Bernini edit error: ${editErrorMsg}`)
-              setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
-              return
+              editErrorMsg =
+                "Reference-image editing (r2v) requires at least one reference image.";
+              logger.error(`Bernini edit error: ${editErrorMsg}`);
+              setState({
+                isEditing: false,
+                editStatus: "",
+                editError: editErrorMsg,
+                result: null,
+              });
+              return;
             }
-            body = berniniRunnerR2VBody(params.prompt, refs, editTarget, opts)
+            body = berniniRunnerR2VBody(params.prompt, refs, editTarget, opts);
           } else {
-            body = berniniRunnerV2VBody(params.prompt, videoB64, editTarget, opts)
+            body = berniniRunnerV2VBody(
+              params.prompt,
+              videoB64,
+              editTarget,
+              opts,
+            );
           }
 
-          logger.info(`[bernini-edit] rail=${spec.task} media=base64`)
-          const res = await postRunnerTaskWithTicketSSE(runner, spec.task, body, {
-            onProgress: (ev) => {
-              const msg = getPhaseMessage(ev.stage || '')
-              const isBackbone = ev.stage === 'generating'
-              const pct = typeof ev.progress === 'number' ? ev.progress : null
-              const showPct = isBackbone && pct !== null
-              const display = showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg
-              setState(prev => ({
-                ...prev,
-                editStatus: display,
-              }))
-              params.onProgress?.({ ...ev, message: display })
+          logger.info(`[bernini-edit] rail=${spec.task} media=base64`);
+          const res = await postRunnerTaskWithTicketSSE(
+            runner,
+            spec.task,
+            body,
+            {
+              watchdog:
+                v2vMaxDurationMs !== undefined
+                  ? { maxDurationMs: v2vMaxDurationMs }
+                  : undefined,
+              onProgress: (ev) => {
+                const msg = getPhaseMessage(ev.stage || "");
+                const isBackbone = ev.stage === "generating";
+                const pct =
+                  typeof ev.progress === "number" ? ev.progress : null;
+                const showPct = isBackbone && pct !== null;
+                const display = showPct
+                  ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%`
+                  : msg;
+                setState((prev) => ({
+                  ...prev,
+                  editStatus: display,
+                }));
+                params.onProgress?.({ ...ev, message: display });
+              },
             },
-          })
+          );
 
           if (!res.mediaBlob) {
-            editErrorMsg = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
-            logger.error(`Bernini edit error: ${editErrorMsg}`)
-            setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
-            return
+            editErrorMsg = res.payload?.error
+              ? String(res.payload.error)
+              : "Runner returned no media";
+            logger.error(`Bernini edit error: ${editErrorMsg}`);
+            setState({
+              isEditing: false,
+              editStatus: "",
+              editError: editErrorMsg,
+              result: null,
+            });
+            return;
           }
 
           const videoPath = registerBlob(
             res.mediaBlob,
-            'bernini-edit.mp4',
-            (res.mediaBlob as Blob).type || 'video/mp4',
-          )
-          successVideoPath = videoPath
+            "bernini-edit.mp4",
+            (res.mediaBlob as Blob).type || "video/mp4",
+          );
+          successVideoPath = videoPath;
 
           setState({
             isEditing: false,
-            editStatus: 'Edit complete!',
+            editStatus: "Edit complete!",
             editError: null,
             result: { videoPath },
-          })
+          });
         } catch (err) {
-          editErrorMsg = err instanceof Error ? err.message : 'Bernini edit failed'
-          logger.error(`Bernini edit error: ${editErrorMsg}`)
-          setState({ isEditing: false, editStatus: '', editError: editErrorMsg, result: null })
+          editErrorMsg =
+            err instanceof Error ? err.message : "Bernini edit failed";
+          logger.error(`Bernini edit error: ${editErrorMsg}`);
+          setState({
+            isEditing: false,
+            editStatus: "",
+            editError: editErrorMsg,
+            result: null,
+          });
         } finally {
-          window.localStorage.removeItem(GENERATION_RECOVERY_KEY)
-          window.localStorage.removeItem(GENERATION_RECOVERY_TS_KEY)
+          window.localStorage.removeItem(GENERATION_RECOVERY_KEY);
+          window.localStorage.removeItem(GENERATION_RECOVERY_TS_KEY);
         }
-      })
+      });
 
-      return { error: editErrorMsg, videoPath: successVideoPath }
+      return { error: editErrorMsg, videoPath: successVideoPath };
     },
     [],
-  )
+  );
 
   const resetBerniniEdit = useCallback(() => {
     setState({
       isEditing: false,
-      editStatus: '',
+      editStatus: "",
       editError: null,
       result: null,
-    })
-  }, [])
+    });
+  }, []);
 
   return {
     submitBerniniEdit,
@@ -275,5 +363,5 @@ export function useBerniniEdit() {
     editStatus: state.editStatus,
     editError: state.editError,
     berniniEditResult: state.result,
-  }
+  };
 }

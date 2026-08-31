@@ -63,6 +63,7 @@ const TASK_ENDPOINTS: Record<string, string> = {
   'restyle:style-frame': '/video-creator/v1/style-frame',
   'ic-lora': '/video-creator/v1/ic-lora-generate',
   'ic-lora:extract-conditioning': '/video-creator/v1/extract-conditioning',
+  'ic-lora-restyle': '/video-creator/v1/ic-lora-restyle',
   edit: '/video-creator/v1/edit',
   layer: '/video-creator/v1/layer',
   // Whole-frame klein styling runs on the IMAGE worker (capability `style-frame`) —
@@ -154,6 +155,7 @@ export function makeJobId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
   return 'job-' + Math.random().toString(36).slice(2) + Date.now().toString(36)
 }
+
 
 // ── Analysis-result cache keyed by image content hash ───────────────────────
 // Analysis-style runner calls (suggest-layers, SAM3 subject segmentation) are
@@ -1035,7 +1037,14 @@ export async function postRunnerTaskWithTicketSSE(
   runner: RunnerDto,
   task: string,
   body: unknown,
-  opts?: { signal?: AbortSignal; onProgress?: (ev: RunnerProgressEvent) => void },
+  opts?: {
+    signal?: AbortSignal;
+    onProgress?: (ev: RunnerProgressEvent) => void;
+    /** Watchdog overrides fed to readSSEStream. Long chunked v2v runs well past the
+     *  default 25-min max-duration, so the caller scales maxDurationMs by the chunk
+     *  count; unset keeps the default (25 min) and the 90-s idle timeout. */
+    watchdog?: { maxDurationMs?: number; idleTimeoutMs?: number };
+  },
 ): Promise<{ payload: Record<string, unknown>; mediaBlob?: Blob }> {
   const res = await postToRunnerWithTicket(runner, task, body, { ...opts, sse: true })
   if (!res.ok) {
@@ -1066,6 +1075,7 @@ export async function postRunnerTaskWithTicketSSE(
           progress: typeof p.progress === 'number' ? p.progress : null,
           step: typeof p.step === 'number' ? p.step : null,
           total_steps: typeof p.total_steps === 'number' ? p.total_steps : null,
+          preview: typeof p.preview === 'string' ? p.preview : null,
         })
       } else if (event === 'complete') {
         settled = true
@@ -1081,7 +1091,7 @@ export async function postRunnerTaskWithTicketSSE(
         try { msg = String((JSON.parse(data) as { error?: unknown }).error ?? msg) } catch { /* keep default */ }
         reject(new Error(msg))
       }
-    }).then(() => {
+    }, opts?.watchdog).then(() => {
       // Stream ended without a terminal complete/error event — connection dropped
       // (proxy idle timeout, runner exit) — surface a clear error instead of hanging.
       if (!settled) { settled = true; reject(new Error('Runner SSE connection closed before it completed')) }
@@ -1279,6 +1289,88 @@ export async function enhancePromptViaRunner(
 }
 
 /**
+ * Extract an IC-LoRA conditioning frame (canny/depth preview) via a Livepeer runner.
+ * Like prompt-enhance this returns JSON (two data: URLs — the conditioning + original
+ * frame), not a media blob. The runner's `/video-creator/v1/extract-conditioning`
+ * requires the source video's real bytes under `video_base64` (a browser web:// key
+ * is unreadable remotely). Rendered in the IC-LoRA panel's Conditioning column.
+ */
+export async function extractConditioningViaRunner(
+  runner: RunnerDto,
+  body: { video_base64: string; frame_time?: number; conditioning_type?: string },
+  opts?: { signal?: AbortSignal },
+): Promise<{ conditioning: string; original: string; conditioningType?: string; frameTime?: number }> {
+  const res = await postToRunnerWithTicket(runner, 'ic-lora:extract-conditioning', body, opts)
+  if (!res.ok) {
+    let msg = `Conditioning extraction failed (${res.status})`
+    try {
+      const errJson = (await res.json()) as { error?: unknown } | null
+      if (typeof errJson?.error === 'string') msg = errJson.error
+    } catch { /* keep status message */ }
+    throw new Error(msg)
+  }
+  const data = (await res.json().catch(() => null)) as
+    | { conditioning?: unknown; original?: unknown; conditioning_type?: unknown; frame_time?: unknown } | null
+  if (typeof data?.conditioning !== 'string' || !data.conditioning) {
+    throw new Error('Runner returned no conditioning frame')
+  }
+  return {
+    conditioning: data.conditioning,
+    original: typeof data.original === 'string' ? data.original : '',
+    conditioningType: typeof data.conditioning_type === 'string' ? data.conditioning_type : undefined,
+    frameTime: typeof data.frame_time === 'number' ? data.frame_time : undefined,
+  }
+}
+
+/**
+ * Full-video LTX IC-LoRA restyle via a Livepeer runner.
+ *
+ * Runs the IC-LoRA pipeline over the ENTIRE conditioning video
+ * (``/video-creator/v1/ic-lora-restyle``, capability `ic-lora-restyle`) — the
+ * frame-aligned full-clip restyle, unlike `ic-lora-generate` which only uses the
+ * first frame as an i2v seed. The control video's real bytes go under `video_base64`
+ * (a browser web:// key is unreadable remotely). Returns the restyled video Blob.
+ */
+export async function icLoraRestyleViaRunner(
+  runner: RunnerDto,
+  body: {
+    prompt: string
+    video_base64: string
+    conditioning_type?: string
+    conditioning_strength?: number
+    resolution?: unknown
+    fps?: number
+    seed?: number
+    skip_stage_2?: boolean
+    resolution_factor?: number
+    loras?: Array<{ id?: string; filename?: string; scale?: number } | { custom_url: string; scale?: number; sha256?: string; hf_token?: string }>
+  },
+  opts?: { signal?: AbortSignal },
+): Promise<{ blob: Blob; generationId?: string; contentType: string }> {
+  const res = await postToRunnerWithTicket(runner, 'ic-lora-restyle', body, opts)
+  if (!res.ok) {
+    let detail = `IC-LoRA restyle failed (${res.status})`
+    try {
+      const j = (await res.json()) as { error?: unknown } | null
+      if (j && typeof j.error === 'string') detail = j.error
+    } catch { /* keep status message */ }
+    throw new Error(detail)
+  }
+  const data = (await res.json().catch(() => null)) as
+    | { video_base64?: unknown; content_type?: unknown; generation_id?: unknown } | null
+  const b64 = data?.video_base64
+  if (typeof b64 !== 'string' || !b64) {
+    throw new Error('Runner returned no restyled video')
+  }
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  const contentType = typeof data.content_type === 'string' && data.content_type ? data.content_type : 'video/mp4'
+  const generationId = typeof data.generation_id === 'string' ? data.generation_id : undefined
+  return { blob: new Blob([bytes], { type: contentType }), contentType, generationId }
+}
+
+/**
  * Livepeer image generation over HTTP with the full payment handshake
  * (postToRunnerWithTicket: Livepeer-Payer-Address -> 402+params -> /sign-ticket ->
  * retry with Livepeer-Payment + Livepeer-Segment). The orchestrator signs the
@@ -1330,6 +1422,8 @@ export interface RunnerProgressEvent {
   step?: number | null
   /** Total denoising steps for the current job. */
   total_steps?: number | null
+  /** Ephemeral per-chunk preview (base64 JPEG), shown in the task card while running. */
+  preview?: string | null
 }
 
 
