@@ -312,6 +312,35 @@ class BerniniManager:
             return result
 
     # -- single-shot resident CLI call ---------------------------------------
+    async def _drain_stale_stdout(self) -> None:
+        """Discard orphaned result lines left in the resident CLI's stdout pipe.
+
+        The resident subprocess is shared across jobs and chunks. If a prior
+        request was aborted (e.g. the client 504'd) its CLI result line is
+        never consumed and sits in the pipe; the next _run_one would otherwise
+        misread it as ITS result, desyncing the chunk loop (unanchored chunks,
+        missing src_chunk files, mismatched anchor exports). Drain before each
+        write so only fresh results are seen. Short timeouts: we discard only
+        what is ALREADY buffered from a prior write, never a result for the
+        job that has not been sent yet.
+        """
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        for _ in range(64):
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), 0.05)
+            except asyncio.TimeoutError:
+                return
+            except Exception:  # noqa: BLE001 - stream unusable
+                return
+            if not raw:
+                return
+            text = raw.decode("utf-8", "replace").strip()
+            if text:
+                self._stage("gen: drained stale stdout line (%d B) %r" %
+                            (len(raw), text[:80]))
+
     async def _run_one(self, job: dict[str, Any], timeout: float = JOB_TIMEOUT,
                        progress_cb: Optional[Any] = None) -> dict[str, Any]:
         """Write one job to the resident CLI and read its JSONL result.
@@ -322,6 +351,9 @@ class BerniniManager:
         if self._proc is None or self._proc.stdin is None or \
                 self._proc.stdout is None:
             raise BerniniError("berni subprocess unavailable")
+        # Clear any orphaned result line from an aborted prior job before
+        # writing ours, so it can't be misread as our result.
+        await self._drain_stale_stdout()
         line = json.dumps(job, ensure_ascii=False) + "\n"
 
         async def _read_result() -> bytes:
