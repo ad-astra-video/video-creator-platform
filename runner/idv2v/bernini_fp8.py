@@ -536,11 +536,25 @@ def build_fp8_model(
         return None
     for _n in _skip_init:
         setattr(_torch_init, _n, _noop_init)
+    # transformers' _initialize_weights/_init_weights call the DIRECT tensor
+    # methods (weight.data.normal_(...)), which BYPASS torch.nn.init - so the
+    # torch.nn.init patch alone leaves that full normal_ cost running (~34s
+    # on this model). Neutralise the direct Tensor.normal_/uniform_ methods
+    # for the construction window too. All such calls hit weight params that
+    # stream_fill overwrites (missing:0); bias/padding_idx zero_ still runs.
+    _T = torch.Tensor
+    _saved_tmethod = {"normal_": _T.normal_, "uniform_": _T.uniform_}
+    def _noop_self(self, *a, **k):
+        return self
+    for _m in _saved_tmethod:
+        setattr(_T, _m, _noop_self)
     try:
         model = BerniniModel(config)
     finally:
         for _n, _f in _saved_init.items():
             setattr(_torch_init, _n, _f)
+        for _m, _f in _saved_tmethod.items():
+            setattr(_T, _m, _f)
     # Swap quantisable layers inside the two renderer /GEN_Wanx22/ containers only
     # (mllm/t5/connector/vit_decoder stay bf16 plain weights).
     for attr in ("diff_dec", "diff_dec_low"):
