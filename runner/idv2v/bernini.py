@@ -28,6 +28,7 @@ Wire format (mirrors bernini_cli.py):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -65,6 +66,18 @@ NATIVE_FRAMES = 33
 # is speed-preserving and yields the correct duration. Keep aligned with
 # BERNINI_NATIVE_FPS in the frontend.
 NATIVE_FPS = 16
+
+# Number of the PREVIOUS chunk's last OUTPUT frames to pass as reference images
+# (`images=[...]`) to the next chunk. Bernini v2v is source-driven — the
+# contiguous source window already carries MOTION across the boundary — so the
+# seam is an APPEARANCE pop: each chunk independently re-restyles the boundary
+# source frames, and a single still (prev_last.png) under-constrains the edit.
+# Anchoring on the model's own last N output frames (an H3-style continuation
+# window, e.g. 5 frames like MiniMax H3 "Fast") pins the restyled scene (the
+# warehouse) across the boundary instead of re-hallucinating it. Keep the
+# source `video` (motion) and single `image` slot intact; this widens only the
+# `images` reference anchor.
+CHUNK_REF_FRAMES = 5
 
 
 class BerniniError(RuntimeError):
@@ -451,12 +464,24 @@ class BerniniManager:
         chunk_srcs: list[str] = []
         chunk_outs: list[str] = []
         ref_files: list[str] = []
+        preview_files: list[str] = []
         listfile = os.path.join(base, "concat.list")
         try:
             self._stage("gen: chunks=%d total=%d fpc=%d src=%s" %
                         (n_chunks, total, frames_per, src))
             prev_out: Optional[str] = None
             prev_frames: int = 0
+            # --- chunk-aggregate progress ------------------------------------
+            # Multi-chunk v2v renders n_chunks chunks, each running its own
+            # denoise loop. The CLI reports per-chunk step/total (resets to
+            # 0 each chunk), which would make the frontend bar bounce 0..1 N
+            # times. We instead relay a CUMULATIVE step/total spanning ALL
+            # chunks (total = n_chunks * per-chunk steps, learned from the
+            # per-chunk CLI events) plus a monotonic absolute fraction, so the
+            # frontend shows one accurate progress bar for the whole job.
+            _steps_per: list = [None]  # effective per-chunk denoise steps
+            def _scale_frac(f):
+                return 0.05 + 0.90 * min(max(float(f), 0.0), 1.0)
             for k in range(n_chunks):
                 start = k * frames_per
                 end = min((k + 1) * frames_per, total)
@@ -467,8 +492,15 @@ class BerniniManager:
                             (k + 1, n_chunks, start, end, length))
                 if progress_cb is not None:
                     try:
-                        progress_cb({"chunk": k + 1, "chunks": n_chunks,
-                                     "frames_done": min((k + 1) * frames_per, total)})
+                        _ev = {"chunk": k + 1, "chunks": n_chunks,
+                               "frames_done": min((k + 1) * frames_per, total)}
+                        if _steps_per[0]:
+                            _to = n_chunks * _steps_per[0]
+                            _base = k * _steps_per[0]
+                            _ev["step"] = _base
+                            _ev["total"] = _to
+                            _ev["fraction"] = round(_scale_frac(_base / _to), 4)
+                        progress_cb(_ev)
                     except Exception:  # noqa: BLE001 - never break the job
                         pass
                 # extract the exact source window, re-timed onto the native
@@ -490,24 +522,78 @@ class BerniniManager:
                 sub_job["num_frames"] = length
                 sub_job["output"] = out_k
                 if prev_out and prev_frames > 0:
-                    # Anchor appearance to the PREVIOUS chunk's last OUTPUT
-                    # frame so the restyled scene (e.g. the warehouse) persists
-                    # across the boundary instead of being re-hallucinated.
-                    ref = os.path.join(base, f"ref_chunk_{k:03d}.png")
+                    # Anchor appearance to the PREVIOUS chunk's last
+                    # CHUNK_REF_FRAMES OUTPUT frames (H3-style continuation
+                    # window) so the restyled scene (e.g. the warehouse)
+                    # persists across the boundary instead of being
+                    # re-hallucinated. A window, not a single still, pins the
+                    # edit's look AND its recent state. MOTION is not the
+                    # concern here — the contiguous source window drives it via
+                    # v2v control — so this widens only the appearance anchor.
+                    nref = min(CHUNK_REF_FRAMES, max(int(prev_frames), 1))
+                    refs: list[str] = []
                     try:
-                        await asyncio.to_thread(
-                            _export_last_frame, prev_out, prev_frames, ref)
-                        sub_job["images"] = [ref]
-                        ref_files.append(ref)
-                        self._stage("gen: chunk %d anchored -> %s" % (k + 1, ref))
+                        base_idx = max(int(prev_frames) - nref, 0)
+                        for i in range(nref):
+                            ref = os.path.join(
+                                base, f"ref_chunk_{k:03d}_{i:02d}.png")
+                            await asyncio.to_thread(
+                                _export_frame, prev_out, base_idx + i, ref)
+                            refs.append(ref)
+                        sub_job["images"] = refs
+                        ref_files.extend(refs)
+                        self._stage(
+                            "gen: chunk %d anchored -> %d frames (out idx %d..%d)"
+                            % (k + 1, nref, base_idx, max(base_idx + nref - 1, 0)))
                     except Exception as exc:  # noqa: BLE001
                         # A failed anchor export must not kill the whole
                         # multi-chunk job; render this chunk unanchored.
+                        refs.clear()
                         self._stage("gen: anchor export failed (%r) - unanchored" %
                                     (exc,))
-                result = await self._run_one(sub_job, timeout, progress_cb)
+                def _chunk_prog(info, _k=k, _steps_per=_steps_per,
+                                _scale_frac=_scale_frac, _n_chunks=n_chunks,
+                                _cb=progress_cb):
+                    if not isinstance(info, dict):
+                        return
+                    if isinstance(info.get("step"), int) and \
+                            isinstance(info.get("total"), int) and info.get("total"):
+                        if _steps_per[0] is None:
+                            _steps_per[0] = info["total"]
+                        _to = _n_chunks * _steps_per[0]
+                        if _to <= 0:
+                            _cb(info)
+                            return
+                        _cum = _k * _steps_per[0] + info["step"]
+                        _cb({"type": "progress", "step": _cum, "total": _to,
+                             "fraction": round(_scale_frac(_cum / _to), 4)})
+                    else:
+                        _cb(info)
+                result = await self._run_one(
+                    sub_job, timeout,
+                    _chunk_prog if progress_cb is not None else None)
                 prev_out = out_k
                 prev_frames = result.get("frames") or length
+                # Preview: after each chunk lands, surface a small ephemeral still
+                # so the user sees every chunk complete in the chat card (each new
+                # chunk's preview replaces the last; the client removes it on done).
+                if progress_cb is not None:
+                    try:
+                        _pvf = os.path.join(base, f"pv_chunk_{k:03d}.jpg")
+                        _pv = _export_preview_jpg(out_k, prev_frames, _pvf)
+                        if _pv:
+                            preview_files.append(_pvf)
+                            progress_cb({"type": "preview", "chunk": k + 1,
+                                         "chunks": n_chunks,
+                                         "preview": _pv})
+                        else:
+                            try:
+                                if os.path.exists(_pvf):
+                                    os.remove(_pvf)
+                            except OSError:
+                                pass
+                    except Exception as exc:  # noqa: BLE001
+                        self._stage("gen: preview export failed (%r)" % (exc,))
             # concatenate the per-chunk outputs into the final file
             with open(listfile, "w") as f:
                 for o in chunk_outs:
@@ -532,7 +618,7 @@ class BerniniManager:
                     "frames": total, "task": job.get("task_name"),
                     "out_fps": src_fps}
         finally:
-            for pth in chunk_srcs + chunk_outs + ref_files:
+            for pth in chunk_srcs + chunk_outs + ref_files + preview_files:
                 try:
                     if os.path.exists(pth):
                         os.remove(pth)
@@ -636,6 +722,21 @@ def _run_ffmpeg(args: list, timeout: float = 300) -> None:
         raise BerniniError(f"ffmpeg failed ({proc.returncode}): {detail}")
 
 
+def _export_frame(src: str, idx: int, out_png: str) -> None:
+    """Write frame index ``idx`` of ``src`` to ``out_png``.
+
+    Used to build the multi-frame cross-chunk anchor: the previous chunk's last
+    ``CHUNK_REF_FRAMES`` output frames become the ``images`` reference list for
+    the next chunk, so the restyled scene carries across the boundary instead
+    of being re-hallucinated per chunk.
+    """
+    _run_ffmpeg([
+        "ffmpeg", "-y", "-i", src,
+        "-vf", f"select='eq(n\\,{max(int(idx), 0)})'",
+        "-frames:v", "1", out_png,
+    ])
+
+
 def _export_last_frame(src: str, nframes: int, out_png: str) -> None:
     """Write the last frame (index ``nframes-1``) of ``src`` to ``out_png``.
 
@@ -650,6 +751,26 @@ def _export_last_frame(src: str, nframes: int, out_png: str) -> None:
         "-vf", f"select='eq(n\,{max(nframes - 1, 0)})'",
         "-frames:v", "1", out_png,
     ])
+
+
+def _export_preview_jpg(src: str, nframes: int, out_jpg: str,
+                        max_w: int = 320) -> str:
+    """Export a small JPEG preview (base64) - a mid-frame of (src) downscaled
+    to (max_w) wide - used to surface each finished chunk to the frontend as
+    an ephemeral still in the chat task card. Never raises; returns "" on any
+    failure so a preview problem can never affect the render job."""
+    try:
+        n = max(int(nframes) - 1, 0)
+        mid = n // 2
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", src,
+            "-vf", f"select='eq(n\\,{mid})',scale={max_w}:-2",
+            "-frames:v", "1", "-q:v", "5", out_jpg,
+        ])
+        with open(out_jpg, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _probe_frames(path: str) -> Optional[int]:
