@@ -79,6 +79,14 @@ NATIVE_FPS = 16
 # `images` reference anchor.
 CHUNK_REF_FRAMES = 5
 
+# Appearance-anchor weight used for cross-chunk reference frames. Anchoring on
+# the previous chunk's OUTPUT frames also carries that chunk's synthesized
+# pose/motion, which on 1.3B (softer motion control) nudges the new chunk's
+# motion away from pure source-following. Dialed down from the default omega_img
+# (6.5) so the source v2v control reasserts the intended motion, at a small
+# appearance-carry cost at the seam.
+CHUNK_ANCHOR_OMEGA_IMG = 5.0
+
 
 class BerniniError(RuntimeError):
     pass
@@ -541,6 +549,7 @@ class BerniniManager:
                                 _export_frame, prev_out, base_idx + i, ref)
                             refs.append(ref)
                         sub_job["images"] = refs
+                        sub_job["omega_img"] = CHUNK_ANCHOR_OMEGA_IMG
                         ref_files.extend(refs)
                         self._stage(
                             "gen: chunk %d anchored -> %d frames (out idx %d..%d)"
