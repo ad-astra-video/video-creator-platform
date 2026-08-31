@@ -142,7 +142,7 @@ def _arg_defaults() -> argparse.Namespace:
     ns.max_image_size = 848
     ns.height = 480
     ns.width = 848
-    ns.num_inference_steps = 20
+    ns.num_inference_steps = 40  # full-quality native default
     ns.guidance_mode = "rv2v"
     ns.omega_vid = 1.25
     ns.omega_img = 6.5
@@ -277,7 +277,7 @@ def main() -> int:
         # Turbo (4-step rzgar LoRA + DPM++2M-SDE sgm_uniform) re-enabled
         # 2026-08-30: the green was NOT the LoRA/sampler/fp8 — it was the
         # scale_shift_table uint8-plain-copy bug in stream_fill (bernini_fp8.py,
-        # fixed). Native 20-step UniPC stays the default; a job with
+        # fixed). Native 40-step UniPC stays the default; a job with
         # "turbo": true goes 4-step via TurboLora + DPM++2M-SDE below.
         turbo = bool(job.get("turbo"))
         if tl is not None:
