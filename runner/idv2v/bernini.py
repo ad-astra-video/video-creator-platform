@@ -77,7 +77,7 @@ NATIVE_FPS = 16
 # warehouse) across the boundary instead of re-hallucinating it. Keep the
 # source `video` (motion) and single `image` slot intact; this widens only the
 # `images` reference anchor.
-CHUNK_REF_FRAMES = 5
+CHUNK_REF_FRAMES = 4
 
 # Appearance-anchor weight used for cross-chunk reference frames. Anchoring on
 # the previous chunk's OUTPUT frames also carries that chunk's synthesized
