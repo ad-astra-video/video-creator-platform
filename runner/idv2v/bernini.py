@@ -87,6 +87,15 @@ CHUNK_REF_FRAMES = 4
 # appearance-carry cost at the seam.
 CHUNK_ANCHOR_OMEGA_IMG = 4.5  # original bernini default omega_img (anchored chunks)
 
+# Keep chunk 0's FIRST restyled output frame as a persistent GLOBAL identity
+# anchor (a "global sink"), re-fed into every subsequent chunk's `images`
+# reference alongside the local seam tail. Purpose: lock long edits to the
+# established restyle instead of letting the look drift chunk-to-chunk
+# (JoyAI-Video-Edit "global sink"; MoCha-LD long-range context). The global
+# frame trades out the OLDEST local-tail slot so the total `images` count stays
+# at CHUNK_REF_FRAMES -> no extra VRAM on the 14B/32GB OOM ceiling.
+CHUNK_GLOBAL_ANCHOR = True
+
 
 class BerniniError(RuntimeError):
     pass
@@ -484,12 +493,15 @@ class BerniniManager:
         (e.g. 30 -> 29), a sub-frame error. Outputs are concatenated back to
         src_fps by the final concat remap, restoring the source rate.
 
-        Consistency across chunks: chunk 0 anchors on the raw source; every
-        later chunk is additionally conditioned on the PREVIOUS chunk's last
-        OUTPUT frame, passed as a reference image (``images=[prev_last.png]``),
-        so scene content the edit introduces (e.g. a restyled background)
-        carries across the boundary instead of being re-hallucinated per chunk.
-        The chunk's own source window still drives motion via v2v control.
+        Consistency across chunks: chunk 0 anchors on the raw source and its
+        first restyled OUTPUT frame becomes a GLOBAL identity anchor; every
+        later chunk is additionally conditioned on that persistent chunk-0
+        frame PLUS the PREVIOUS chunk's last CHUNK_REF_FRAMES OUTPUT frames,
+        passed as reference images (``images=[...]``), so scene content the
+        edit introduces (e.g. a restyled background) carries across the
+        boundary (local seam) and stays locked to the established look
+        (long-range identity) instead of drifting per chunk. The chunk's own
+        source window still drives motion via v2v control.
         """
         video = job["video"]
         src = video[0] if isinstance(video, (list, tuple)) else video
@@ -511,6 +523,7 @@ class BerniniManager:
                         (n_chunks, total, frames_per, src))
             prev_out: Optional[str] = None
             prev_frames: int = 0
+            global_ref: Optional[str] = None  # chunk-0 frame, persistent identity anchor
             # --- chunk-aggregate progress ------------------------------------
             # Multi-chunk v2v renders n_chunks chunks, each running its own
             # denoise loop. The CLI reports per-chunk step/total (resets to
@@ -570,11 +583,19 @@ class BerniniManager:
                     # edit's look AND its recent state. MOTION is not the
                     # concern here — the contiguous source window drives it via
                     # v2v control — so this widens only the appearance anchor.
+                    # When CHUNK_GLOBAL_ANCHOR is on, the persistent chunk-0
+                    # frame is prepended (first) and the OLDEST local tail
+                    # frame is dropped, keeping the total `images` count at
+                    # CHUNK_REF_FRAMES so the 14B/32GB VRAM budget is unchanged.
                     nref = min(CHUNK_REF_FRAMES, max(int(prev_frames), 1))
                     refs: list[str] = []
                     try:
-                        base_idx = max(int(prev_frames) - nref, 0)
-                        for i in range(nref):
+                        n_tail = nref
+                        if global_ref and nref > 1:
+                            refs.append(global_ref)   # long-range identity pin
+                            n_tail = nref - 1         # drop oldest local tail frame
+                        base_idx = max(int(prev_frames) - n_tail, 0)
+                        for i in range(n_tail):
                             ref = os.path.join(
                                 base, f"ref_chunk_{k:03d}_{i:02d}.png")
                             await asyncio.to_thread(
@@ -584,8 +605,10 @@ class BerniniManager:
                         sub_job["omega_img"] = CHUNK_ANCHOR_OMEGA_IMG
                         ref_files.extend(refs)
                         self._stage(
-                            "gen: chunk %d anchored -> %d frames (out idx %d..%d)"
-                            % (k + 1, nref, base_idx, max(base_idx + nref - 1, 0)))
+                            "gen: chunk %d anchored -> %d frames (global=%s "
+                            "tail=%d out idx %d..%d)" %
+                            (k + 1, len(refs), bool(global_ref), n_tail,
+                             base_idx, max(base_idx + n_tail - 1, 0)))
                     except Exception as exc:  # noqa: BLE001
                         # A failed anchor export must not kill the whole
                         # multi-chunk job; render this chunk unanchored.
@@ -615,6 +638,21 @@ class BerniniManager:
                     _chunk_prog if progress_cb is not None else None)
                 prev_out = out_k
                 prev_frames = result.get("frames") or length
+                # Global identity anchor: keep chunk 0's FIRST restyled frame
+                # as a persistent reference for every later chunk (identity /
+                # long-range drift pin). Exported once from chunk 0, then
+                # reused on all k>0 anchors.
+                if global_ref is None and prev_frames > 0 and CHUNK_GLOBAL_ANCHOR:
+                    try:
+                        global_ref = os.path.join(base, "ref_global_000.png")
+                        await asyncio.to_thread(
+                            _export_frame, prev_out, 0, global_ref)
+                        ref_files.append(global_ref)
+                        self._stage("gen: global anchor set from chunk 0 frame 0")
+                    except Exception as exc:  # noqa: BLE001
+                        global_ref = None
+                        self._stage(
+                            "gen: global anchor export failed (%r)" % (exc,))
                 # Preview: after each chunk lands, surface a small ephemeral still
                 # so the user sees every chunk complete in the chat card (each new
                 # chunk's preview replaces the last; the client removes it on done).
