@@ -27,7 +27,7 @@ Request field reference (all optional except ``prompt``/``output``):
       "height": 0, "width": 0,               # 0/0 => follow source media / native
       "num_inference_steps": 40, "fps": 16, "seed": 42,
       "guidance_mode": null,                 # default derived from task_name
-      "omega_vid": 1.25, "omega_img": 6.5, "omega_txt": 4.0, "omega_tgt": 0.5,
+      "omega_vid": 1.25, "omega_img": 4.5, "omega_txt": 4.0, "omega_tgt": 0.5,
       "omega_scale": 1.0, "flow_shift": 5.0, "eta": 0.5, "momentum": 0,
       "planning_step": 25, "vit_txt_cfg": 1.2, "vit_img_cfg": 1.0,
       "vit_denoising_step": 5
@@ -145,7 +145,7 @@ def _arg_defaults() -> argparse.Namespace:
     ns.num_inference_steps = 40  # full-quality native default
     ns.guidance_mode = "rv2v"
     ns.omega_vid = 1.25
-    ns.omega_img = 6.5
+    ns.omega_img = 4.5
     ns.omega_txt = 4.0
     ns.omega_tgt = 0.5
     ns.omega_scale = 1.0

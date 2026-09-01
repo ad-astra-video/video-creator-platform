@@ -85,7 +85,7 @@ CHUNK_REF_FRAMES = 4
 # motion away from pure source-following. Dialed down from the default omega_img
 # (6.5) so the source v2v control reasserts the intended motion, at a small
 # appearance-carry cost at the seam.
-CHUNK_ANCHOR_OMEGA_IMG = 6.5  # default omega_img (anchored chunks use the stock img weight)
+CHUNK_ANCHOR_OMEGA_IMG = 4.5  # original bernini default omega_img (anchored chunks)
 
 
 class BerniniError(RuntimeError):
