@@ -87,7 +87,7 @@ CHUNK_REF_FRAMES = 4
 # appearance-carry cost at the seam.
 CHUNK_ANCHOR_OMEGA_IMG = 4.5  # original bernini default omega_img (anchored chunks)
 
-# Keep chunk 0's FIRST restyled output frame as a persistent GLOBAL identity
+# Keep chunk 0's LAST restyled output frame as a persistent GLOBAL identity
 # anchor (a "global sink"), re-fed into every subsequent chunk's `images`
 # reference alongside the local seam tail. Purpose: lock long edits to the
 # established restyle instead of letting the look drift chunk-to-chunk
@@ -494,7 +494,7 @@ class BerniniManager:
         src_fps by the final concat remap, restoring the source rate.
 
         Consistency across chunks: chunk 0 anchors on the raw source and its
-        first restyled OUTPUT frame becomes a GLOBAL identity anchor; every
+        last restyled OUTPUT frame becomes a GLOBAL identity anchor; every
         later chunk is additionally conditioned on that persistent chunk-0
         frame PLUS the PREVIOUS chunk's last CHUNK_REF_FRAMES OUTPUT frames,
         passed as reference images (``images=[...]``), so scene content the
@@ -645,10 +645,19 @@ class BerniniManager:
                 if global_ref is None and prev_frames > 0 and CHUNK_GLOBAL_ANCHOR:
                     try:
                         global_ref = os.path.join(base, "ref_global_000.png")
+                        # Use chunk 0's LAST frame as the global identity pin:
+                        # chunk 0 was rendered unanchored, so its own look can
+                        # drift head->tail over its frames. Pinning on frame 0
+                        # made the first anchored chunk pull against chunk 0's
+                        # own tail (both refs from the same chunk), popping the
+                        # 1->2 seam. The last frame agrees with the tail region
+                        # that chunk and its successors actually continue.
                         await asyncio.to_thread(
-                            _export_frame, prev_out, 0, global_ref)
+                            _export_frame, prev_out,
+                            max(int(prev_frames) - 1, 0), global_ref)
                         ref_files.append(global_ref)
-                        self._stage("gen: global anchor set from chunk 0 frame 0")
+                        self._stage(
+                            "gen: global anchor set from chunk 0 last frame")
                     except Exception as exc:  # noqa: BLE001
                         global_ref = None
                         self._stage(
