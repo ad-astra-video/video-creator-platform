@@ -189,7 +189,30 @@ def main() -> int:
                     help="dir with rzgar high/low noise LoRA safetensors (optional)")
     args = ap.parse_args()
 
-    device = torch.device(args.device)
+    # --- Optional distributed / Ulysses sequence-parallel init --------------
+    # Enables multi-GPU Ulysses SP when launched with a multi-rank runtime
+    # (WORLD_SIZE > 1, e.g. `torchrun --nproc-per-node=2 --standalone`).
+    # Single-GPU (WORLD_SIZE unset/1) is unchanged. Ulysses size must divide
+    # the transformer's num_attention_heads (Wan14B = 40 -> 2 or 4 valid, 3 is
+    # NOT). Each rank keeps a full copy of the fp8 weights (Ulysses shards
+    # sequence/activations, not weights). The pipeline reads
+    # get_parallel_state() at forward time, so once this inits the state its
+    # attention uses the Ulysses all-to-all path automatically.
+    _world = int(os.environ.get("WORLD_SIZE", "1"))
+    _local = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    _ulys = int(os.environ.get("ULYSSES_SIZE", _world))
+    _is_root = (_world <= 1) or (_local == 0)
+    if _world > 1:
+        import torch.distributed as dist
+        logger.info("init_process_group world=%d rank=%d", _world, _local)
+        dist.init_process_group(backend="nccl")
+        device = torch.device("cuda:%d" % _local)
+        from bernini.parallel import init_parallel_state
+        init_parallel_state(ulysses_size=_ulys)
+        logger.info("Ulysses SP enabled ulysses_size=%d world=%d dp=%d",
+                    _ulys, _world, _world // _ulys)
+    else:
+        device = torch.device(args.device)
     torch.cuda.set_device(device)
 
     ns = _arg_defaults()
@@ -246,6 +269,12 @@ def main() -> int:
                         len(tl.linear), len(tl.patch))
 
     def handle(job: dict) -> dict:
+        # Under Ulysses SP every rank runs the forward (it must participate in
+        # the collectives), but only rank 0 (or the sole rank) writes the
+        # output mp4 and is allowed to return a usable result.
+        _world = int(os.environ.get("WORLD_SIZE", "1"))
+        _local = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        is_root = (_world <= 1) or (_local == 0)
         if not job.get("prompt"):
             return {"ok": False, "error": "missing 'prompt'"}
         try:
@@ -319,7 +348,7 @@ def main() -> int:
                     video=task["video"],
                     image=task["image"],
                     images=task["images"],
-                    output_path=out,
+                    output_path=(out if is_root else None),
                     system_prompt=sys_prompt,
                     **generation_kwargs(ns))
                 try:
@@ -336,7 +365,7 @@ def main() -> int:
                     video=task["video"],
                     image=task["image"],
                     images=task["images"],
-                    output_path=out,
+                    output_path=(out if is_root else None),
                     system_prompt=sys_prompt,
                     **generation_kwargs(ns))
                 try:
@@ -362,8 +391,11 @@ def main() -> int:
             sys.stdout.flush()
             continue
         result = handle(job)
-        sys.stdout.write(json.dumps(result) + "\n")
-        sys.stdout.flush()
+        # Under Ulysses SP only rank 0 emits the result line; other ranks ran
+        # their shard (collectives) and stay quiet.
+        if _is_root:
+            sys.stdout.write(json.dumps(result) + "\n")
+            sys.stdout.flush()
     return 0
 
 
