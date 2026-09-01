@@ -99,6 +99,10 @@ COPY runner/ ./runner/
 # modeling_qwen2_5_vl.py's import guard is satisfied (SDPA-backed).
 COPY runner/idv2v/attn_shim/flash_attn/ /opt/bernini/venv/lib/python3.12/site-packages/flash_attn/
 RUN /opt/bernini/venv/bin/python /app/runner/idv2v/bernini_progress_patch.py
+# Route Bernini's Wan-transformer attention through SageAttention (densely
+# fused kernel) with FA2/SDPA fallback. SageAttention is already in the Bernini
+# venv (inherited from the main venv); this only wires the dispatch.
+RUN /opt/bernini/venv/bin/python /app/runner/idv2v/bernini_sage_patch.py
 RUN mkdir -p /models && chown runneruser:runneruser /models
 USER runneruser
 
