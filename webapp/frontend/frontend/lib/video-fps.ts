@@ -80,3 +80,45 @@ export async function measureVideoFps(url: string, samples = 14): Promise<number
     v.load()
   }
 }
+
+/** Result of probing a video's duration + estimated total frame count. */
+export interface VideoProbe {
+  /** Total frame count estimate: round(duration * estimated fps). */
+  frameCount: number
+  /** Snapped frame rate estimate (measureVideoFps), or null if unmeasurable. */
+  fps: number | null
+  /** Container duration in seconds (video.duration), or null if unknown. */
+  duration: number | null
+}
+
+/**
+ * Probe a playable video URL (blob:, http(s)://, or data:) for its duration and an
+ * estimated TOTAL frame count (frameCount = round(duration * fps)). Used by the Bertini
+ * v2v rail so an edit renders the source's full timeline instead of only the native clip.
+ * DOM-only; every failure path returns null (never throws) so callers fall back to native.
+ */
+export async function probeVideoFrames(url: string): Promise<VideoProbe | null> {
+  if (typeof document === 'undefined' || typeof HTMLVideoElement === 'undefined') return null
+  const v = document.createElement('video')
+  v.muted = true
+  v.playsInline = true
+  v.preload = 'metadata'
+  v.src = url
+  let duration: number | null = null
+  try {
+    await new Promise<void>((resolve, reject) => {
+      v.onloadedmetadata = () => resolve()
+      v.onerror = () => reject(new Error('video load failed'))
+    })
+    if (Number.isFinite(v.duration) && v.duration > 0) duration = v.duration
+  } catch {
+    return null
+  } finally {
+    try { v.removeAttribute('src'); v.load() } catch { /* ignore */ }
+  }
+  if (!duration) return null
+  const fps = await measureVideoFps(url)
+  if (!fps) return null
+  const frameCount = Math.max(1, Math.round(duration * fps))
+  return { frameCount, fps, duration }
+}

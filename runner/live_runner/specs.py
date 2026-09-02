@@ -50,10 +50,13 @@ def build_extend_capability() -> dict:
         max_extend_frames = area_scaled - _WINDOW_FRAMES
         secs = max(EXTEND_MIN_SECONDS, min(EXTEND_MAX_SECONDS, max_extend_frames / EXTEND_FPS))
         table[res] = int(secs)
+    # Terse keys: this extend block rides the go-livepeer 1024-byte heartbeat
+    # metadata and is consumed only in-repo (frontend getExtendCapability /
+    # GenSpace), so we keep it compact. NOT part of the generated/openapi contract.
     return {
-        "context_window_seconds": EXTEND_CONTEXT_SECONDS,
-        "min_duration_seconds": EXTEND_MIN_SECONDS,
-        "max_duration_seconds": table,
+        "cws": EXTEND_CONTEXT_SECONDS,
+        "mins": EXTEND_MIN_SECONDS,
+        "maxs": table,
     }
 
 # Durations (seconds) offered per fps band. KEPT LEAN: this rides the orchestrator
@@ -194,6 +197,15 @@ def build_model_specs(vram_mb: int) -> list[dict]:
             "spec": {
                 "display_name": "Bernini",
                 "options": ["1.3b", "14b"],
+                # Bernini native render is 480p @ 16fps, 81 frames (~5.06s). This base
+                # matrix advertises the fps (16) and the duration that represents the
+                # native 81-frame clip, so the frontend mirrors it the same way it does
+                # LTX (video-generation-model-specs.ts). Per-engine resolution (1.3b ->
+                # 480p only; 14b -> 480p + 720p) is applied client-side at expansion.
+                "supported_resolutions_durations": {
+                    "480p": {"fps_to_durations": {"16": [5]}},
+                    "720p": {"fps_to_durations": {"16": [5]}},
+                },
             },
         },
     ]

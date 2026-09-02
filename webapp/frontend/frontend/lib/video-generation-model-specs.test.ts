@@ -32,14 +32,22 @@ describe('Bernini pipeline -> options expansion', () => {
     ])
   })
 
-  it('does not alias Bernini onto the LTX fast matrix', () => {
+  it('gives each engine its own 16fps Bernini matrix (not the LTX alias), filtered per engine', () => {
     const out = getVideoGenerationModelSpecs(
       { api_models: [], local_models: [berniniCollapsed, fast] as never[] },
       { useApiSpecs: false },
     )
-    const bern = out.find((m) => (m.pipeline as string) === '1.3b')
-    // Bernini stays marker-only (no LTX resolution/fps matrix inherited).
-    expect((bern?.spec as { supported_resolutions_durations?: unknown }).supported_resolutions_durations).toBeUndefined()
+    const one = out.find((m) => (m.pipeline as string) === '1.3b')
+    const fourteen = out.find((m) => (m.pipeline as string) === '14b')
+    const s1 = (one?.spec as { supported_resolutions_durations?: Record<string, { fps_to_durations?: Record<string, number[]> }> }).supported_resolutions_durations ?? {}
+    const s14 = (fourteen?.spec as { supported_resolutions_durations?: Record<string, { fps_to_durations?: Record<string, number[]> }> }).supported_resolutions_durations ?? {}
+    // Bernini's own limits on 16fps (its native render fps), NOT LTX's 24fps band.
+    expect(Object.keys(s1)).toEqual(['480p'])
+    expect(s1['480p']?.fps_to_durations?.['16']).toEqual([5])
+    // 14b -> 480p + 720p.
+    expect(Object.keys(s14)).toEqual(['480p', '720p'])
+    // It never inherits the LTX fast matrix (''720p' @ 24fps).
+    expect(s14['720p']?.fps_to_durations?.['24']).toBeUndefined()
   })
 
   it('keeps a bare bernini pipeline as a marker when it advertises no options', () => {

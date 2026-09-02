@@ -13,14 +13,14 @@ export type VideoGenerationAspectRatio = components['schemas']['GenerateVideoReq
 // runner/live_runner/specs.py -- build_extend_capability). The runner is the authority on how
 // many "seconds to add" it can actually run at each output resolution on its own GPU.
 export interface ExtendCapability {
-  context_window_seconds?: number
-  min_duration_seconds?: number
-  max_duration_seconds?: Record<string, number> // resolution key (e.g. "540p") -> max seconds
+  cws?: number
+  mins?: number
+  maxs?: Record<string, number> // resolution key (e.g. "540p") -> max extend seconds
 }
 
 export function getExtendCapability(item: VideoGenerationModelSpecItem): ExtendCapability | null {
   const ext = (item.spec as { extend?: ExtendCapability }).extend
-  return ext && ext.max_duration_seconds ? ext : null
+  return ext && ext.maxs ? ext : null
 }
 
 export interface VideoGenerationSettingsShape {
@@ -149,6 +149,27 @@ const BERNINI_OPTION_LABELS: Record<string, string> = {
  * generate/edit paths can filter runners by the chosen option. A "bernini" entry
  * with no options is kept as a bare marker fallback.
  */
+/** Per-engine Bernini delivery resolutions offered in Generate Video. The OpenAPI
+ * resolution union has no '480p' (it only lists 540p..2160p for the LTX rails), so
+ * these are plain strings -- Bernini's own 480p tier and the 720p tier it offers on
+ * the 14B engine all flow through the resolver as generic resolution keys. */
+const BERNINI_ENGINE_RESOLUTIONS: Record<string, string[]> = {
+  '1.3b': ['480p'],
+  '14b': ['480p', '720p'],
+}
+
+/**
+ * Fallback base matrix used when a runner hasn't advertised Bernini's limits yet.
+ * Bernini natively renders 480p @ 16fps at 81 frames (~5.06s); the runner metadata
+ * (runner/live_runner/specs.py) normally supplies this so the picker mirrors LTX.
+ * These are Bernini's OWN limits -- NEVER the LTX-2.3 alias -- and each engine's item
+ * is further filtered to its allowed resolutions (1.3b -> 480p; 14b -> 480p + 720p).
+ */
+const BERNINI_FALLBACK_MATRIX: Record<string, VideoGenerationResolutionSpec> = {
+  '480p': { fps_to_durations: { '16': [5] } },
+  '720p': { fps_to_durations: { '16': [5] } },
+}
+
 function expandBerniniOptions(modelSpecs: VideoGenerationModelSpecItem[]): VideoGenerationModelSpecItem[] {
   const out: VideoGenerationModelSpecItem[] = []
   for (const item of modelSpecs) {
@@ -158,19 +179,31 @@ function expandBerniniOptions(modelSpecs: VideoGenerationModelSpecItem[]): Video
       out.push(item)
       continue
     }
-    const spec = item.spec as unknown as { options?: string[] }
+    const spec = item.spec as unknown as {
+      options?: string[]
+      supported_resolutions_durations?: Record<string, VideoGenerationResolutionSpec>
+    }
     const opts = Array.isArray(spec.options) ? spec.options : []
     if (opts.length === 0) {
       out.push(item)
       continue
     }
+    const baseMatrix = spec.supported_resolutions_durations ?? BERNINI_FALLBACK_MATRIX
     for (const opt of opts) {
+      // Each engine item carries Bernini's own (fps=16 / ~5s) matrix, filtered to that
+      // engine's resolution policy. This is what makes 1.3b / 14b SELECTABLE in the
+      // generate-video picker (they previously expanded marker-only and were disabled).
+      const allowed: string[] = BERNINI_ENGINE_RESOLUTIONS[opt] ?? Object.keys(baseMatrix)
+      const matrix = Object.fromEntries(
+        Object.entries(baseMatrix).filter(([res]) => allowed.includes(res)),
+      ) as Record<string, VideoGenerationResolutionSpec>
       out.push({
         ...item,
         pipeline: opt as VideoGenerationModelSpecItem['pipeline'],
         spec: {
           ...(item.spec as object),
           display_name: BERNINI_OPTION_LABELS[opt] ?? opt,
+          supported_resolutions_durations: matrix,
         } as VideoGenerationModelSpecItem['spec'],
       })
     }
