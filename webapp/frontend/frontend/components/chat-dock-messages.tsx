@@ -44,12 +44,18 @@ function GenerationCard({ msg, onStopTrack }: { msg: GenerationMessage; onStopTr
             <span className="text-[10px] uppercase tracking-wide text-zinc-400">Deleted</span>
           </div>
         )}
-        {msg.status === 'running' && (
+        {msg.status === 'running' && msg.preview ? (
+          <img
+            src={`data:image/jpeg;base64,${msg.preview}`}
+            alt="Live preview"
+            className="w-full h-full object-contain"
+          />
+        ) : msg.status === 'running' ? (
           <div className="flex flex-col items-center gap-2 text-zinc-500">
             <Loader2 className="h-6 w-6 animate-spin text-emerald-400" />
             <span className="text-[10px] uppercase tracking-wide">Generating…</span>
           </div>
-        )}
+        ) : null}
         {msg.status === 'error' && (
           <div className="flex flex-col items-center gap-1 p-3 text-center">
             <AlertTriangle className="h-5 w-5 text-red-400" />

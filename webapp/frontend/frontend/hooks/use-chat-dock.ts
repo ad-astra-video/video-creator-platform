@@ -36,7 +36,7 @@ export function useChatDock() {
   }, [])
 
   const updateGeneration = useCallback(
-    (id: string, patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'progress' | 'step' | 'totalSteps' | 'statusMessage'>>) => {
+    (id: string, patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'progress' | 'step' | 'totalSteps' | 'statusMessage' | 'preview'>>) => {
       dispatch({ type: 'update_generation', id, patch })
     },
     [],

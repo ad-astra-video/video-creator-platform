@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicket, pathToBase64 } from '../lib/direct-transport'
+import { resolveRunner, postRunnerTaskWithTicketSSE, pathToBase64 } from '../lib/direct-transport'
 
 export type RetakeMode = 'replace_audio_and_video' | 'replace_video' | 'replace_audio'
 
@@ -63,22 +63,30 @@ export function useRetake() {
         return
       }
 
-      const res = await postRunnerTaskWithTicket(runner, 'retake', {
-        video_base64: videoBase64,
-        startTime: params.startTime,
-        duration: params.duration,
-        prompt: params.prompt,
-        mode: params.mode,
-        seed: 42,
-        fps: 24,
-        resolution: params.resolution,
-      }, {
-        onProgress: (ev) => {
-          if (ev.stage === 'generating') {
-            setState(prev => ({ ...prev, retakeStatus: ev.message || 'Retaking...' }))
-          }
-        },
-      })
+      let res
+      try {
+        res = await postRunnerTaskWithTicketSSE(runner, 'retake', {
+          video_base64: videoBase64,
+          startTime: params.startTime,
+          duration: params.duration,
+          prompt: params.prompt,
+          mode: params.mode,
+          seed: 42,
+          fps: 24,
+          resolution: params.resolution,
+        }, {
+          onProgress: (ev) => {
+            if (ev.stage === 'generating') {
+              setState(prev => ({ ...prev, retakeStatus: ev.message || 'Retaking...' }))
+            }
+          },
+        })
+      } catch (e) {
+        const err = e instanceof Error ? e.message : String(e)
+        logger.error(`Retake error: ${err}`)
+        setState({ isRetaking: false, retakeStatus: '', retakeError: err, result: null })
+        return
+      }
 
       if (!res.mediaBlob) {
         const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'

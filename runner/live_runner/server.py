@@ -276,6 +276,7 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
                 return await r.json()
 
         task = asyncio.create_task(_restyle())
+        last_sent = None  # (stage, step) — send once per stage / per denoise step, like _bernini_chain
         try:
             while not task.done():
                 try:
@@ -293,7 +294,17 @@ async def _restyle_chain(wm, session, token, body, progress_cb=None) -> web.Resp
                                     p = round(float(prog), 4)
                                 except (TypeError, ValueError):
                                     p = None
-                            await _send({"stage": stage, "message": message, "progress": p})
+                            step = info.get("step")
+                            step = step if isinstance(step, int) else None
+                            total = info.get("total")
+                            total = total if isinstance(total, int) else None
+                            key = (stage, step)
+                            if key != last_sent:
+                                last_sent = key
+                                await _send({
+                                    "stage": stage, "message": message, "progress": p,
+                                    "step": step, "total_steps": total,
+                                })
                 except Exception:
                     pass
                 try:
@@ -384,13 +395,21 @@ async def _bernini_chain(wm, session, token, endpoint: str, body: dict,
         task = asyncio.create_task(
             _bernini_post(session, wan_base, endpoint, rbody, token, job_id))
         last_step = -1
+        last_preview = None
         while not task.done():
             try:
                 info = await _worker_progress(session, wan_base, job_id, token)
                 step = info.get("step")
                 total = info.get("total")
-                if isinstance(step, int) and step != last_step:
-                    last_step = step
+                preview = info.get("preview")
+                preview = preview if isinstance(preview, str) and preview else None
+                step_changed = isinstance(step, int) and step != last_step
+                preview_changed = preview is not None and preview != last_preview
+                if step_changed or preview_changed:
+                    if step_changed:
+                        last_step = step
+                    if preview_changed:
+                        last_preview = preview
                     prog = info.get("progress")
                     msg = f"Step {step}/{total}" if isinstance(total, int) and total else "Generating..."
                     if progress_cb is not None:
@@ -399,8 +418,9 @@ async def _bernini_chain(wm, session, token, endpoint: str, body: dict,
                                 "stage": "generating",
                                 "message": msg,
                                 "progress": prog if isinstance(prog, (int, float)) else None,
-                                "step": step,
+                                "step": step if isinstance(step, int) else None,
                                 "total_steps": total if isinstance(total, int) else None,
+                                "preview": preview,
                             })
                         except Exception:  # noqa: BLE001
                             pass
@@ -550,6 +570,7 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
                 return await r.json()
 
         task = asyncio.create_task(_restyle())
+        last_sent = None  # (stage, step) — send once per stage / per denoise step, like _bernini_chain
         try:
             while not task.done():
                 try:
@@ -567,7 +588,17 @@ async def _ws_restyle_chain(ws, wm, session, token, request_id, job_id, body) ->
                                     p = round(float(prog), 4)
                                 except (TypeError, ValueError):
                                     p = None
-                            await _send({"stage": stage, "message": message, "progress": p})
+                            step = info.get("step")
+                            step = step if isinstance(step, int) else None
+                            total = info.get("total")
+                            total = total if isinstance(total, int) else None
+                            key = (stage, step)
+                            if key != last_sent:
+                                last_sent = key
+                                await _send({
+                                    "stage": stage, "message": message, "progress": p,
+                                    "step": step, "total_steps": total,
+                                })
                 except Exception:
                     pass
                 try:
@@ -790,7 +821,20 @@ async def handle_generic(req: web.Request) -> web.Response:
     try:
         if endpoint == "restyle":
             async def _prog(ev): await _ev("progress", ev)
-            out = await _restyle_chain(wm, session, token, body, progress_cb=_prog)
+            try:
+                out = await _restyle_chain(wm, session, token, body, progress_cb=_prog)
+                if out.status >= 400:
+                    await _ev("error", {"error": out.text or f"worker error {out.status}"})
+                else:
+                    try:
+                        await _ev("complete", json.loads(out.body.decode("utf-8")))
+                    except Exception:
+                        await _ev("error", {"error": "worker returned a non-JSON response"})
+            except Exception as exc:
+                logger.exception("restyle sse failed")
+                await _ev("error", {"error": str(exc)})
+            await resp.write_eof()
+            return resp
         elif endpoint in ("layer", "extend"):
             # Workers that emit their own text/event-stream (?sse=1):
             # image-worker /layer and /edit, ltx-worker /extend. Relay bytes
@@ -1161,6 +1205,16 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         stream=sys.stdout)
+
+    _QUIET_ACCESS_PATHS = ("/health", "/info", "/progress")
+    class _QuietAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - never drop logs on a format error
+                return True
+            return not any(p in msg for p in _QUIET_ACCESS_PATHS)
+    logging.getLogger("aiohttp.access").addFilter(_QuietAccessFilter())
     # Resolve auth token eagerly so a blank one is generated + logged once.
     config.worker_token()
     app = create_app()

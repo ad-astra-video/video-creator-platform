@@ -241,7 +241,32 @@ def set_progress(job_id, progress, stage="generating", message="",
     if total is not None:
         rec["total"] = int(total)
     with PROGRESS_LOCK:
+        # Carry the ephemeral chunk preview forward across step/stage updates so
+        # it stays visible while the job runs, and drop it at the terminal stages
+        # (complete/failed) so it is NOT retained after the job ends.
+        prev = _PROGRESS.get(job_id)
+        if prev and "preview" in prev and stage not in ("complete", "failed"):
+            rec["preview"] = prev["preview"]
         _PROGRESS[job_id] = rec
+
+
+def set_preview(job_id, preview):
+    """Attach an ephemeral preview (base64 image) to the current progress record
+    without disturbing progress/stage/step. (None) clears it."""
+    if not job_id:
+        return
+    with PROGRESS_LOCK:
+        rec = dict(_PROGRESS.get(job_id) or {
+            "progress": 0.0, "stage": "generating", "message": "", "done": False})
+        if preview is None:
+            rec.pop("preview", None)
+        else:
+            rec["preview"] = preview
+        _PROGRESS[job_id] = rec
+
+
+def clear_preview(job_id):
+    set_preview(job_id, None)
 
 
 def get_progress(job_id):

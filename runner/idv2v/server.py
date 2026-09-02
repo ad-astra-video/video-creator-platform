@@ -653,6 +653,11 @@ async def handle_bernini(request: web.Request) -> web.Response:
         def _prog(info):
             if not isinstance(info, dict):
                 return
+            if info.get("type") == "preview":
+                _pv = info.get("preview")
+                if isinstance(_pv, str) and _pv:
+                    run_mod.set_preview(job_id, _pv)
+                return
             if isinstance(info.get("step"), int) and                     isinstance(info.get("total"), int) and info.get("total"):
                 frac = 0.05 + 0.90 * (min(info["step"], info["total"]) / info["total"])
                 run_mod.set_progress(
@@ -660,10 +665,14 @@ async def handle_bernini(request: web.Request) -> web.Response:
                     f"step {info['step']}/{info['total']}",
                     step=info["step"], total=info["total"])
             elif isinstance(info.get("chunk"), int) and                     isinstance(info.get("chunks"), int):
+                _frac = info.get("fraction")
+                if not isinstance(_frac, (int, float)) or not (0.0 <= _frac <= 1.0):
+                    _frac = 0.05
                 run_mod.set_progress(
-                    job_id, 0.05, "bernini",
+                    job_id, round(min(max(_frac, 0.05), 0.95), 4), "bernini",
                     f"chunk {info['chunk']}/{info['chunks']} "
-                    f"(frames {info.get('frames_done', '?')})")
+                    f"(frames {info.get('frames_done', '?')})",
+                    step=info.get("step"), total=info.get("total"))
 
         try:
             result = await asyncio.wait_for(

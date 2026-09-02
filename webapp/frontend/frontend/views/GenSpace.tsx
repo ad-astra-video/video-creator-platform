@@ -3555,10 +3555,11 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
       const outcome = await editVideoPanelRef.current?.runEdit(prompt, {
         onProgress: (ev) => {
           if (!genId) return
-          const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string } = {}
+          const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string; preview?: string } = {}
           if (typeof ev.progress === 'number') patch.progress = Math.min(Math.max(ev.progress, 0), 1)
           if (typeof ev.step === 'number') patch.step = ev.step
           if (typeof ev.total_steps === 'number') patch.totalSteps = ev.total_steps
+          if (typeof ev.preview === 'string') patch.preview = ev.preview
           if (ev.message) patch.statusMessage = ev.message
           if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
         },
@@ -3803,10 +3804,11 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
           // request (e.g. Bernini per-denoise-step over SSE): a 0..1 value
           // plus the current step / total so the card can show a bar + "step X/Y".
           if (!genId) return
-          const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string } = {}
+          const patch: { progress?: number; step?: number; totalSteps?: number; statusMessage?: string; preview?: string } = {}
           if (typeof ev.progress === 'number') patch.progress = Math.min(Math.max(ev.progress, 0), 1)
           if (typeof ev.step === 'number') patch.step = ev.step
           if (typeof ev.total_steps === 'number') patch.totalSteps = ev.total_steps
+          if (typeof ev.preview === 'string') patch.preview = ev.preview
           if (ev.message) patch.statusMessage = ev.message
           if (Object.keys(patch).length) chat.updateGeneration(genId, patch)
         },
@@ -4011,7 +4013,7 @@ const runEnhance = useCallback(async (sourcePrompt: string) => {
   const canSubmit = !isOtherGenerationRunning && (isEditMode
     ? !!editVideoInitial.videoPath && !!prompt.trim()
     : isRetakeMode
-    ? retakeInput.ready && !!retakeInput.videoPath && !isRetaking
+    ? retakeInput.ready && !!retakeInput.videoPath
     : isExtendMode
       ? extendInput.ready && !!extendInput.videoPath && !isExtending
       : isIcLoraMode

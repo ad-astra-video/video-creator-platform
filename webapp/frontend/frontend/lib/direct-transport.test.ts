@@ -160,3 +160,4 @@ describe('image edit routing', () => {
     expect(imageEditCapability('zimage', false)).toBe('edit')
   })
 })
+

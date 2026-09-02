@@ -35,18 +35,6 @@ async function assetToBase64(path: string | null | undefined): Promise<string | 
   return null
 }
 
-/**
- * The id-v2v worker reports its real denoise step as a message string, both in the
- * single-clip core ("step K/M") and the multi-clip path ("clip N/total step K/M").
- * Extract K/M so the chat-history card can render a live "step K/M" alongside the
- * overall progress fraction.
- */
-function parseStep(message?: string): { step?: number; totalSteps?: number } {
-  const m = /step\s+(\d+)\s*\/\s*(\d+)/i.exec(message || '')
-  if (m) return { step: parseInt(m[1], 10), totalSteps: parseInt(m[2], 10) }
-  return {}
-}
-
 export type RestyleModel = 'fast' | 'regular'
 
 /** Live restyle progress mirrored to a chat-history generation card. */
@@ -200,29 +188,36 @@ export function useRestyle() {
           body.stylized_image_path = params.stylizedImagePath
         }
         logger.info(`[restyle] direct rail media=${usingB64 ? 'base64' : 'path'}`)
+
+        // Shared progress sink (panel + chat card). Fed purely by the SSE stream's
+        // progress events (mirrors the Bernini path). The worker's structured
+        // step/total_steps render as "Step K/M"; only the generating stage carries
+        // the real 0..1 fraction (no fabricated %).
+        const applyProgress = (ev: { stage?: string | null; progress?: number | null; message?: string | null; step?: number | null; total_steps?: number | null }) => {
+          const msg = getPhaseMessage(ev.stage || '')
+          const isBackbone = ev.stage === 'generating'
+          const pct = typeof ev.progress === 'number' ? ev.progress : null
+          const showPct = isBackbone && pct !== null
+          setState(prev => ({
+            ...prev,
+            restyleStatus: showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg,
+          }))
+          const hasStep = typeof ev.step === 'number' && typeof ev.total_steps === 'number'
+          params.onProgress?.({
+            progress: pct,
+            // Structure-first: "Step K/M" from the worker's real step/total_steps
+            // (Bernini shape). Fall back to the worker's message text (which still
+            // carries "clip x step k/m") when the structured fields are absent.
+            statusMessage:
+              hasStep ? `Step ${ev.step}/${ev.total_steps}`
+                      : typeof ev.message === 'string' && ev.message.trim() ? ev.message : msg,
+            stage: ev.stage ?? undefined,
+            ...(hasStep ? { step: ev.step!, totalSteps: ev.total_steps! } : {}),
+          })
+        }
+
         const res = await postRunnerTaskWithTicketSSE(runner, 'restyle', body, {
-          onProgress: (ev) => {
-            const msg = getPhaseMessage(ev.stage || '')
-            const isBackbone = ev.stage === 'generating'
-            const pct = typeof ev.progress === 'number' ? ev.progress : null
-            const showPct = isBackbone && pct !== null
-            setState(prev => ({
-              ...prev,
-              restyleStatus: showPct ? `${msg} ${Math.min(Math.round(pct * 100), 99)}%` : msg,
-            }))
-            // Mirror the REAL worker progress (fraction + per-step "clip x step k/m"
-            // text) to the chat-history card. The worker's message is authoritative —
-            // only the generating stage carries a numeric fraction (no fabricated %).
-            params.onProgress?.({
-              progress: pct,
-              statusMessage:
-                typeof ev.message === 'string' && ev.message.trim()
-                  ? ev.message
-                  : msg,
-              stage: ev.stage ?? undefined,
-              ...parseStep(ev.message ?? undefined),
-            })
-          },
+          onProgress: (ev) => applyProgress(ev),
         })
 
         if (!res.mediaBlob) {

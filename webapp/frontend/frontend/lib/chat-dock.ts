@@ -47,6 +47,9 @@ export interface GenerationMessage {
   totalSteps?: number
   /** Human-readable phase status while running (e.g. 'Generating (Bernini)...'). */
   statusMessage?: string
+  /** Ephemeral per-chunk preview (base64 JPEG) shown in the card while running;
+   *  removed once the generation completes. */
+  preview?: string
   createdAt: number
 }
 
@@ -89,7 +92,7 @@ export interface ChatDockState {
 
 export type ChatDockAction =
   | { type: 'add_generation'; prompt: string; mode: string; id?: string }
-  | { type: 'update_generation'; id: string; patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'deleted' | 'progress' | 'step' | 'totalSteps' | 'statusMessage'>> }
+  | { type: 'update_generation'; id: string; patch: Partial<Pick<GenerationMessage, 'status' | 'resultPath' | 'stillPath' | 'error' | 'deleted' | 'progress' | 'step' | 'totalSteps' | 'statusMessage' | 'preview'>> }
   | { type: 'add_chat'; role: ChatMessage['role']; text: string }
   | {
       type: 'add_llm_trace'
