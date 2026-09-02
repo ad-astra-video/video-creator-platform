@@ -34,6 +34,20 @@ def test_bernini_route_prefers_body_engine():
     assert model_for_endpoint("bernini-v2v", {"engine": 0}) == "bernini-1.3b"
 
 
+def test_bernini_route_prefers_body_model_short_id():
+    # The frontend sends the SHORT engine id in `model` (bernini-delivery.ts:
+    # `model: target.engine` -> "1.3b"/"14b"), NOT `engine`. This is the
+    # regression: model_for_endpoint must honour `model`, or a 14b request wars
+    # the 1.3b default and (with a device-less generation) runs 1.3b.
+    assert model_for_endpoint("bernini-v2v", {"model": "14b"}) == "bernini-14b"
+    assert model_for_endpoint("bernini-v2v", {"model": "1.3b"}) == "bernini-1.3b"
+    assert model_for_endpoint("bernini-t2v", {"model": "bernini-14b"}) == "bernini-14b"
+    # An explicit `model` (short id) wins over a stale `engine`.
+    assert model_for_endpoint("bernini-r2v", {"model": "14b", "engine": "bernini-1.3b"}) == "bernini-14b"
+    # Unknown model string falls back to the default.
+    assert model_for_endpoint("bernini-v2v", {"model": "idv2v"}) == "bernini-1.3b"
+
+
 def test_restyle_route_loads_idv2v():
     assert model_for_endpoint("restyle") == "idv2v"
 

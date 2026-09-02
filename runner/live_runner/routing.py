@@ -33,6 +33,7 @@ ROUTES = {
     "suggest-layers": "gemma-worker",
     "extract-conditioning": "ltx-worker",
     "ic-lora-generate": "ltx-worker",
+    "ic-lora-restyle": "ltx-worker",
     "edit": "image-worker",
     "layer": "image-worker",
     "restyle": "idv2v-worker",
@@ -83,6 +84,7 @@ ROUTE_MODELS: dict[str, str] = {
     "retake": "ltx",
     "extract-conditioning": "ltx",
     "ic-lora-generate": "ltx",
+    "ic-lora-restyle": "ltx",
     # Image worker — advisory family label (real model chosen per-request).
     "image": "image",
     "edit": "image",
@@ -111,14 +113,28 @@ ROUTE_MODELS: dict[str, str] = {
 def model_for_endpoint(endpoint: str, body: dict | None = None) -> str | None:
     """Model id to make resident for ``endpoint`` (a value for every route).
 
-    Bernini routes read the request body's ``engine`` (bernini-1.3b /
-    bernini-14b) when present so the correct family becomes resident, else 1.3b.
+    Bernini routes resolve the model from the request body's ``model`` field —
+    the frontend sends the SHORT engine id (``1.3b`` / ``14b``; see
+    webapp/frontend/lib/bernini-delivery.ts ``model: target.engine``) — mapping
+    it to the wan-worker family via config.resolve_model, so a 14b request warms
+    the 14b model instead of the 1.3b default. The legacy ``engine``
+    (bernini-1.3b / bernini-14b) is honoured as a fallback; otherwise 1.3b.
     Image routes pass the request body's ``engine`` through as an advisory warm
     hint. All other routes map 1:1 from ROUTE_MODELS to their worker's model
     family.
     """
+    from ..idv2v.config import resolve_model as _resolve_bernini_model
     body = body or {}
-    if endpoint in BERNINI_ENDPOINTS or endpoint in _IMAGE_ENDPOINTS:
+    if endpoint in BERNINI_ENDPOINTS:
+        candidate = body.get("model")
+        if not (isinstance(candidate, str) and candidate):
+            candidate = body.get("engine")
+        if isinstance(candidate, str) and candidate:
+            resolved = _resolve_bernini_model(candidate)
+            if resolved in ("bernini-1.3b", "bernini-14b"):
+                return resolved
+        return ROUTE_MODELS.get(endpoint)  # default bernini-1.3b
+    if endpoint in _IMAGE_ENDPOINTS:
         engine = body.get("engine")
         if isinstance(engine, str) and engine:
             return engine
@@ -133,7 +149,7 @@ def model_for_endpoint(endpoint: str, body: dict | None = None) -> str | None:
 CAPABILITIES = sorted({"restyle", "style-frame", "t2v", "i2v", "image", "edit", "layer",
                        "sam3", "extend", "retake", "prompt-enhance",
                        "suggest-gap-prompt", "chat", "suggest-layers", "extract-conditioning",
-                       "ic-lora-generate", "bernini-t2v", "bernini-v2v",
+                       "ic-lora-generate", "ic-lora-restyle", "bernini-t2v", "bernini-v2v",
                        "bernini-r2v", "process", "fps-boost", "upscale", "ffmpeg"})
 
 # Image models the image-worker can serve, by id. Consumed by the frontend to
