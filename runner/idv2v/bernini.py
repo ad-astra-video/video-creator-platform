@@ -77,7 +77,15 @@ NATIVE_FPS = 16
 # warehouse) across the boundary instead of re-hallucinating it. Keep the
 # source `video` (motion) and single `image` slot intact; this widens only the
 # `images` reference anchor.
-CHUNK_REF_FRAMES = 4
+CHUNK_REF_FRAMES = 4  # 14B: keep tight — each ref is a VAE latent tile and the 14B/32GB ceiling is why this is capped.
+
+# 1.3B: widening the appearance anchor is VRAM-cheap, so pass more of the
+# previous chunk's OUTPUT context forward. Each new chunk re-derives the
+# restyle from its `images` refs; more well-conditioned frames of the already
+# restyled scene means less per-chunk re-hallucination, tightening the seam
+# (the reported "appearance jump"). 14B deliberately stays at CHUNK_REF_FRAMES
+# (OOM ceiling). Resolved per-model in _generate_chunked via self.model.
+CHUNK_REF_FRAMES_13B = 6
 
 # Appearance-anchor weight used for cross-chunk reference frames. Anchoring on
 # the previous chunk's OUTPUT frames also carries that chunk's synthesized
@@ -587,7 +595,11 @@ class BerniniManager:
                     # frame is prepended (first) and the OLDEST local tail
                     # frame is dropped, keeping the total `images` count at
                     # CHUNK_REF_FRAMES so the 14B/32GB VRAM budget is unchanged.
-                    nref = min(CHUNK_REF_FRAMES, max(int(prev_frames), 1))
+                    # 1.3B widens the anchor (VRAM-cheap); 14B stays at the
+                    # tight CHUNK_REF_FRAMES cap to protect the 32GB ceiling.
+                    _ref_cap = (CHUNK_REF_FRAMES_13B if "14" not in
+                                (self.model or "") else CHUNK_REF_FRAMES)
+                    nref = min(_ref_cap, max(int(prev_frames), 1))
                     refs: list[str] = []
                     try:
                         n_tail = nref
