@@ -477,6 +477,17 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s",
                         stream=sys.stdout)
+
+    _QUIET_ACCESS_PATHS = ("/health", "/info", "/progress")
+    class _QuietAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - never drop logs on a format error
+                return True
+            return not any(p in msg for p in _QUIET_ACCESS_PATHS)
+    logging.getLogger("aiohttp.access").addFilter(_QuietAccessFilter())
+
     _resolve_token()
     app = create_app()
     runner = web.AppRunner(app)
