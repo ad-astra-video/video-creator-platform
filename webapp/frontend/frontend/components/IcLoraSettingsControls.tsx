@@ -22,13 +22,12 @@ function controlOptionLabel(control: CatalogControl, option: number | string): s
   return control.value_labels?.[String(option)] ?? `${option}${control.unit ?? ''}`
 }
 
-// The IC-LoRA control row in the prompt bar: conditioning-type selector + per-mode knobs
-// (strength, duration, LoRA strength, and the advanced stage-2 / resolution / audio / fps).
+// The IC-LoRA control row in the prompt bar: per-mode knobs (strength, duration, LoRA
+// strength, and the custom IC-LoRA picker). The CONDITIONING TYPE selector lives in the
+// IC-LoRA panel's Conditioning column; the advanced stage-2 / resolution / audio / fps
+// live in IcLoraAdvancedPanel beside the prompt bar.
 export interface IcLoraControlsProps {
   icLoraCondType?: ICLoraConditioningType
-  icLoraSelectorValue?: string
-  icLoraSelectorOptions?: { value: string; label: string }[]
-  onIcLoraSelectorChange?: (value: string) => void
   icLoraStrength?: number
   onIcLoraStrengthChange?: (strength: number) => void
   availableIcLoras?: ApiSuccessOf<'listModels'>['models']
@@ -60,9 +59,6 @@ export interface IcLoraControlsProps {
 
 export function IcLoraSettingsControls({
   icLoraCondType,
-  icLoraSelectorValue,
-  icLoraSelectorOptions,
-  onIcLoraSelectorChange,
   icLoraStrength,
   onIcLoraStrengthChange,
   availableIcLoras,
@@ -77,20 +73,6 @@ export function IcLoraSettingsControls({
 }: IcLoraControlsProps) {
   return (
     <>
-            {/* Unified IC-LoRA selector: canny | depth | [catalog IC-LoRAs] | custom. No tooltip:
-                the options are self-explanatory and the copy was wrong for catalog recipes. */}
-            <SettingsDropdown
-              title="CONDITIONING TYPE"
-              value={icLoraSelectorValue ?? 'canny'}
-              onChange={(v) => onIcLoraSelectorChange?.(v)}
-              options={icLoraSelectorOptions ?? []}
-              trigger={
-                <>
-                  <span className="text-zinc-300 font-medium">{(icLoraSelectorOptions ?? []).find(o => o.value === icLoraSelectorValue)?.label ?? 'Canny Edges'}</span>
-                  <ChevronUp className="h-3 w-3 text-zinc-500" />
-                </>
-              }
-            />
             {!isCatalogIcLora && icLoraCondType === 'custom' && (
               <>
                 <div className="w-px h-4 bg-zinc-700 mx-0.5" />

@@ -377,7 +377,7 @@ async def handle_info(_req: web.Request) -> web.Response:
         "runner_id": registration.runner_id if registration else "",
         "app": APP_ID,
         "model": MODEL_CHECKPOINT,
-        "capabilities": ["t2v", "i2v", "image", "extend", "retake", "prompt-enhance", "suggest-gap-prompt", "ic-lora-extract", "ic-lora-generate"],
+        "capabilities": ["t2v", "i2v", "image", "extend", "retake", "prompt-enhance", "suggest-gap-prompt", "ic-lora-extract", "ic-lora-generate", "ic-lora-restyle"],
         "ready": ready,
         "gpu": profile_info,
         "device_in_use": engine.device_index if engine is not None else (GPU_DEVICE or 0),
@@ -880,16 +880,21 @@ async def handle_extract_conditioning(req: web.Request) -> web.Response:
     original_img.save(original_buf, format="JPEG", quality=85)
     original_b64 = base64.b64encode(original_buf.getvalue()).decode()
 
-    # Apply conditioning
+    # Apply conditioning (mirror of the desktop backend's VideoProcessor.apply_canny):
+    # real OpenCV Canny so the preview matches the edge signal the IC-LoRA control videos
+    # are trained on — the old PIL FIND_EDGES stand-in was too noisy and didn't look like
+    # the actual canny conditioning. frames[0] is RGB (av decoded rgb24).
     if conditioning_type == "canny":
-        # Simple edge detection via PIL
-        from PIL import ImageFilter
-        cond_img = Image.fromarray(frames[0]).convert("L")
-        cond_img = cond_img.filter(ImageFilter.FIND_EDGES)
-        cond_img = cond_img.convert("RGB")
+        import cv2
+        import numpy as np
+        img = frames[0]
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        cond_img = Image.fromarray(np.concatenate([edges[:, :, None]] * 3, axis=2).astype(np.uint8))
     elif conditioning_type == "depth":
-        # Depth conditioning requires local depth model — not feasible remotely
-        # Fall back to grayscale
+        # Real depth needs a MiDaS/DPT model that is not provisioned on the ltx-worker.
+        # Keep the read-only reference's honest fallback (grayscale) rather than fabricate
+        # a depth map. Only affects the preview, not the actual ic-lora-generate control.
         cond_img = Image.fromarray(frames[0]).convert("L").convert("RGB")
     else:
         cond_img = Image.fromarray(frames[0])
@@ -997,6 +1002,190 @@ async def handle_ic_lora_generate(req: web.Request) -> web.Response:
         })
     finally:
         os.unlink(tmp.name)
+
+
+def _read_video_props(path: str) -> tuple[int, int, int, float]:
+    """Return (width, height, frame_count, fps) for a video file."""
+    import cv2
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {path}")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return w, h, frame_count, fps
+
+
+def _conditioning_video_frame(frame_bgr, conditioning_type: str):
+    """Per-frame IC-LoRA conditioning of a BGR OpenCV frame -> 3-channel uint8 BGR.
+
+    Full desktop parity: canny is real OpenCV Canny (mirror of the desktop
+    VideoProcessor.apply_canny: gray -> cv2.Canny(100,200) -> 3-channel); depth keeps the
+    honest grayscale fallback (no MiDaS/DPT provisioned on the ltx-worker) rather than
+    fabricate a depth map.
+    """
+    import cv2
+    import numpy as np
+    if conditioning_type == "canny":
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        return np.concatenate([edges[:, :, None]] * 3, axis=2)
+    if conditioning_type == "depth":
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        return np.concatenate([gray[:, :, None]] * 3, axis=2)
+    raise ValueError(f"Unsupported conditioning_type for full-video restyle: {conditioning_type}")
+
+
+def _build_control_video_from_source(src_path: str, dst_path: str, conditioning_type: str) -> tuple[int, int, int, float]:
+    """Condition every frame of a source clip into a control video (desktop parity).
+
+    Rewrites the whole clip frame-by-frame through canny/depth so the full-video
+    IC-LoRA has a per-frame conditioning signal aligned to the source timeline.
+    Returns (width, height, frame_count, fps) of the control video.
+    """
+    import cv2
+    cap = cv2.VideoCapture(src_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open source video: {src_path}")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    writer = cv2.VideoWriter(dst_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    n = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(_conditioning_video_frame(frame, conditioning_type))
+            n += 1
+    finally:
+        cap.release()
+        writer.release()
+    return w, h, n, fps
+
+
+async def handle_ic_lora_restyle(req: web.Request) -> web.Response:
+    """POST /video-creator/v1/ic-lora-restyle — full-video LTX IC-LoRA restyle.
+
+    Runs the LTX ``ICLoraPipeline`` over the ENTIRE conditioning video via
+    ``video_conditioning`` — frame-aligned restyle of the whole clip, NOT the
+    first-frame-only i2v path (``ic-lora-generate``). Conditioning source:
+      * canny/depth — per-frame cv2.Canny / grayscale preprocessing of the supplied
+        source clip into a control video (full desktop parity);
+      * custom — the supplied video IS the control video, used verbatim.
+    Requires the IC-LoRA weights via a ``loras`` entry (catalog id or custom_url),
+    resolved through the runner's LoraCache exactly like t2v/i2v loras — without them
+    the pipeline has no IC-LoRA to condition on and the effect is inert.
+    """
+    body = await req.json()
+    assert engine
+    prompt = body["prompt"]
+    video_base64 = body["video_base64"]
+    conditioning_type = body.get("conditioning_type", "canny")
+    conditioning_strength = float(body.get("conditioning_strength", 1.0))
+    seed = int(body.get("seed", 42))
+    skip_stage_2 = bool(body.get("skip_stage_2", False))
+    resolution_factor = float(body.get("resolution_factor", 2.0))
+
+    if conditioning_type not in ("canny", "depth", "custom"):
+        return web.json_response(
+            {"error": f"Unsupported conditioning_type: {conditioning_type} (expected canny|depth|custom)"},
+            status=400,
+        )
+
+    # Resolve the IC-LoRA weights (exactly one) so the pipeline is actually loRA-driven.
+    loras_raw = body.get("loras")
+    if not loras_raw:
+        return web.json_response(
+            {"error": "IC-LoRA restyle requires a 'loras' entry (the IC-LoRA weights: catalog id or custom_url)"},
+            status=400,
+        )
+    try:
+        resolved, custom_paths = _resolve_loras(
+            loras_raw if isinstance(loras_raw, list) else [loras_raw]
+        )
+    except _LoraError as exc:
+        return web.json_response({"error": str(exc)}, status=404)
+    if not resolved:
+        return web.json_response({"error": "Could not resolve IC-LoRA lora"}, status=400)
+    lora_path, lora_strength = resolved[0]
+
+    src_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    src_file.write(base64.b64decode(video_base64))
+    src_file.close()
+    cleanup = [src_file.name]
+    control_path = src_file.name
+
+    try:
+        if conditioning_type == "custom":
+            w, h, frame_count, fps = _read_video_props(control_path)
+        else:
+            control_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+            cleanup.append(control_path)
+            w, h, frame_count, fps = _build_control_video_from_source(src_file.name, control_path, conditioning_type)
+
+        fps_override = body.get("fps")
+        if fps_override is not None:
+            fps = float(fps_override)
+
+        # Target resolution: an explicit override wins; otherwise desktop parity (no
+        # use_lora_in_stage_2) — width 768 by source aspect, snapped to 128.
+        res = body.get("resolution")
+        if isinstance(res, dict):
+            tw, th = int(res.get("width", w)), int(res.get("height", h))
+        elif isinstance(res, str):
+            rmap = {"540p": (960, 544), "720p": (1280, 704), "1080p": (1920, 1088)}
+            tw, th = rmap.get(res, (1280, 704))
+        else:
+            tw, th = 768, max(round(768 * h / w / 128) * 128, 128)
+        width = max(128, (tw // 128) * 128)
+        height = max(128, (th // 128) * 128)
+
+        if (frame_count - 1) % 8 != 0:
+            logger.warning(
+                "[ic-lora-restyle] %d frames: (frames-1) %% 8 != 0 — pipeline may pad/trim and output could glitch",
+                frame_count,
+            )
+
+        out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        try:
+            engine.generate_ic_lora_full_video(
+                prompt=prompt,
+                control_video_path=control_path,
+                seed=seed,
+                width=width,
+                height=height,
+                num_frames=frame_count,
+                fps=fps,
+                output_path=out.name,
+                conditioning_strength=conditioning_strength,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
+                skip_stage_2=skip_stage_2,
+                resolution_factor=resolution_factor,
+            )
+            b64 = _read_file_b64(out.name)
+            return web.json_response({
+                "video_base64": b64,
+                "content_type": "video/mp4",
+                "generation_id": uuid.uuid4().hex[:8],
+            })
+        finally:
+            os.unlink(out.name)
+    finally:
+        for p in cleanup:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+        for cp in custom_paths:
+            try:
+                os.unlink(cp)
+            except Exception:
+                pass
 
 
 # ── Lifecycle ────────────────────────────────────────────
@@ -1161,6 +1350,7 @@ def create_app() -> web.Application:
     app.router.add_post(f"{p}/suggest-gap-prompt", handle_suggest_gap_prompt)
     app.router.add_post(f"{p}/extract-conditioning", handle_extract_conditioning)
     app.router.add_post(f"{p}/ic-lora-generate", handle_ic_lora_generate)
+    app.router.add_post(f"{p}/ic-lora-restyle", handle_ic_lora_restyle)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
@@ -1168,6 +1358,17 @@ def create_app() -> web.Application:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    _QUIET_ACCESS_PATHS = ("/health", "/info", "/progress")
+    class _QuietAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - never drop logs on a format error
+                return True
+            return not any(p in msg for p in _QUIET_ACCESS_PATHS)
+    logging.getLogger("aiohttp.access").addFilter(_QuietAccessFilter())
+
     app = create_app()
     web.run_app(app, host=HOST, port=PORT)
 

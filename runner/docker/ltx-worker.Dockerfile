@@ -56,8 +56,10 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "https://github.com/SHI-Labs/NATTEN/releases/download/v0.21.7/natten-0.21.7%2Btorch2130cu132-cp312-cp312-linux_x86_64.whl"
 
-# Diffusers for image generation (Z-Image-Turbo)
-RUN pip install --no-cache-dir diffusers accelerate
+# Diffusers for image generation (Z-Image-Turbo). opencv-python-headless is for the
+# IC-LoRA conditioning extract (/video-creator/v1/extract-conditioning) which uses real
+# cv2.Canny to produce the conditioning preview.
+RUN pip install --no-cache-dir diffusers accelerate opencv-python-headless
 
 RUN useradd -m runneruser
 

@@ -1,12 +1,15 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import {
   Upload, Loader2, Film, Sparkles, Image as ImageIcon,
-  RefreshCw, Download, AlertCircle, Trash2,
+  RefreshCw, Download, AlertCircle, Trash2, ChevronUp,
 } from 'lucide-react'
 import { ApiClient, type ApiRequestBodyOf, type ApiSuccessOf } from '../lib/api-client'
 import { logger } from '../lib/logger'
 import { pathToFileUrl } from '../lib/file-url'
+import { resolveRunner, extractConditioningViaRunner, pathToBase64 } from '../lib/direct-transport'
+import { isWebPlatform } from '../lib/livepeer-discovery'
 import { OutpaintCanvasEditor, type OutpaintPads } from './OutpaintCanvasEditor'
+import { SettingsDropdown } from './SettingsDropdown'
 
 export type ICLoraConditioningType = 'canny' | 'depth' | 'custom'
 
@@ -37,6 +40,12 @@ interface ICLoraPanelProps {
   onConditioningTypeChange?: (type: ICLoraConditioningType) => void
   conditioningStrength?: number
   onConditioningStrengthChange?: (strength: number) => void
+  // Unified conditioning-type selector (canny | depth | [catalog IC-LoRAs] | custom),
+  // rendered in the panel's Conditioning column header. GenSpace owns the state and
+  // stays the single writer via these callbacks; the panel only renders the dropdown.
+  icLoraSelectorValue?: string
+  icLoraSelectorOptions?: { value: string; label: string }[]
+  onIcLoraSelectorChange?: (value: string) => void
   outputVideoPath?: string | null
   onChange?: (data: {
     videoPath: string | null
@@ -79,6 +88,9 @@ export function ICLoraPanel({
   onConditioningTypeChange,
   conditioningStrength: conditioningStrengthProp,
   onConditioningStrengthChange,
+  icLoraSelectorValue,
+  icLoraSelectorOptions,
+  onIcLoraSelectorChange,
   outputVideoPath: _outputVideoPath,
   onChange,
 }: ICLoraPanelProps) {
@@ -105,8 +117,11 @@ export function ICLoraPanel({
   const isImage = inputKind === 'image'
   // Catalog IC-LoRA mode (any input kind): the IC-LoRA builds its own control video server-side.
   const isCatalogIcLora = selectedIcLoraId !== null
-  // The conditioning preview only applies to the built-in canny/depth flow.
-  const showConditioningPreview = !isCatalogIcLora && !isCustom
+  // The Conditioning column itself (with its conditioning-type dropdown) shows for the
+  // whole built-in flow — canny, depth AND custom — so the type selector stays reachable
+  // and isn't hidden behind what's currently selected. Only catalog IC-LoRAs (chosen via
+  // the library modal) hide it and swap in the Reference/Canvas columns instead.
+  const showConditioningColumn = !isCatalogIcLora
   const [conditioningPreview, setConditioningPreview] = useState<string | null>(null)
   const [isExtracting, setIsExtracting] = useState(false)
 
@@ -255,22 +270,40 @@ export function ICLoraPanel({
     isExtractingRef.current = true
     setIsExtracting(true)
     setExtractError(null)
-    const result = await ApiClient.extractIcLoraConditioning({
-      video_path: inputVideoPath,
-      conditioning_type: conditioningType,
-      frame_time: inputTime,
-    })
-    if (!result.ok) {
-      logger.warn(`Failed to extract conditioning: ${result.error.message}`)
-      setExtractError(result.error.message)
+    try {
+      // Web/direct build: the Cloudflare Worker no longer serves /api/ic-lora/extract-conditioning,
+      // so route the preview to a capable runner's extract-conditioning rail with the video's REAL
+      // bytes (video_base64) — an on-disk/web:// path is unreadable by the remote worker.
+      if (isWebPlatform()) {
+        const runner = await resolveRunner(['extract-conditioning'])
+        if (!runner) throw new Error('No capable Livepeer runner available for conditioning extraction')
+        const videoBase64 = await pathToBase64(inputVideoPath)
+        if (!videoBase64) throw new Error('Could not read the input video for conditioning')
+        const res = await extractConditioningViaRunner(runner, {
+          video_base64: videoBase64,
+          frame_time: inputTime,
+          conditioning_type: conditioningType,
+        })
+        setConditioningPreview(res.conditioning)
+        return
+      }
+      // Desktop: the local backend serves the endpoint directly.
+      const result = await ApiClient.extractIcLoraConditioning({
+        video_path: inputVideoPath,
+        conditioning_type: conditioningType,
+        frame_time: inputTime,
+      })
+      if (!result.ok) throw new Error(result.error.message)
+      setConditioningPreview(result.data.conditioning)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to extract conditioning'
+      logger.warn(`Failed to extract conditioning: ${msg}`)
+      setExtractError(msg)
+    } finally {
+      // Always clear the in-flight state on settle so the button never sticks.
       isExtractingRef.current = false
       setIsExtracting(false)
-      return
     }
-
-    setConditioningPreview(result.data.conditioning)
-    isExtractingRef.current = false
-    setIsExtracting(false)
   }, [inputVideoPath, conditioningType, inputTime, icLoraReady, isCustom, isImage, isCatalogIcLora])
 
   const extractTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -580,14 +613,34 @@ export function ICLoraPanel({
             </div>
           </div>
 
-          {showConditioningPreview && (
+          {showConditioningColumn && (
           <div className="flex-1 flex flex-col min-w-0">
             <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between gap-2">
-              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Conditioning</span>
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider shrink-0">Conditioning</span>
+                {(icLoraSelectorOptions ?? []).length > 0 && (
+                  <SettingsDropdown
+                    title="CONDITIONING TYPE"
+                    value={icLoraSelectorValue ?? 'canny'}
+                    onChange={(v) => onIcLoraSelectorChange?.(v)}
+                    options={icLoraSelectorOptions ?? []}
+                    triggerClassName="!py-0.5 rounded text-[10px]"
+                    trigger={
+                      <>
+                        <span className="text-zinc-300 font-medium">
+                          {(icLoraSelectorOptions ?? []).find(o => o.value === icLoraSelectorValue)?.label ?? 'Canny Edges'}
+                        </span>
+                        <ChevronUp className="h-3 w-3 text-zinc-500" />
+                      </>
+                    }
+                  />
+                )}
+              </div>
               <button
                 onClick={() => { void extractConditioning() }}
                 disabled={!inputVideoPath || isExtracting}
-                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors disabled:opacity-50"
+                className="flex shrink-0 items-center gap-1 px-2 py-0.5 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors disabled:opacity-50"
+                title="Re-extract conditioning"
               >
                 <RefreshCw className={`h-3 w-3 ${isExtracting ? 'animate-spin' : ''}`} />
               </button>
@@ -598,7 +651,13 @@ export function ICLoraPanel({
                   <Loader2 className="h-5 w-5 text-blue-400 animate-spin" />
                 </div>
               )}
-              {conditioningPreview ? (
+              {isCustom ? (
+                <div className="text-center p-4">
+                  <p className="text-zinc-600 text-xs">
+                    Custom IC-LoRA: pick your weights + control video (no canny/depth preview)
+                  </p>
+                </div>
+              ) : conditioningPreview ? (
                 <img src={conditioningPreview} alt="Conditioning preview" className="w-full h-full object-contain" />
               ) : (
                 <div className="text-center p-4">
@@ -612,7 +671,7 @@ export function ICLoraPanel({
           )}
 
           {/* Reference image column: takes the conditioning slot for catalog IC-LoRAs that opt in. */}
-          {allowsReferenceImage && !showConditioningPreview && (
+          {allowsReferenceImage && !showConditioningColumn && (
           <div className="flex-1 flex flex-col min-w-0">
             <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between gap-2">
               <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider shrink-0">Reference</span>
@@ -675,7 +734,7 @@ export function ICLoraPanel({
           )}
 
           {/* Canvas editor column: takes the middle slot for outpainting (position_canvas control). */}
-          {showOutpaintCanvas && !showConditioningPreview && (
+          {showOutpaintCanvas && !showConditioningColumn && (
           <div className="flex-1 flex flex-col min-w-0">
             <div className="px-3 py-2 border-b border-zinc-800 flex items-center">
               <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Canvas</span>

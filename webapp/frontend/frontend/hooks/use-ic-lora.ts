@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { withGenerationActive } from '../lib/generation-active'
 import { logger } from '../lib/logger'
-import { resolveRunner, postRunnerTaskWithTicket, pathToBase64 } from '../lib/direct-transport'
+import { resolveRunner, postRunnerTaskWithTicketSSE, pathToBase64 } from '../lib/direct-transport'
 
 export type IcLoraConditioningType = 'canny' | 'depth' | 'custom'
 export type IcLoraAudioMode = 'source' | 'generated' | 'off'
@@ -98,35 +98,43 @@ export function useIcLora() {
       // video_path for catalog mode where the source is supplied another way.
       const videoBase64 = params.videoPath ? await pathToBase64(params.videoPath) : null
 
-      const res = await postRunnerTaskWithTicket(runner, 'ic-lora', {
-        ...(videoBase64 ? { video_base64: videoBase64 } : { video_path: params.videoPath }),
-        conditioning_type: params.conditioningType,
-        conditioning_strength: params.conditioningStrength,
-        prompt: params.prompt,
-        custom_lora_ref: params.customLoraRef,
-        control_video_path: params.controlVideoPath,
-        skip_stage_2: params.skipStage2,
-        use_lora_in_stage_2: params.useLoraInStage2,
-        resolution: params.resolution,
-        resolution_factor: params.resolutionFactor,
-        audio_mode: params.audioMode,
-        lora_strength: params.loraStrength,
-        fps_override: params.fpsOverride,
-        ic_lora_id: params.icLoraId,
-        variant_id: params.variantId,
-        input_path: params.inputPath,
-        control_values: params.controlValues,
-        outpaint_pads: params.outpaintPads,
-        images: params.referenceImagePath
-          ? [{ path: params.referenceImagePath, frame: 0, strength: 1.0 }]
-          : [],
-      }, {
-        onProgress: (ev) => {
-          if (ev.stage === 'generating') {
-            setState(prev => ({ ...prev, status: ev.message || 'Generating...' }))
-          }
-        },
-      })
+      let res
+      try {
+        res = await postRunnerTaskWithTicketSSE(runner, 'ic-lora', {
+          ...(videoBase64 ? { video_base64: videoBase64 } : { video_path: params.videoPath }),
+          conditioning_type: params.conditioningType,
+          conditioning_strength: params.conditioningStrength,
+          prompt: params.prompt,
+          custom_lora_ref: params.customLoraRef,
+          control_video_path: params.controlVideoPath,
+          skip_stage_2: params.skipStage2,
+          use_lora_in_stage_2: params.useLoraInStage2,
+          resolution: params.resolution,
+          resolution_factor: params.resolutionFactor,
+          audio_mode: params.audioMode,
+          lora_strength: params.loraStrength,
+          fps_override: params.fpsOverride,
+          ic_lora_id: params.icLoraId,
+          variant_id: params.variantId,
+          input_path: params.inputPath,
+          control_values: params.controlValues,
+          outpaint_pads: params.outpaintPads,
+          images: params.referenceImagePath
+            ? [{ path: params.referenceImagePath, frame: 0, strength: 1.0 }]
+            : [],
+        }, {
+          onProgress: (ev) => {
+            if (ev.stage === 'generating') {
+              setState(prev => ({ ...prev, status: ev.message || 'Generating...' }))
+            }
+          },
+        })
+      } catch (e) {
+        const err = e instanceof Error ? e.message : String(e)
+        logger.error(`IC-LoRA error: ${err}`)
+        setState({ isGenerating: false, status: '', error: err, result: null })
+        return
+      }
       if (!res.mediaBlob) {
         const err = res.payload?.error ? String(res.payload.error) : 'Runner returned no media'
         logger.error(`IC-LoRA error: ${err}`)

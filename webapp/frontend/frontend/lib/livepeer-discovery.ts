@@ -30,6 +30,7 @@ const TASK_LABELS: Record<string, string> = {
   restyle: 'Restyle',
   'ic-lora': 'IC-LoRA',
   'ic-lora-generate': 'IC-LoRA',
+  'ic-lora-restyle': 'Restyle Video (IC-LoRA)',
   sam3: 'Segment',
   prompt: 'Prompt Enhance',
   'prompt-enhance': 'Prompt Enhance',

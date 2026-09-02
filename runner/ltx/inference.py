@@ -189,6 +189,13 @@ class VideoCreatorInferenceEngine:
         # The LoRA set currently baked into the loaded pipeline (None until load).
         # Used to detect when a per-request LoRA change requires a reload.
         self._loaded_loras: list[tuple[str, float]] | None = None
+        # LTX IC-LoRA full-video pipeline (ltx_pipelines.ic_lora.ICLoraPipeline),
+        # built lazily on the first ic-lora-restyle request. A SEPARATE instance from
+        # self._pipeline: it carries its own [IC-LoRA lora] and the two-stage blocks,
+        # and its video_conditioning path is what restyles a whole clip. Keyed on
+        # (lora_path, lora_strength) so a different LoRA set forces a rebuild.
+        self._iclora_pipe = None
+        self._iclora_pipe_key: tuple[str, float] | None = None
         # Exactly one of video/_zimage_pipe may be resident at a time on
         # constrained cards; this lock serializes swaps so a load never
         # happens concurrently with an eviction/other load.
@@ -410,6 +417,13 @@ class VideoCreatorInferenceEngine:
         """
         if self._device.type == "cuda":
             try:
+                # Pin the process CUDA device to the engine's card BEFORE
+                # freeing, so empty_cache() releases the card we actually own
+                # (not whatever the process default device happens to be).
+                if self._device.index is not None:
+                    torch.cuda.set_device(self._device.index)
+                else:
+                    torch.cuda.set_device(self._device)
                 # Pass the device index when available so we synchronize the
                 # exact GPU the engine targets; a bare device (e.g. cuda with
                 # no explicit index) synchronizes its default stream too.
@@ -486,6 +500,10 @@ class VideoCreatorInferenceEngine:
             old = self._device
             self.free()
             self._device = torch.device(f"cuda:{int(gpu_idx)}")
+            # Pin the process CUDA device to the new card so every subsequent
+            # default-device op (and empty_cache) lands on the relocated GPU,
+            # never leaving a parked context on the vacated card.
+            torch.cuda.set_device(int(gpu_idx))
             # If prompt-enhance wasn't pinned to a separate GPU, follow the move.
             if self._enhance_device is not None and self._enhance_device == old:
                 self._enhance_device = self._device
@@ -530,6 +548,140 @@ class VideoCreatorInferenceEngine:
                 self._load_pipeline()
                 self._loaded_loras = list(self._loras)
             return self._pipeline
+
+    def _load_ic_lora_pipeline(self, lora_path: str, lora_strength: float = 1.0) -> Any:
+        """Build (or reuse) the LTX IC-LoRA pipeline (``ltx_pipelines.ic_lora.ICLoraPipeline``).
+
+        Mirrors the desktop ``LTXIcLoraPipeline`` but uses the ModelPaths-era constructor
+        (same style as ``DistilledPipeline`` here). The IC-LoRA *effect* comes from the
+        LoRA weights passed via ``loras``: they steer the transformer's attention so the
+        ``video_conditioning`` reference actually restyles the sequence. Without them the
+        pipeline is just a two-stage distilled generator and the conditioning is inert, so
+        a missing/empty lora is surfaced loudly rather than silently no-op'd.
+        """
+        from pathlib import Path
+        from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+        from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
+        from ltx_pipelines.ic_lora import ICLoraPipeline
+        from ltx_pipelines.utils.model_paths import ModelPaths
+        from ltx_pipelines.utils.types import OffloadMode
+
+        if self._api_generation(ICLoraPipeline) != "new":
+            raise RuntimeError(
+                "IC-LoRA requires the ModelPaths-era ltx-pipelines API. Apply the pin "
+                "bump: Lightricks/LTX-2 -> fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca for "
+                "BOTH packages/ltx-core and packages/ltx-pipelines, then rebuild the "
+                "ltx-worker image."
+            )
+
+        key = (lora_path, lora_strength)
+        if self._iclora_pipe_key == key and self._iclora_pipe is not None:
+            return self._iclora_pipe
+
+        quantization = None
+        if self._device.type == "cuda":
+            try:
+                from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+                quantization = build_fp8_cast_policy(self._checkpoint)
+            except Exception:
+                logger.warning("IC-LoRA: FP8 quantization unavailable, running without it")
+
+        if self._profile is not None and self._profile.offload_mode == "CPU":
+            offload_mode = OffloadMode.CPU
+        else:
+            offload_mode = OffloadMode.NONE
+
+        # Free the image pipeline so the (heavier) IC-LoRA two-stage model fits.
+        self._evict_zimage()
+        self._iclora_pipe = ICLoraPipeline(
+            model_paths=ModelPaths.from_monolith(self._checkpoint, gemma_root=self._gemma_root),
+            spatial_upsampler_path=self._upsampler_path,
+            loras=[
+                LoraPathStrengthAndSDOps(
+                    path=lora_path,
+                    strength=lora_strength,
+                    sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+                )
+            ],
+            device=self._device,
+            quantization=quantization,
+            offload_mode=offload_mode,
+            prompt_enhancer_gemma_root=self._gemma_root,
+        )
+        logger.info(
+            "ICLoraPipeline loaded (lora=%s strength=%.2f offload=%s fp8=%s)",
+            Path(lora_path).name, lora_strength, offload_mode, quantization is not None,
+        )
+        self._iclora_pipe_key = key
+        _memlog("iclora built")
+        return self._iclora_pipe
+
+    @torch.inference_mode()
+    def generate_ic_lora_full_video(
+        self,
+        *,
+        prompt: str,
+        control_video_path: str,
+        seed: int,
+        width: int,
+        height: int,
+        num_frames: int,
+        fps: float,
+        output_path: str,
+        conditioning_strength: float = 1.0,
+        lora_path: str = "",
+        lora_strength: float = 1.0,
+        skip_stage_2: bool = False,
+        resolution_factor: float = 2.0,
+    ) -> None:
+        """Full-video LTX IC-LoRA restyle.
+
+        Runs ``ICLoraPipeline`` over the ENTIRE conditioning/control video
+        (``video_conditioning``), frame-aligned — restyling the whole clip instead of the
+        first-frame-only i2v path. ``width``/``height`` are the FINAL target resolution
+        (stage-1 runs at half); when ``skip_stage_2`` the canvas is scaled by
+        ``resolution_factor`` and snapped to a multiple of 128 (stage-1 latent must be
+        even for the 2x patchify) — mirroring the desktop LTXIcLoraPipeline.generate.
+        """
+        if not lora_path:
+            raise RuntimeError(
+                "IC-LoRA full-video restyle requires an IC-LoRA LoRA path (none supplied)"
+            )
+        pipe = self._load_ic_lora_pipeline(lora_path, lora_strength)
+
+        tiling_config = self.default_tiling_config()
+        num_frames = self.snap_frames_to_grid(num_frames, pipe)
+        if skip_stage_2:
+            width = max(128, round(width * resolution_factor / 128) * 128)
+            height = max(128, round(height * resolution_factor / 128) * 128)
+
+        import os as _os
+        logger.info(
+            "[ic-lora-restyle] stage-1 %dx%d x %d frames @%gfps (skip_stage_2=%s) "
+            "lora=%s cstr=%.2f",
+            width // 2, height // 2, num_frames, fps, skip_stage_2,
+            _os.path.basename(lora_path), conditioning_strength,
+        )
+
+        video, audio, _out_tiling = pipe(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=float(fps),
+            images=[],
+            video_conditioning=[(control_video_path, conditioning_strength)],
+            tiling_config=tiling_config,
+            skip_stage_2=skip_stage_2,
+        )
+        chunks = self.video_chunks_number(num_frames, tiling_config)
+        self.encode_video_output(
+            video=video,
+            fps=int(round(fps)),
+            output_path=output_path,
+            video_chunks_number_value=chunks,
+        )
 
     def _pad_latent_frames(self, latent: torch.Tensor, pad_frames: int, at: str) -> torch.Tensor:
         """Zero-pad a latent on its temporal axis (dim 2): front for ``start``, back for
