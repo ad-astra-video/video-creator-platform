@@ -160,6 +160,27 @@ class FluxKleinEditor:
     def is_ready(self) -> bool:
         return self._model is not None
 
+    def relocate(self, device: object) -> None:
+        """Retarget the editor onto a different CUDA GPU (int index or 'cuda:N').
+
+        The image-worker is device-aware: the live-runner's scheduler assigns a
+        specific GPU per task (X-Worker-Device -> engine.current_device). The
+        klein editor is a process-global SINGLETON that can only live on ONE GPU
+        at a time, so it must follow the currently-scheduled engine's device
+        instead of a hardcoded default (which silently parked 18.6 GiB on a card
+        the scheduler didn't know it owned -> co-residency/OOM when a video task
+        later took that GPU). If a model is already resident on a different GPU,
+        drop it so the next ensure_loaded() rebuilds on the new card. No-op when
+        already on target (klein requests are globally serialized via
+        ``server._klein_lock``, so the singleton never straddles two GPUs).
+        """
+        target = _normalize_device(str(device))
+        if target == self._device and self._model is not None:
+            return
+        if self._model is not None:
+            self.unload()
+        self._device = target
+
     def ensure_loaded(self) -> None:
         """Load the FLUX.2 klein 4B flow + AE + Qwen3 text encoder.
 
@@ -335,7 +356,18 @@ class FluxKleinEditor:
         self.evict_text_encoder()
 
         # Reference conditioning: encode the (capped) source frame through the AE.
-        ref_tokens, ref_ids = encode_image_refs(self._ae, [ref_img])
+        # Pin this thread's current CUDA device to the klein card for the encode:
+        # the vendored flux2 encode_image_refs() hardcodes img[None].cuda(), which
+        # would otherwise place the input on the thread default (cuda:0) and
+        # mismatch klein's AE (which now follows relocate() onto the scheduled GPU).
+        # Thread current device is thread-local and klein edits are serialized via
+        # server._klein_lock, so save/restore leaves no side effect on siblings.
+        prev_dev = torch.cuda.current_device()
+        torch.cuda.set_device(int(self._device.split(":")[-1]))
+        try:
+            ref_tokens, ref_ids = encode_image_refs(self._ae, [ref_img])
+        finally:
+            torch.cuda.set_device(prev_dev)
         ref_tokens = ref_tokens.to(self._device)
         ref_ids = ref_ids.to(self._device)
 

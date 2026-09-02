@@ -832,6 +832,10 @@ class ImageInferenceEngine:
         self._evict_other("klein")
         from . import flux_edit
         editor = flux_edit.get_editor()
+        # Device-aware: bind klein to THIS engine's assigned GPU (the scheduler's
+        # X-Worker-Device) so its residency is visible to the live-runner's /info
+        # map and can be evicted per-card instead of parking silently on cuda:0.
+        editor.relocate(self._active_device())
         editor.ensure_loaded()
         steps = num_inference_steps if num_inference_steps is not None else None
         width = int(width or 1024)
@@ -939,6 +943,10 @@ class ImageInferenceEngine:
         self._evict_other("klein")
         from . import flux_edit
         editor = flux_edit.get_editor()
+        # Device-aware: bind klein to THIS engine's assigned GPU (the scheduler's
+        # X-Worker-Device) so its residency is visible to the live-runner's /info
+        # map and can be evicted per-card instead of parking silently on cuda:0.
+        editor.relocate(self._active_device())
         editor.ensure_loaded()
         try:
             styled = editor.edit(src, prompt, int(seed), width=width, height=height,

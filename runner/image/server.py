@@ -98,6 +98,7 @@ def _resolve_device(req: web.Request) -> int:
 
 def _engine_for(device: int) -> "ImageInferenceEngine":
     """Return (creating on demand) the engine bound to CUDA ``device``."""
+    _pin_cuda_device(device)
     if device not in _engines:
         e = ImageInferenceEngine(profile=gpu_profile)
         e.current_device = device
@@ -129,6 +130,41 @@ def _devices_visible() -> int:
     except Exception:
         pass
     return 0
+
+
+def _klein_resident_device() -> int | None:
+    """CUDA index the FLUX.2 klein singleton is resident on (None if not loaded).
+
+    klein runs through a process-global singleton (flux_edit.get_editor()) that
+    can live on ONE GPU at a time, independent of the per-device _engines dict.
+    The scheduler's reconcile reads /info devices to know which cards a worker
+    owns; without this, klein's real GPU was invisible there and never evicted.
+    """
+    try:
+        from . import flux_edit
+        e = flux_edit.get_editor()
+        if e.is_ready:
+            dev = str(e.device)
+            if dev.startswith("cuda:"):
+                return int(dev.split(":", 1)[1])
+    except Exception:
+        pass
+    return None
+
+
+def _pin_cuda_device(device: int) -> None:
+    """Pin this process's ACTIVE CUDA device to the worker's assigned GPU so no
+    context is created on an unassigned card (torch's default is cuda:0, which a
+    multi-GPU worker would otherwise leave a stray context on). Best-effort: the
+    first CUDA touch in a process creates a persistent context, so this must run
+    before any allocation on the assigned device. torch has no public context
+    destroy, so a context parked BEFORE this bin is only reclaimed at teardown."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(device))
+    except Exception:
+        pass
 
 
 def _estimate_bytes(obj) -> int:
@@ -214,13 +250,38 @@ async def handle_evict(req: web.Request) -> web.Response:
             e.free()
         _engines.clear()
         _device_locks.clear()
+        # klein is a separate process-global singleton; free it on a full evict
+        # too so no orphaned VRAM is left on any card.
+        try:
+            from . import flux_edit
+            flux_edit.evict_editor()
+        except Exception:
+            pass
         logger.info("image-worker /evict: all devices freed")
     else:
         device = int(device)
         e = _engines.pop(device, None)
         if e is not None:
+            # Target the vacated card so free()'s synchronize + empty_cache
+            # reclaim that card's VRAM (the process's active device decides
+            # which card empty_cache() flushes).
+            _pin_cuda_device(device)
             e.free()
         _device_locks.pop(device, None)
+        # If the klein singleton is resident on the evicted card, drop it (its
+        # residency is not in _engines, so only a conscious check frees it).
+        if _klein_resident_device() == device:
+            try:
+                from . import flux_edit
+                flux_edit.evict_editor()
+            except Exception:
+                pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         logger.info("image-worker /evict: device %d freed", device)
     return web.json_response({"evicted": True})
 
@@ -240,6 +301,17 @@ async def handle_info(_req: web.Request) -> web.Response:
         device_in_use = _default_device if _default_device is not None else min(_engines)
     if device_in_use is None:
         device_in_use = DEFAULT_DEVICE
+    # The FLUX.2 klein editor is a process-global SINGLETON (one GPU at a time),
+    # so its residency is NOT in the per-device _engines dict. Surface its actual
+    # GPU so the scheduler's reconcile sees every card this worker owns — the
+    # missing piece that let a style-frame park 18.6 GiB on a card the map
+    # thought was free (co-residency when a video task later took it).
+    klein_dev = _klein_resident_device()
+    if klein_dev is not None:
+        device_in_use = device_in_use if device_in_use is not None else klein_dev
+        devs = set(_engines) | {klein_dev}
+    else:
+        devs = set(_engines)
     return web.json_response({
         "app": APP_ID,
         "capabilities": ["image", "edit", "layer", "style-frame"],
@@ -250,7 +322,8 @@ async def handle_info(_req: web.Request) -> web.Response:
         # Multi-resident: the scheduler's reconcile needs the full device SET so
         # it can mark several slots as owned by this worker.
         "device_in_use": device_in_use,
-        "devices": sorted(_engines),
+        "devices": sorted(devs),
+        "klein_device": klein_dev,
     })
 
 
@@ -775,6 +848,17 @@ def create_app() -> web.Application:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    _QUIET_ACCESS_PATHS = ("/health", "/info", "/progress")
+    class _QuietAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 - never drop logs on a format error
+                return True
+            return not any(p in msg for p in _QUIET_ACCESS_PATHS)
+    logging.getLogger("aiohttp.access").addFilter(_QuietAccessFilter())
+
     app = create_app()
     web.run_app(app, host=HOST, port=PORT)
 
