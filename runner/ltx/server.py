@@ -1421,8 +1421,23 @@ def _warn_if_low_host_ram() -> None:
                     commit_limit / 2**30, ckpt_size / 2**30)
 
 
+def _memlog(tag: str) -> None:
+    """Log the PARENT process's host RSS only (no CUDA — this process is
+    CUDA-free; any GPU-memory logging lives in the model child)."""
+    try:
+        with open("/proc/self/status") as _f:
+            for _line in _f:
+                if _line.startswith("VmRSS:"):
+                    _kb = int(_line.split()[1])
+                    logger.info("MEMLOG %-24s rss=%dMiB", tag, _kb // 1024)
+                    return
+    except OSError:
+        pass
+    logger.info("MEMLOG %-24s rss=n/a", tag)
+
+
 async def on_startup(_app: web.Application) -> None:
-    global engine, ready, gpu_profile
+    global engine, ready, gpu_profile, _chosen_video_device
     _warn_if_low_host_ram()
 
     # Pick the CUDA device this worker warms up on. An explicit GPU_DEVICE env
