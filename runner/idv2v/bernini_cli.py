@@ -117,6 +117,32 @@ FP8_TASK_GUIDANCE = {
     "r2v": "vae_txt_vit_wapg",
 }
 
+# Per-model v2v omega defaults mirroring the upstream gradio_demo.py task
+# profiles. The generic ns defaults below match the 1.3B renderer's BASE
+# profile, but the 14B full-model `v2v` profile (BERNINI_V2_TASK_DEFAULTS)
+# weights the source video far more strongly (omega_img 1.25 vs 4.5,
+# omega_tgt 1.2 vs 0.5) — which is what makes a 14B edit actually follow the
+# source. Applied UNCONDITIONALLY for every v2v (they are the authoritative
+# v2v omegas, even overriding a request's values or the chunk anchor's
+# omega_img=CHUNK_ANCHOR_OMEGA_IMG set in bernini.py), so single-shot and
+# anchored multi-chunk v2v both use identical source-adherence.
+# 14B (WIT-CFG sampler): BERNINI_V2_TASK_DEFAULTS["v2v"].
+V2V_OMEGA_14B = {
+    "omega_vid": 1.25,
+    "omega_img": 1.25,
+    "omega_txt": 4.0,
+    "omega_tgt": 1.2,
+    "omega_scale": 0.75,
+}
+# 1.3B (renderer BASE_TASK_DEFAULTS); omega_tgt is not consumed by the
+# 1.3B renderer (absorbed by **kwargs).
+V2V_OMEGA_13B = {
+    "omega_vid": 1.25,
+    "omega_img": 4.5,
+    "omega_txt": 4.0,
+    "omega_scale": 0.8,
+}
+
 
 def _arg_defaults() -> argparse.Namespace:
     """Base argparse Namespace mirroring infer_single_gpu.py common args.
@@ -351,6 +377,13 @@ def main() -> int:
                     output_path=(out if is_root else None),
                     system_prompt=sys_prompt,
                     **generation_kwargs(ns))
+                if task_name == "v2v":
+                    # Applied unconditionally (not just as a fallback): the per-
+                    # model v2v source-adherence omegas are the authoritative
+                    # defaults for every v2v, even when a request or the chunk
+                    # anchor (bernini.py omega_img) set them.
+                    for _k, _v in (V2V_OMEGA_14B if is_fp8 else V2V_OMEGA_13B).items():
+                        common[_k] = _v
                 try:
                     # Per-step progress_cb is threaded in by the build-time
                     # source patch; if the patch didn't apply upstream, fall
@@ -368,6 +401,10 @@ def main() -> int:
                     output_path=(out if is_root else None),
                     system_prompt=sys_prompt,
                     **generation_kwargs(ns))
+                if task_name == "v2v":
+                    # Applied unconditionally (see 14B branch comment).
+                    for _k, _v in (V2V_OMEGA_14B if is_fp8 else V2V_OMEGA_13B).items():
+                        common[_k] = _v
                 try:
                     pipeline(task["prompt"], **common,
                              progress_cb=_progress_emitter())
