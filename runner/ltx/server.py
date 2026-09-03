@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 import uuid
