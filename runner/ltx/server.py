@@ -1430,13 +1430,11 @@ async def on_startup(_app: web.Application) -> None:
     # video worker doesn't collide with the image worker's warm model on GPU 0.
     video_device = await _pick_video_device(GPU_DEVICE)
 
-    # Pin torch's CURRENT/primary CUDA device to the picked card BEFORE any CUDA
-    # allocation. Without this, torch initializes its default context on device 0
-    # and unqualified ops (.cuda()/device="cuda") leak a ~500MB footprint onto
-    # GPU 0 even though the model loads explicitly on cuda:N -- which collides
-    # with whichever worker actually owns GPU 0. Models still load on cuda:N.
-    torch.cuda.set_device(video_device)
-    _memlog("after set_device")
+    # This aiohttp parent process stays CUDA-FREE. The real engine + GPU (and the
+    # torch.cuda.set_device pin that used to run here) live ONLY in the
+    # `runner.ltx.engine_cli` child, spawned lazily on /load / first generation.
+    # Here we only record the picked device and build the VRAM-aware profile.
+    _chosen_video_device = video_device
 
     # Detect GPU and build the VRAM-aware profile (4090 = streaming/24GB,
     # 5090 = full-resident/32GB, RTX PRO 6000 = full-resident/96GB).
@@ -1451,15 +1449,14 @@ async def on_startup(_app: web.Application) -> None:
     logger.info("GPU: %s (%.1f GB VRAM, mode=%s)",
                 gpu_profile.gpu_name, gpu_profile.vram_gb, gpu_profile.mode)
 
-    # Load inference engine. Prompt enhancement may run on a separate GPU
-    # (ENHANCE_GPU_DEVICE); default to the video pipeline's GPU when unset.
-    device = torch.device(f"cuda:{video_device}")
-    enhance_device = torch.device(f"cuda:{ENHANCE_GPU_DEVICE}") if ENHANCE_GPU_DEVICE else device
-    engine = VideoCreatorInferenceEngine(MODEL_CHECKPOINT, TEXT_ENCODER_ROOT, UPSCALER_PATH, device,
-                                profile=gpu_profile, enhance_device=enhance_device)
-    _memlog("after engine")
-    logger.info("Inference engine ready on %s (mode=%s, max_res=%s)",
-                device, gpu_profile.mode, gpu_profile.max_resolution)
+    # Subprocess-backed engine proxy (see _EngineProxy). No child is spawned
+    # here: the model loads in the child on /load / first generation, and /evict
+    # kills the child, destroying its CUDA primary context so this worker drops
+    # to 0 MiB on every card it had touched.
+    engine = _EngineProxy(video_device)
+    _memlog("after engine proxy")
+    logger.info("Engine proxy on GPU %d (mode=%s, max_res=%s)",
+                video_device, gpu_profile.mode, gpu_profile.max_resolution)
 
     # Report which backend serves /prompt-enhance.
     if ENHANCE_FORWARD_URL:
@@ -1468,12 +1465,10 @@ async def on_startup(_app: web.Application) -> None:
         logger.info("Prompt enhancement: forwarded to %s/v1/chat/completions (local Gemma not loaded)",
                     ENHANCE_FORWARD_URL)
     else:
-        if enhance_device != device:
-            logger.info("Prompt enhancement: local Gemma on %s (video pipeline stays on %s)",
-                        enhance_device, device)
         # Prompt enhancement is served by the provisioned Gemma QAT q4_0 text
-        # encoder at TEXT_ENCODER_ROOT. Report availability at startup so an
-        # unprovisioned box is obvious before /prompt-enhance returns 500s.
+        # encoder at TEXT_ENCODER_ROOT (loaded lazily inside the engine child on
+        # fallback use). Report availability at startup so an unprovisioned box
+        # is obvious before /prompt-enhance returns 500s.
         _gemma_files = (
             [f.name for f in os.scandir(TEXT_ENCODER_ROOT) if f.is_file()]
             if os.path.isdir(TEXT_ENCODER_ROOT) else []
@@ -1487,11 +1482,12 @@ async def on_startup(_app: web.Application) -> None:
                 "provisioned (provision_models.py)", TEXT_ENCODER_ROOT
             )
 
-    # Warmup
+    # Warmup (opt-in): spawn the child and run a warm generation.
     if WARMUP:
         tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         try:
-            engine.warmup(tmp.name)
+            await engine.ensure_loaded()
+            await engine.warmup(tmp.name)
             _memlog("after warmup")
             logger.info("Warmup complete")
         finally:
