@@ -77,7 +77,7 @@ NATIVE_FPS = 16
 # warehouse) across the boundary instead of re-hallucinating it. Keep the
 # source `video` (motion) and single `image` slot intact; this widens only the
 # `images` reference anchor.
-CHUNK_REF_FRAMES = 4  # 14B: keep tight — each ref is a VAE latent tile and the 14B/32GB ceiling is why this is capped.
+CHUNK_REF_FRAMES = 1  # 14B: move back to the single-frame anchor (preceding chunk's LAST output frame) while debugging source-following; the multi-frame refs were pulling the plan toward the re-styled look instead of the source. Each ref is a VAE latent tile, so 1 keeps the 14B/32GB ceiling too.
 
 # 1.3B: widening the appearance anchor is VRAM-cheap, so pass more of the
 # previous chunk's OUTPUT context forward. Each new chunk re-derives the
