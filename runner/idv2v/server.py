@@ -32,7 +32,8 @@ from . import run as run_mod
 from . import gemma_forward
 from . import bernini_io
 from . import bernini as bernini_mod
-from .model import ModelManager, health_check
+from .engine import Idv2vEngine
+from runner.common import engineproc
 
 logger = logging.getLogger("video_creator.runner.idv2v.server")
 
@@ -68,21 +69,24 @@ def _require_token(request: web.Request) -> None:
 # Model lifecycle
 # ---------------------------------------------------------------------------
 
-# One ModelManager instance owned by this worker process.
-_model: ModelManager | None = None
+# The id-v2v diffsynth ModelManager lives in a SEPARATE subprocess (hosted by
+# runner.idv2v.engine_cli and driven through the engineproc JSONL transport).
+# This server process only holds an :class:`Idv2vEngine` PROXY — it never
+# constructs a ModelManager or touches torch.cuda for id-v2v, so /evict can
+# tear the model's CUDA primary context down by killing the child.
 _model_lock = asyncio.Lock()
+_engine = Idv2vEngine()
+# The running aiohttp event loop (captured when the server starts). The Gemma
+# eviction hook is a synchronous callback fired from a worker thread, but
+# stopping the id-v2v engine subprocess must happen on the main loop (its
+# asyncio subprocess transports are loop-bound on Windows) — so the hook
+# schedules the stop there and blocks until it completes.
+_main_loop: asyncio.AbstractEventLoop | None = None
 # Which model is resident: None | "idv2v" | "bernini-1.3b" | "bernini-14b".
 # The worker can serve either family (diffsynth id-v2v pipe, or the Bernini
 # subprocess), and /load places whichever the scheduler asks for on the
 # assigned GPU — one resident video model per card at a time.
 _resident_kind: str | None = None
-
-
-def _get_model() -> ModelManager:
-    global _model
-    if _model is None:
-        _model = ModelManager(device=config.GPU_DEVICE)
-    return _model
 
 
 def _device_from_body(device) -> int | None:
@@ -100,7 +104,7 @@ def _device_from_body(device) -> int | None:
 
 async def handle_load(request: web.Request) -> web.Response:
     _require_token(request)
-    global _model, _resident_kind
+    global _resident_kind
     body = {}
     try:
         body = await request.json()
@@ -127,9 +131,8 @@ async def handle_load(request: web.Request) -> web.Response:
             # Load the Bernini subprocess resident on the assigned GPU. Free the
             # id-v2v diffsynth pipe first (one resident video model per card),
             # unless a restyle is actively generating on it.
-            if _model is not None and not run_mod.generation_active():
-                _model.evict()
-            _model = None
+            if _engine.is_ready and not run_mod.generation_active():
+                await _engine.stop()
             try:
                 mgr = await bernini_mod.get_manager(model=kind, device=device_str)
                 await asyncio.wait_for(mgr.ensure_loaded(), timeout=900)
@@ -143,27 +146,28 @@ async def handle_load(request: web.Request) -> web.Response:
 
         # idv2v (default) — free a resident Bernini subprocess first.
         await bernini_mod.evict_manager()
-        model = _get_model()
-        if model.device != device_str:
+        if _engine.device != device_str:
             logger.info("idv2v-worker /load: relocating GPU %s -> %s",
-                        model.device, device_str)
-            model.set_device(str(device_idx))
-        if model_arg and config.resolve_model(model_arg) == "idv2v":
-            variant = config._norm_variant(model_arg)
-            if model.variant != variant:
-                model.set_variant(variant)
-        if model.is_ready:
-            _resident_kind = "idv2v"
-            return web.json_response(
-                {"loaded": True, "already_loaded": True,
-                 "device": model.device, "model": "idv2v"})
+                        _engine.device, device_str)
+            await _engine.set_device(str(device_idx))
+        # Which id-v2v variant the scheduler asked for (fast/regular); default
+        # resets to config's default when the request omits `model`.
+        variant = config._norm_variant(model_arg) if config.resolve_model(model_arg) == "idv2v" \
+            else config.DEFAULT_MODEL_VARIANT
+        already_loaded = _engine.is_ready and _engine.variant == variant
         try:
-            await asyncio.wait_for(model.load(), timeout=3600)
+            # Spawn the child (if needed) + build the model. ensure_loaded is a
+            # no-op when the same variant is already resident.
+            await asyncio.wait_for(_engine.ensure_loaded(variant), timeout=3600)
+        except engineproc.EngineProcError as exc:
+            return web.json_response(
+                {"error": f"id-v2v load failed: {exc}"}, status=500)
         except asyncio.TimeoutError:
             return web.json_response({"error": "model load timed out"}, status=504)
         _resident_kind = "idv2v"
         return web.json_response(
-            {"loaded": True, "device": model.device, "model": "idv2v"})
+            {"loaded": True, "already_loaded": already_loaded,
+             "device": _engine.device, "model": "idv2v"})
 
 
 def _resident_status() -> dict:
@@ -182,10 +186,16 @@ def _resident_status() -> dict:
             "precision": "bf16",
             "offload": False,
         }
-    model = _model
-    base = health_check(model) if model is not None else {
-        "status": "unloaded", "model_loaded": False, "device": config.GPU_DEVICE,
-        "precision": config.IDV2V_QUANT, "offload": config.IDV2V_OFFLOAD,
+    ready = _engine.is_ready
+    base = {
+        "status": "ok" if ready else "unloaded",
+        "device": _engine.device,
+        "model_loaded": ready,
+        "precision": ("fp8-from-hf" if config.IDV2V_SOURCE == "hf-fp8"
+                       else config.IDV2V_QUANT),
+        "variant": _engine.variant,
+        "hf_subfolder": config.subfolder_for(_engine.variant),
+        "offload": config.IDV2V_OFFLOAD,
     }
     base["resident_kind"] = _resident_kind
     base["model"] = "idv2v" if _resident_kind == "idv2v" else None
@@ -194,11 +204,12 @@ def _resident_status() -> dict:
 
 async def handle_evict(request: web.Request) -> web.Response:
     _require_token(request)
-    global _model, _resident_kind
+    global _resident_kind
     async with _model_lock:
-        if _model is not None:
-            _model.evict()
-        _model = None
+        # id-v2v: stop the ModelManager SUBPROCESS. Its process exit destroys
+        # the CUDA primary context — the only reliable way to release the GPU
+        # (an in-process evict() cannot drop the driver-reserved floor).
+        await _engine.stop()
         await bernini_mod.evict_manager()
         _resident_kind = None
     return web.json_response({"evicted": True})
@@ -221,13 +232,12 @@ def _device_index() -> int:
                 except ValueError:
                     pass
         return 0
-    if _model is not None:
-        cur = str(_model.device)
-        if ":" in cur:
-            try:
-                return int(cur.split(":")[1])
-            except ValueError:
-                pass
+    cur = str(_engine.device)
+    if ":" in cur:
+        try:
+            return int(cur.split(":")[1])
+        except ValueError:
+            pass
     ds = str(config.GPU_DEVICE)
     if ":" in ds:
         try:
@@ -487,31 +497,25 @@ async def handle_restyle(request: web.Request) -> web.Response:
         get_enhancer().unload()
     except Exception:
         pass
-    model = _get_model()
     async with _model_lock:
         # A restyle needs the id-v2v pipe (never bernini) — free a resident
         # Bernini subprocess first so they don't share the GPU.
         await bernini_mod.evict_manager()
-        if not model.is_ready:
-            model.set_variant(requested)
-            try:
-                await asyncio.wait_for(model.load(), timeout=3600)
-            except asyncio.TimeoutError:
-                return web.json_response({"error": "model load timed out", "job_id": job_id}, status=504)
-        elif model.variant != requested:
-            logger.info("Switching idv2v model variant %s -> %s", model.variant, requested)
-            model.evict()
-            model.set_variant(requested)
-            try:
-                await asyncio.wait_for(model.load(), timeout=3600)
-            except asyncio.TimeoutError:
-                return web.json_response({"error": "model load timed out", "job_id": job_id}, status=504)
+        try:
+            # Spawn/build the id-v2v ModelManager subprocess on the requested
+            # variant (ensures a loaded engine is resident before process_job).
+            await asyncio.wait_for(_engine.ensure_loaded(requested), timeout=3600)
+        except engineproc.EngineProcError as exc:
+            return web.json_response(
+                {"error": f"id-v2v load failed: {exc}", "job_id": job_id}, status=500)
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "model load timed out", "job_id": job_id}, status=504)
         _resident_kind = "idv2v"
     try:
-        result = await run_mod.process_job(model, body, job_id=job_id)
+        result = await run_mod.process_job(_engine, body, job_id=job_id)
         run_mod.set_progress(job_id, 1.0, "complete", "restyle done")
         result["job_id"] = job_id
-        result["model"] = model.variant
+        result["model"] = _engine.variant
     except Exception as exc:
         run_mod.set_progress(job_id, -1, "failed", str(exc))
         logger.error("Restyle job failed: %s", exc, exc_info=True)
@@ -562,7 +566,7 @@ async def handle_bernini(request: web.Request) -> web.Response:
     post rails orchestrated by the live-runner.
     """
     _require_token(request)
-    global _model, _resident_kind
+    global _resident_kind
     # Routes are STATIC paths (aiohttp match_info has no {task} placeholder),
     # so derive the task from the request path. Handles every alias:
     #   /v1/t2v            -> t2v
@@ -603,10 +607,10 @@ async def handle_bernini(request: web.Request) -> web.Response:
         device=_dev_header.strip() if _dev_header.strip() else None,
     )
     # One resident video model per card: if the id-v2v diffsynth pipe is
-    # resident, drop it before the Bernini subprocess allocates the shared GPU.
-    if _model is not None and not run_mod.generation_active():
-        _model.evict()
-        _model = None
+    # resident, drop it (kill its subprocess) before the Bernini subprocess
+    # allocates the shared GPU.
+    if _engine.is_ready and not run_mod.generation_active():
+        await _engine.stop()
     _resident_kind = manager.model
     run_mod.set_progress(job_id, 0.02, "bernini", "decoding media")
     with bernini_io.tmpdir_context() as tmpdir:

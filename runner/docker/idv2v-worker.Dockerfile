@@ -82,6 +82,18 @@ RUN pip install --no-cache-dir --no-build-isolation "git+https://github.com/thu-
 RUN useradd -m runneruser
 WORKDIR /app
 COPY runner/ ./runner/
+
+# The resident diff-synth ModelManager runs in a CHILD MODEL SUBPROCESS
+# (runner.idv2v.engine_cli) so /evict can destroy the CUDA primary context by
+# killing the child (PyTorch has no in-process teardown). The server spawns
+# `python -m runner.idv2v.engine_cli --device cuda:N` at /load; COPY runner/
+# above ships runner/common/ + runner/idv2v/engine_cli.py, and /app is on
+# sys.path for `-m`. The parent aiohttp server stays CUDA-free; /evict merely
+# TERMINATES the child (Bernini already runs as its own subprocess). Verify the
+# child imports at build time so a broken child fails the build.
+RUN python -c "import runner.idv2v.engine_cli" \
+    && python -c "import runner.common.engineproc"
+
 RUN mkdir -p /models && chown runneruser:runneruser /models
 USER runneruser
 

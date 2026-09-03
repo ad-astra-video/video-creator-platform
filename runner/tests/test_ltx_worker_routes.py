@@ -46,6 +46,7 @@ def ltx_server(monkeypatch):
         "GPU_VRAM_GB": 0, "HOST": "0.0.0.0", "MODEL_CHECKPOINT": "/models/x",
         "PORT": 8991, "TEXT_ENCODER_ROOT": "/models/gemma", "UPSCALER_PATH": "",
         "WARMUP": False, "IDV2V_WORKER_URL": "http://idv2v-worker:8992",
+        "LIVE_RUNNER_URL": "http://live-runner:8990",
         "worker_token": lambda: "tok",
     }.items():
         setattr(cfg, k, v)

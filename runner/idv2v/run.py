@@ -31,18 +31,21 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-async def process_job(model, body: dict, job_id: str | None = None) -> dict:
+async def process_job(engine, body: dict, job_id: str | None = None) -> dict:
     """Process a restylization job request.
 
     Args:
-        model: a ready `ModelManager` instance (owned/evicted by the worker).
+        engine: a ready id-v2v engine proxy owning the ModelManager SUBPROCESS
+                (see runner.idv2v.engine). Only `engine.is_ready`,
+                `engine.variant`, and the async `engine.infer_frames(...)` GPU
+                step are consumed here.
         body: parsed JSON containing source_video, stylized_first_frame, prompt,
               and parameters.
 
     Returns:
         dict matching the IdV2VResponse schema.
     """
-    if not model.is_ready:
+    if not engine.is_ready:
         raise RuntimeError("Model is not loaded yet — retry in a moment")
 
     start = time.time()
@@ -64,7 +67,7 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
         _explicit_fps = None
     # A 0/omitted inference_steps resolves to the loaded model variant's default
     # budget (fast=8, regular=30). An explicit >0 value is honored as-is.
-    inference_steps = int(body.get("inference_steps") or config.steps_for(model.variant))
+    inference_steps = int(body.get("inference_steps") or config.steps_for(engine.variant))
     cfg_scale = float(body.get("cfg_scale", 5.0))
     vace_scale = float(body.get("vace_scale", 1.0))
     width = int(body.get("width", 1280))
@@ -111,8 +114,6 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
         keyframe_specs.append((idx, img))
 
     set_progress(job_id, 0.01, "preprocessing", "decoding source + conditioning")
-    def _prog(progress, stage, message, step=None, total=None):
-        set_progress(job_id, progress, stage, message, step=step, total=total)
 
     # Optional Gemma LLM stage: automatically caption the source video when the
     # prompt is blank/placeholder, and/or run prompt enhancement on the final
@@ -131,13 +132,40 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
 
     set_generation_active(True)
     try:
-        result = await asyncio.to_thread(
-            _run_pipeline,
-            model, source_b64, stylized_b64, prompt,
-            max_frames, inference_steps, cfg_scale, vace_scale,
-            num_frames_per_clip, seed, keyframe_specs, width, height,
-            _explicit_fps, _prog,
+        # Conditioning (decode source/stylized, SAM3 subprocess, anchor +
+        # keyframe decode) stays in the PARENT — it only uses cv2/PIL plus the
+        # SAM3 segmentation SUBPROCESS (its own self-evicting CUDA), never
+        # torch.cuda in this process.
+        cond = await asyncio.to_thread(
+            _prepare_conditioning,
+            source_b64, stylized_b64, keyframe_specs, width, height)
+
+        # The GPU denoise step runs in the ModelManager SUBPROCESS via the
+        # engine proxy; its per-clip progress lines are bridged back onto the
+        # SSE rail by the proxy (through run_mod.set_progress/set_preview).
+        out = await engine.infer_frames(
+            prompt=prompt,
+            negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+            input_image=cond["input_image"],
+            condition_frames=cond["condition_frames"],
+            keyframes=cond["keyframes"],
+            width=width, height=height,
+            num_frames=num_frames_per_clip,
+            max_frames=max_frames,
+            num_inference_steps=inference_steps,
+            cfg_scale=cfg_scale, vace_scale=vace_scale,
+            seed=seed, job_id=job_id,
         )
+        frames = out["frames"]
+
+        # Output fps: explicit 24/25/30 wins; otherwise match the source video's
+        # fps (falling back to 24 if the container doesn't carry a sane rate).
+        src_fps = await asyncio.to_thread(_read_source_fps, cond["source_path"])
+        out_fps = _explicit_fps if _explicit_fps is not None else (src_fps or 24.0)
+        logger.info("restyle output fps=%s (explicit=%s source=%s)",
+                    out_fps, _explicit_fps, src_fps)
+
+        b64 = await asyncio.to_thread(_encode_frames_mp4, frames, out_fps)
     finally:
         set_generation_active(False)
 
@@ -145,8 +173,8 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
     logger.info("Restyle job complete in %.1fs", elapsed)
 
     return {
-        "output_video": result["b64"],
-        "frames_generated": result["frames"],
+        "output_video": b64,
+        "frames_generated": out["count"],
         "resolution": f"{width}x{height}",
         "processing_time_sec": round(elapsed, 2),
         # Gemma LLM artifacts for the UI to save/display for reference.
@@ -156,11 +184,31 @@ async def process_job(model, body: dict, job_id: str | None = None) -> dict:
     }
 
 
-def _run_pipeline(model, source_b64, stylized_b64, prompt, max_frames,
-                  inference_steps, cfg_scale, vace_scale, num_frames_per_clip,
-                  seed, keyframe_specs, width, height,
-                  fps=None, progress_cb=None) -> dict:
-    """Synchronous pipeline body (runs in a worker thread)."""
+def _pil_to_png_b64(img) -> str:
+    """Encode a PIL RGB frame as a base64 PNG (parent<->child serialization)."""
+    import base64 as _b64
+    import io as _io
+    from PIL import Image
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(img)
+    buf = _io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return _b64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _prepare_conditioning(source_b64, stylized_b64, keyframe_specs,
+                          width, height) -> dict:
+    """Synchronous conditioning stage (runs in a worker thread).
+
+    Decodes the source video + stylized first frame, runs the SAM3
+    foreground segmentation SUBPROCESS, reads the condition frames, decodes
+    keyframes and loads the anchor frame — everything before the GPU denoise.
+    Only uses cv2/PIL + subprocess (never torch.cuda in this process).
+
+    Returns a JSON-safe package for the child's ``infer_frames`` op:
+    ``source_path`` (for the output fps match), plus base64 PNGs for the
+    condition video frames, the anchor (input) frame and the keyframes.
+    """
     tmpdir = tempfile.mkdtemp(prefix="idv2v_")
 
     source_path = os.path.join(tmpdir, "source.mp4")
@@ -170,36 +218,18 @@ def _run_pipeline(model, source_b64, stylized_b64, prompt, max_frames,
 
     cond_frames = _segment_foreground(source_path, stylized_path, tmpdir, width, height)
 
+    input_image = _load_anchor(stylized_path, width, height)
+
     decoded_kf = []
     for idx, img_b64 in keyframe_specs:
         decoded_kf.append((idx, _decode_image(img_b64)))
 
-    input_image = _load_anchor(stylized_path, width, height)
-
-    frames = model.infer(
-        prompt=prompt,
-        negative_prompt=DEFAULT_NEGATIVE_PROMPT,
-        input_image=input_image,
-        condition_videos=[cond_frames],
-        keyframes=decoded_kf,
-        width=width, height=height,
-        num_frames=num_frames_per_clip,
-        max_frames=max_frames,
-        num_inference_steps=inference_steps,
-        cfg_scale=cfg_scale,
-        vace_scale=vace_scale,
-        seed=seed,
-        progress_cb=progress_cb,
-    )
-
-    # Output fps: explicit 24/25/30 wins; otherwise match the source video's fps
-    # (falling back to 24 if the container doesn't carry a sane rate).
-    src_fps = _read_source_fps(source_path)
-    out_fps = fps if fps is not None else (src_fps or 24.0)
-    logger.info("restyle output fps=%s (requested=%s source=%s)", out_fps, fps, src_fps)
-
-    b64 = _encode_frames_mp4(frames, out_fps)
-    return {"b64": b64, "frames": len(frames)}
+    return {
+        "source_path": source_path,
+        "condition_frames": [_pil_to_png_b64(f) for f in cond_frames],
+        "input_image": _pil_to_png_b64(input_image),
+        "keyframes": [[idx, _pil_to_png_b64(img)] for idx, img in decoded_kf],
+    }
 
 
 import threading

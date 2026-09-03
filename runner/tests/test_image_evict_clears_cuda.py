@@ -117,17 +117,29 @@ def image_server(monkeypatch):
     return server
 
 
-def _registered_engine(image_server, engine_cls, device):
-    e = engine_cls(profile=None)
-    e.current_device = device
-    image_server._engines[device] = e
+class _FakeProxy:
+    """Parent-side proxy stand-in: records stop() calls (the /evict mechanism
+    now TERMINATES the model subprocess; the raw engine never lives in the
+    parent, so proxies report their own eviction, not a freed engine)."""
+
+    def __init__(self, device):
+        self.current_device = device
+        self.stopped = 0
+
+    async def stop(self):
+        self.stopped += 1
+
+
+def _registered_engine(image_server, device):
+    p = _FakeProxy(device)
+    image_server._engines[device] = p
     image_server._device_locks[device] = __import__("asyncio").Lock()
-    return e
+    return p
 
 
-def test_image_route_evict_frees_only_requested_device(image_server, engine_cls, fake_torch):
-    e0 = _registered_engine(image_server, engine_cls, 0)
-    e1 = _registered_engine(image_server, engine_cls, 1)
+def test_image_route_evict_frees_only_requested_device(image_server, fake_torch):
+    p0 = _registered_engine(image_server, 0)
+    p1 = _registered_engine(image_server, 1)
 
     import asyncio
     resp = asyncio.run(image_server.handle_evict(_FakeReq(0)))
@@ -136,18 +148,23 @@ def test_image_route_evict_frees_only_requested_device(image_server, engine_cls,
     assert 0 not in image_server._engines, "device 0 must be removed from the registry"
     assert 0 not in image_server._device_locks, "device 0 lock must be dropped"
     assert 1 in image_server._engines, "device 1 (other card) must stay warm"
-    assert e1 is image_server._engines[1]
-    assert e0._qwen_edit is None or e0.ready is False
+    assert p1 is image_server._engines[1]
+    assert p0.stopped == 1, "device 0's subprocess must be terminated (CUDA ctx destroyed)"
+    assert p1.stopped == 0, "device 1's warm subprocess must survive"
 
 
-def test_image_route_evict_idempotent_and_all_device(image_server, engine_cls, fake_torch):
-    _registered_engine(image_server, engine_cls, 0)
-    _registered_engine(image_server, engine_cls, 1)
+def test_image_route_evict_idempotent_and_all_device(image_server, fake_torch):
+    p0 = _registered_engine(image_server, 0)
+    p1 = _registered_engine(image_server, 1)
     import asyncio
     asyncio.run(image_server.handle_evict(_FakeReq(0)))
+    assert p0.stopped == 1
     # Evicting the same device again (already gone) must not raise.
+    before = p1.stopped
     asyncio.run(image_server.handle_evict(_FakeReq(0)))
+    assert p1.stopped == before
     # No-device evict frees ALL remaining engines.
     asyncio.run(image_server.handle_evict(_FakeReq(None)))
     assert image_server._engines == {}
     assert image_server._device_locks == {}
+    assert p1.stopped == 1, "no-device evict must terminate every remaining subprocess"

@@ -9,29 +9,37 @@ Orchestrator (that is live-runner's job); it only serves the inference surface
 and the worker control plane over the Docker network.
 
 The aiohttp route layer imports cleanly WITHOUT torch/diffusers — every GPU
-dependency is reached lazily through the engine, so the routes are testable
-standalone.
+dependency lives in a child MODEL SUBPROCESS (``runner.image.engine_cli``),
+so the routes are testable standalone and the PARENT process stays CUDA-free.
 
-MULTI-ENGINE (one request per GPU at a time): the worker holds one
-``ImageInferenceEngine`` per resident CUDA device, each bound to that device
-and with its own serialization lock, so concurrent requests on DIFFERENT GPUs
-run in parallel. The live-runner's scheduler picks the GPU and forwards it via
-the ``X-Worker-Device`` header; when absent (backward compat) the last
-/load'ed device is used.
+MODEL SUBPROCESS architecture: the real ``ImageInferenceEngine`` (and the
+FLUX.2 klein singleton) run in a DEDICATED child python process that owns the
+CUDA primary context. The parent holds one ``ImageEngineProxy`` per resident
+CUDA device, each owning a child via ``runner.common.engineproc.EngineProc``.
+/load spawns the child; /evict TERMINATES it — killing the subprocess is the
+only way to destroy a CUDA context (PyTorch has no in-process teardown API),
+so an evicted worker leaves NO primary-context floor on the GPU.
+
+MULTI-ENGINE (one request per GPU at a time): each device's proxy has its own
+serialization lock, so concurrent requests on DIFFERENT GPUs run in parallel
+on their own subprocesses. The live-runner's scheduler picks the GPU and
+forwards it via the ``X-Worker-Device`` header; when absent (backward compat)
+the last /load'ed device is used.
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import logging
 import os
 import random
+import sys
 import uuid
 
 from aiohttp import web
 
+from runner.common import engineproc
 from runner.image.config import (
     APP_ID,
     DEFAULT_DEVICE,
@@ -43,7 +51,8 @@ from runner.image.config import (
     QWEN_MAX_LAYERS,
     worker_token,
 )
-from runner.image.inference import ImageInferenceEngine
+from runner.image.inference import _decoded_pil as _pil_from_b64
+from runner.image.inference import _pil_to_b64
 from runner.ltx.gpu_profile import build_profile
 
 logger = logging.getLogger(__name__)
@@ -57,19 +66,179 @@ _MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(3 * 1024 ** 3)))
 gpu_profile = None
 ready = False
 
-# MULTI-ENGINE: one ImageInferenceEngine per resident CUDA device + one lock
-# per device, so concurrent requests on DIFFERENT GPUs run in parallel (one
-# request per GPU at a time). Engines are created lazily on /load (models
-# themselves build lazily inside the engine on first generation).
-_engines: dict[int, "ImageInferenceEngine"] = {}
+# MULTI-ENGINE: one ImageEngineProxy per resident CUDA device + one lock per
+# device, so concurrent requests on DIFFERENT GPUs run in parallel (one request
+# per GPU at a time). Each proxy owns a MODEL SUBPROCESS (runner.image.engine_cli)
+# that holds the real ImageInferenceEngine and its CUDA context. Proxies are
+# created lazily on /load; the child process is spawned on /load (ensure_loaded)
+# or on the first generation (EngineProc.run auto-starts when absent). /evict
+# TERMINATES the child, which is what actually destroys the CUDA context.
+_engines: dict[int, "ImageEngineProxy"] = {}
 _device_locks: dict[int, asyncio.Lock] = {}
 _default_device: int | None = None
 
-# FLUX.2 klein runs through the flux_edit MODULE SINGLETON (get_editor), which
-# can only live on ONE GPU at a time — so klein generation is serialized
-# GLOBALLY across devices regardless of the per-device spread. qwen-edit /
-# z-image / hidream engines are per-instance and DO spread across GPUs.
+# FLUX.2 klein runs inside whatever child handles the klein request (the
+# flux_edit singleton lives in the CHILD process, one GPU at a time) — so klein
+# generation is serialized GLOBALLY across devices regardless of the per-device
+# spread. qwen-edit / z-image / hidream engines are per-instance and DO spread
+# across GPUs (each in its own child).
 _klein_lock = asyncio.Lock()
+
+
+class ImageEngineProxy:
+    """Parent-side stand-in for ``ImageInferenceEngine`` that delegates to a
+    model subprocess via ``engineproc.EngineProc`` (JSONL over the child's
+    stdin/stdout).
+
+    Generation methods mirror the engine's public signatures and return the SAME
+    types the server handlers expect (``PIL.Image`` for the *_image / edit /
+    style_frame methods, the pre-serialized /layer dict for layered_decompose),
+    so the HTTP + SSE handlers are otherwise unchanged. The proxy NEVER touches
+    CUDA — it only serializes JSON to/from the child. The child is where the GPU
+    engine, the CUDA context, and the FLUX.2 klein singleton live.
+    """
+
+    _STARTUP_TIMEOUT = int(os.environ.get("IMAGE_CHILD_STARTUP_TIMEOUT", "900"))
+    _JOB_TIMEOUT = int(os.environ.get("IMAGE_CHILD_JOB_TIMEOUT", "900"))
+
+    def __init__(self, device: int) -> None:
+        self.current_device = int(device)
+        self.ready = False
+        # ``sys.executable -m runner.image.engine_cli --device N`` — run through
+        # the same interpreter that launched the server, so the child gets the
+        # same venv, packages, and (via PYTHONPATH) the same repo root module
+        # layout. In the container WORKDIR=/app is on sys.path for -m, but we
+        # pass PYTHONPATH explicitly so the child also resolves ``runner.*``
+        # when the server was launched from elsewhere.
+        self._proc = engineproc.EngineProc(
+            label=f"image-{device}",
+            argv=[
+                sys.executable, "-m", "runner.image.engine_cli",
+                "--device", str(self.current_device),
+            ],
+            startup_timeout=self._STARTUP_TIMEOUT,
+            job_timeout=self._JOB_TIMEOUT,
+            env_extra={"PYTHONPATH": _child_pythonpath()},
+        )
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+    @property
+    def started(self) -> bool:
+        """Whether the backing subprocess is alive (its CUDA context resident)."""
+        return bool(getattr(self._proc, "_ready", False))
+
+    async def ensure_loaded(self) -> None:
+        """Spawn (or re-spawn) the model subprocess and wait for its ready
+        handshake (engine shell built; weights still lazy)."""
+        await self._proc.start()
+        self.ready = True
+
+    async def stop(self) -> None:
+        """Terminate the model subprocess — destroying its CUDA primary
+        context. This is the /evict mechanism. Idempotent."""
+        await self._proc.stop()
+        self.ready = False
+
+    # ── dispatch ───────────────────────────────────────────────────────────
+    async def _dispatch(self, op: str, args: dict | None,
+                        progress_cb=None, timeout: float | None = None):
+        """Send one op to the child. ``progress_cb`` (server's 2-arg SSE shape
+        ``(step, total)``) is adapted to the child's progress line
+        ``{"step":.., "total_steps":..}``."""
+        child_pb = None
+        if progress_cb is not None:
+            def child_pb(line):
+                try:
+                    progress_cb(
+                        int(line.get("step", 0)),
+                        int(line.get("total_steps", 0)),
+                    )
+                except Exception:  # noqa: BLE001 - never break on progress
+                    pass
+        return await self._proc.run(op, args, timeout=timeout, progress_cb=child_pb)
+
+    async def query_op(self, op: str, args: dict | None = None,
+                       timeout: float | None = None):
+        """Run an op but ONLY when the child is already resident (never spawns a
+        child to answer a read, e.g. /info's klein residency probe)."""
+        if not self.started:
+            return None
+        return await self._dispatch(op, args, timeout=timeout)
+
+    # ── engine-method mirror (return the same types the handlers expect) ──
+    async def edit_image(self, image, prompt, engine="qwen-edit", mask=None,
+                         keep_subject=False, strength=0.6, padding_mask_crop=0,
+                         mask_composite=True, progress_cb=None, **kw):
+        res = await self._dispatch("edit_image", {
+            "image": image, "prompt": prompt, "engine": engine, "mask": mask,
+            "keep_subject": bool(keep_subject), "strength": float(strength),
+            "padding_mask_crop": int(padding_mask_crop or 0),
+            "mask_composite": bool(mask_composite), "kw": dict(kw),
+        }, progress_cb)
+        return _pil_from_b64(res["image_b64"])
+
+    async def hidream_edit(self, image, prompt, seed=None, keep_original_aspect=True,
+                           num_inference_steps=None, quality=None, progress_cb=None,
+                           **kw):
+        res = await self._dispatch("hidream_edit", {
+            "image": image, "prompt": prompt, "seed": seed,
+            "keep_original_aspect": bool(keep_original_aspect),
+            "num_inference_steps": num_inference_steps, "quality": quality,
+            "kw": dict(kw),
+        }, progress_cb)
+        return _pil_from_b64(res["image_b64"])
+
+    async def hidream_image(self, prompt, width=1024, height=1024, seed=None,
+                            num_inference_steps=None, guidance_scale=None,
+                            quality=None, progress_cb=None, **kw):
+        res = await self._dispatch("hidream_image", {
+            "prompt": prompt, "width": width, "height": height, "seed": seed,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale, "quality": quality,
+            "kw": dict(kw),
+        }, progress_cb)
+        return _pil_from_b64(res["image_b64"])
+
+    async def plain_image(self, prompt, **kw):
+        res = await self._dispatch(
+            "plain_image", {"prompt": prompt, "kw": dict(kw)})
+        return _pil_from_b64(res["image_b64"])
+
+    async def klein_image(self, prompt, seed=123, width=1024, height=1024,
+                          num_inference_steps=None, **kw):
+        res = await self._dispatch("klein_image", {
+            "prompt": prompt, "seed": seed, "width": width, "height": height,
+            "num_inference_steps": num_inference_steps, "kw": dict(kw),
+        })
+        return _pil_from_b64(res["image_b64"])
+
+    async def style_frame(self, image, prompt, seed=123, width=None, height=None,
+                          num_inference_steps=None):
+        res = await self._dispatch("style_frame", {
+            "image": image, "prompt": prompt, "seed": seed,
+            "width": width, "height": height,
+            "num_inference_steps": num_inference_steps,
+        })
+        return _pil_from_b64(res["image_b64"])
+
+    async def layered_decompose(self, image, layers=None, resolution=None,
+                                preview_only=False, num_inference_steps=None,
+                                progress_cb=None):
+        # The child returns the /layer contract dict already — pass straight
+        # through (no image decode).
+        return await self._dispatch("layered_decompose", {
+            "image": image, "layers": layers, "resolution": resolution,
+            "preview_only": bool(preview_only),
+            "num_inference_steps": num_inference_steps,
+        }, progress_cb)
+
+
+def _child_pythonpath() -> str:
+    """PYTHONPATH for the model child: the server's cwd (repo root / /app) plus
+    any parent PYTHONPATH, so ``-m runner.image.engine_cli`` resolves ``runner``
+    regardless of launch cwd."""
+    parts = [p for p in (os.getcwd(), os.environ.get("PYTHONPATH", "")) if p]
+    return os.pathsep.join(parts)
 
 
 def _device_lock(device: int) -> asyncio.Lock:
@@ -96,11 +265,17 @@ def _resolve_device(req: web.Request) -> int:
     return DEFAULT_DEVICE
 
 
-def _engine_for(device: int) -> "ImageInferenceEngine":
-    """Return (creating on demand) the engine bound to CUDA ``device``."""
-    _pin_cuda_device(device)
+def _engine_for(device: int) -> "ImageEngineProxy":
+    """Return (creating on demand) the model-subprocess proxy for CUDA ``device``.
+
+    Pure object construction + EngineProc handle — NO CUDA work happens here and
+    nothing is spawned until /load (``ensure_loaded``) or the first generation
+    (EngineProc.run auto-starts the child). The parent process never touches the
+    GPU; the child owns the engine and its context.
+    """
+    device = int(device)
     if device not in _engines:
-        e = ImageInferenceEngine(profile=gpu_profile)
+        e = ImageEngineProxy(device)
         e.current_device = device
         _engines[device] = e
     return _engines[device]
@@ -122,7 +297,13 @@ def _require_token(request: web.Request) -> None:
 
 
 def _devices_visible() -> int:
-    """Number of visible CUDA devices, or 0 when torch/CUDA isn't available."""
+    """Number of visible CUDA devices, or 0 when torch/CUDA isn't available.
+
+    ``torch.cuda.device_count()`` is a context-FREE driver query (it neither
+    creates nor pins a CUDA primary context), used only to clamp the scheduler's
+    device index to this container's visible cards. All context-bearing CUDA
+    work happens in the model subprocess, never here.
+    """
     try:
         import torch  # lazy
         if torch.cuda.is_available():
@@ -132,39 +313,24 @@ def _devices_visible() -> int:
     return 0
 
 
-def _klein_resident_device() -> int | None:
+async def _klein_resident_device() -> int | None:
     """CUDA index the FLUX.2 klein singleton is resident on (None if not loaded).
 
-    klein runs through a process-global singleton (flux_edit.get_editor()) that
-    can live on ONE GPU at a time, independent of the per-device _engines dict.
-    The scheduler's reconcile reads /info devices to know which cards a worker
-    owns; without this, klein's real GPU was invisible there and never evicted.
+    klein lives inside a MODEL SUBPROCESS (the ``flux_edit`` singleton exists
+    only in the child that handled the last klein request), so we ask each
+    already-resident proxy's child via the ``klein_resident_device`` op. The
+    parent itself never imports the flux_edit module or touches
+    CUDA. Proxies whose child isn't running are skipped (no klein there).
     """
-    try:
-        from . import flux_edit
-        e = flux_edit.get_editor()
-        if e.is_ready:
-            dev = str(e.device)
-            if dev.startswith("cuda:"):
-                return int(dev.split(":", 1)[1])
-    except Exception:
-        pass
+    for device in sorted(_engines):
+        proxy = _engines[device]
+        try:
+            res = await proxy.query_op("klein_resident_device", timeout=5)
+        except Exception:
+            continue
+        if isinstance(res, int):
+            return res
     return None
-
-
-def _pin_cuda_device(device: int) -> None:
-    """Pin this process's ACTIVE CUDA device to the worker's assigned GPU so no
-    context is created on an unassigned card (torch's default is cuda:0, which a
-    multi-GPU worker would otherwise leave a stray context on). Best-effort: the
-    first CUDA touch in a process creates a persistent context, so this must run
-    before any allocation on the assigned device. torch has no public context
-    destroy, so a context parked BEFORE this bin is only reclaimed at teardown."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.set_device(int(device))
-    except Exception:
-        pass
 
 
 def _estimate_bytes(obj) -> int:
@@ -183,18 +349,17 @@ def _estimate_bytes(obj) -> int:
 
 
 async def _run_generation(fn, device: int, *args, **kwargs):
-    """Run a blocking engine generation off the event loop on ``device``.
+    """Run a generation op on ``device`` through the model-subprocess proxy.
 
-    The engine's generation methods are synchronous (GPU-bound). Dispatching to
-    a worker thread (serialized by that device's lock) keeps the asyncio
-    heartbeat responsive so the orchestrator never drops the runner. Requests on
-    DIFFERENT devices use different locks and therefore run concurrently.
+    ``fn`` is an async ``ImageEngineProxy`` method. The per-device lock
+    serializes the requests on that GPU (two concurrent requests on one device
+    must not both write the child's stdin); requests on DIFFERENT devices use
+    DIFFERENT locks and therefore run concurrently, in parallel on their own
+    subprocesses. The await itself is non-blocking (I/O over the child pipe), so
+    the asyncio heartbeat stays responsive.
     """
     async with _device_lock(device):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, functools.partial(fn, *args, **kwargs)
-        )
+        return await fn(*args, **kwargs)
 
 
 # ── Control-plane routes (token-gated) ─────────────────────
@@ -226,6 +391,10 @@ async def handle_load(req: web.Request) -> web.Response:
         device = max(0, min(device, visible - 1))
     e = _engine_for(device)
     e.current_device = device
+    # Spawn the model subprocess now so the card is actually claimed (the child
+    # builds its engine shell; weights stay lazy until the first generation).
+    # The engine/build no longer happens in THIS (parent) process at all.
+    await e.ensure_loaded()
     _default_device = device
     logger.info("image-worker /load: device=%s model=%s (visible=%d, engines=%s)",
                 device, model_hint, visible, sorted(_engines))
@@ -233,12 +402,18 @@ async def handle_load(req: web.Request) -> web.Response:
 
 
 async def handle_evict(req: web.Request) -> web.Response:
-    """POST /evict — drop resident pipelines + free GPU memory.
+    """POST /evict — KILL the model subprocess(es), destroying their CUDA
+    contexts and freeing the GPU(s).
 
     ``{"device": N}`` frees only that ONE card of a multi-resident worker so the
     copies still warm on other cards survive; no device (legacy) frees ALL
     engines. Called by the live-runner before it swaps in another worker's model
-    on that GPU. The next /v1/* generation reloads lazily."""
+    on that GPU. Killing the child is the ONLY way to destroy a CUDA primary
+    context (PyTorch cannot do it in-process); the next /v1/* generation
+    re-spawns a fresh child lazily. The FLUX.2 klein singleton lives inside the
+    child too, so stopping it also frees klein's VRAM — no separate parent-side
+    flux_edit eviction is needed.
+    """
     _require_token(req)
     try:
         body = await req.json()
@@ -246,43 +421,20 @@ async def handle_evict(req: web.Request) -> web.Response:
         body = {}
     device = body.get("device")
     if device is None:
-        for e in list(_engines.values()):
-            e.free()
+        for proxy in list(_engines.values()):
+            await proxy.stop()
         _engines.clear()
         _device_locks.clear()
-        # klein is a separate process-global singleton; free it on a full evict
-        # too so no orphaned VRAM is left on any card.
-        try:
-            from . import flux_edit
-            flux_edit.evict_editor()
-        except Exception:
-            pass
-        logger.info("image-worker /evict: all devices freed")
+        logger.info("image-worker /evict: all model subprocesses stopped")
     else:
         device = int(device)
-        e = _engines.pop(device, None)
-        if e is not None:
-            # Target the vacated card so free()'s synchronize + empty_cache
-            # reclaim that card's VRAM (the process's active device decides
-            # which card empty_cache() flushes).
-            _pin_cuda_device(device)
-            e.free()
+        proxy = _engines.pop(device, None)
+        if proxy is not None:
+            # Terminate the child -> its CUDA context is destroyed, freeing the
+            # GPU (and any klein editor resident in it).
+            await proxy.stop()
         _device_locks.pop(device, None)
-        # If the klein singleton is resident on the evicted card, drop it (its
-        # residency is not in _engines, so only a conscious check frees it).
-        if _klein_resident_device() == device:
-            try:
-                from . import flux_edit
-                flux_edit.evict_editor()
-            except Exception:
-                pass
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        logger.info("image-worker /evict: device %d freed", device)
+        logger.info("image-worker /evict: device %d subprocess stopped", device)
     return web.json_response({"evicted": True})
 
 
@@ -306,7 +458,7 @@ async def handle_info(_req: web.Request) -> web.Response:
     # GPU so the scheduler's reconcile sees every card this worker owns — the
     # missing piece that let a style-frame park 18.6 GiB on a card the map
     # thought was free (co-residency when a video task later took it).
-    klein_dev = _klein_resident_device()
+    klein_dev = await _klein_resident_device()
     if klein_dev is not None:
         device_in_use = device_in_use if device_in_use is not None else klein_dev
         devs = set(_engines) | {klein_dev}
@@ -390,27 +542,22 @@ async def _run_edit_sse(req: web.Request, body: dict) -> web.StreamResponse:
     async with _device_lock(device):
         try:
             if engine_name == "hidream":
-                img = await loop.run_in_executor(
-                    None, functools.partial(
-                        e.hidream_edit, body["image"], prompt,
-                        seed=kw.get("seed"),
-                        num_inference_steps=kw.get("num_inference_steps"),
-                        quality=body.get("quality"), progress_cb=_progress,
-                    )
+                img = await e.hidream_edit(
+                    body["image"], prompt,
+                    seed=kw.get("seed"),
+                    num_inference_steps=kw.get("num_inference_steps"),
+                    quality=body.get("quality"), progress_cb=_progress,
                 )
             else:
-                img = await loop.run_in_executor(
-                    None, functools.partial(
-                        e.edit_image,
-                        body["image"], prompt,
-                        engine=engine_name,
-                        mask=body.get("mask_image"),
-                        keep_subject=bool(body.get("keep_subject", False)),
-                        strength=float(body.get("strength", 0.6)),
-                        padding_mask_crop=int(body.get("padding_mask_crop", 0) or 0),
-                        progress_cb=_progress,
-                        **kw,
-                    )
+                img = await e.edit_image(
+                    body["image"], prompt,
+                    engine=engine_name,
+                    mask=body.get("mask_image"),
+                    keep_subject=bool(body.get("keep_subject", False)),
+                    strength=float(body.get("strength", 0.6)),
+                    padding_mask_crop=int(body.get("padding_mask_crop", 0) or 0),
+                    progress_cb=_progress,
+                    **kw,
                 )
         except Exception as exc:
             logger.exception("edit SSE failed")
@@ -563,11 +710,8 @@ async def _run_layer_sse(req: web.Request, body: dict) -> web.StreamResponse:
 
     async with _device_lock(device):
         try:
-            result = await loop.run_in_executor(
-                None, functools.partial(
-                    e.layered_decompose, body["image"], layers, resolution,
-                    preview_only, steps, _progress,
-                )
+            result = await e.layered_decompose(
+                body["image"], layers, resolution, preview_only, steps, _progress
             )
         except Exception as exc:
             logger.exception("layer SSE failed")

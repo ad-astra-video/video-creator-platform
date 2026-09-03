@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import functools
 import io
 import json
 import logging
@@ -17,9 +16,9 @@ import tempfile
 import threading
 import uuid
 
-import torch
 from aiohttp import web
 
+from runner.common import engineproc
 from runner.ltx import enhance_forward
 from runner.ltx.config import (
     LIVE_RUNNER_URL,
@@ -41,7 +40,6 @@ from runner.ltx.config import (
     worker_token,
 )
 from runner.ltx.gpu_profile import build_profile, STREAMING_MIN_GB
-from runner.ltx.inference import VideoCreatorInferenceEngine
 from runner.ltx.loracache import LoraCache
 
 logger = logging.getLogger(__name__)
@@ -61,10 +59,18 @@ _ENHANCE_I2V_DEFAULT = enhance_forward.DEFAULT_I2V_SYSTEM_PROMPT
 _MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(3000000000)))
 
 # Global state
-engine: VideoCreatorInferenceEngine | None = None
+# ``engine`` is a subprocess-backed proxy (``_EngineProxy``) while a model is
+# resident, or None after /evict / at boot. The real engine + GPU live ONLY in
+# the child process; the proxy serializes method calls over JSONL.
+engine: "_EngineProxy | None" = None
 gpu_profile = None
 registration = None
 ready = False
+# CUDA device picked at startup for this worker (the default target for /load
+# when the request does not specify one). Never a CUDA context in this process.
+_chosen_video_device: int | None = None
+# Serializes (re)creation / eviction of the model subprocess.
+_engine_lock = asyncio.Lock()
 
 
 async def _pick_video_device(preferred: int) -> int:
@@ -161,31 +167,6 @@ def _read_file_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode()
 
 
-def _memlog(tag: str) -> None:
-    import torch as _t
-    if not _t.cuda.is_available():
-        return
-    mi = 1024 * 1024
-    # Per-device total used from nvidia-smi (sees raw CUDA contexts torch's
-    # allocator does not track), plus torch's own accounting for completeness.
-    used = ["?"] * _t.cuda.device_count()
-    try:
-        import subprocess
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10)
-        for line in r.stdout.strip().splitlines():
-            idx, u, tot = (p.strip() for p in line.split(","))
-            used[int(idx)] = f"{u}MiB/{tot}MiB"
-    except Exception:
-        pass
-    parts = []
-    for i in range(_t.cuda.device_count()):
-        parts.append(f"g{i}[smi={used[i]} torch={_t.cuda.memory_allocated(i)//mi}M/{_t.cuda.memory_reserved(i)//mi}M]")
-    logger.info("MEMLOG %-22s %s", tag, " ".join(parts))
-
-
 def _require_token(request: web.Request) -> None:
     """Reject the request unless it carries the shared worker token.
 
@@ -200,48 +181,264 @@ def _require_token(request: web.Request) -> None:
         raise web.HTTPForbidden(reason="missing/mismatched X-Worker-Token")
 
 
-async def handle_load(req: web.Request) -> web.Response:
-    """POST /load — ensure the inference engine is resident (kept warm).
+class _EngineProxy:
+    """Subprocess-backed stand-in for ``VideoCreatorInferenceEngine``.
 
-    Reads ``device`` (int CUDA index) from the body. If it differs from the GPU
-    the engine currently targets, the engine is freed + relocated onto that GPU
-    (weights stream from host RAM, so re-load is comparatively quick) and kept
-    warm there. This is what lets the scheduler place video workers on ANY free
-    card instead of pinning them to GPU 0. Returns 200 + the active device.
+    Mirrors the engine's public surface used by the HTTP routes; each call is
+    serialized to the model child over JSONL via ``engineproc.EngineProc`` and
+    returns the SAME JSON-safe type the real method returns (file path strings,
+    None, clamped resolution / enhanced prompt strings). The parent holds no
+    CUDA context: the engine + GPU live ONLY in the ``runner.ltx.engine_cli``
+    child, which this proxy spawns (on /load / first generation) and tears down
+    (on /evict, by killing the process -> destroying its primary context).
+    """
+
+    def __init__(self, device_index: int) -> None:
+        self._device_index = device_index
+        self._proc = engineproc.EngineProc(
+            "ltx",
+            [sys.executable, "-m", "runner.ltx.engine_cli",
+             "--device", str(device_index)],
+        )
+
+    # ── lifecycle ────────────────────────────────────────────────────────
+    async def ensure_loaded(self) -> None:
+        """Spawn the child (if not running) and wait for its ready handshake."""
+        await self._proc.start()
+
+    async def stop(self) -> None:
+        """Kill the child -> destroys its CUDA primary context. Idempotent."""
+        await self._proc.stop()
+
+    @property
+    def device_index(self) -> int:
+        return self._device_index
+
+    # ── engine-op proxy ──────────────────────────────────────────────────
+    @staticmethod
+    def _ser_loras(loras):
+        # list[tuple[path, scale]] -> [[path, scale], ...]  (tuples are not JSON)
+        if loras is None:
+            return None
+        return [[p, float(s)] for p, s in loras]
+
+    async def generate_t2v(self, prompt, seed, width, height, num_frames,
+                           fps, output_path, loras=None, model=""):
+        await self._proc.run("generate_t2v", {
+            "prompt": prompt, "seed": seed, "width": width,
+            "height": height, "num_frames": num_frames, "fps": fps,
+            "output_path": output_path,
+            "loras": self._ser_loras(loras), "model": model,
+        })
+        return None
+
+    async def generate_i2v(self, prompt, image_base64, seed, width, height,
+                           num_frames, fps, output_path, loras=None, model=""):
+        await self._proc.run("generate_i2v", {
+            "prompt": prompt, "image_base64": image_base64, "seed": seed,
+            "width": width, "height": height, "num_frames": num_frames,
+            "fps": fps, "output_path": output_path,
+            "loras": self._ser_loras(loras), "model": model,
+        })
+        return None
+
+    async def generate_extend(self, *, prompt, video_base64, extend_frames,
+                              mode, seed, fps, output_path, context_seconds=1.0,
+                              model="", progress_cb=None):
+        def _fwd(obj):
+            # child progress line {"stage","message","progress"} -> user cb
+            if progress_cb is not None:
+                try:
+                    progress_cb(obj.get("stage"), obj.get("message"),
+                                obj.get("progress"))
+                except Exception:  # noqa: BLE001 - never break on progress
+                    pass
+
+        await self._proc.run("generate_extend", {
+            "prompt": prompt, "video_base64": video_base64,
+            "extend_frames": extend_frames, "mode": mode, "seed": seed,
+            "fps": fps, "output_path": output_path,
+            "context_seconds": context_seconds, "model": model,
+        }, progress_cb=_fwd)
+        return None
+
+    async def generate_retake(self, *, prompt, video_base64, start_time,
+                              end_time, seed, fps, regenerate_video=True,
+                              regenerate_audio=True, output_path=None):
+        return await self._proc.run("generate_retake", {
+            "prompt": prompt, "video_base64": video_base64,
+            "start_time": start_time, "end_time": end_time, "seed": seed,
+            "fps": fps, "regenerate_video": regenerate_video,
+            "regenerate_audio": regenerate_audio, "output_path": output_path,
+        })
+
+    async def generate_image(self, *, prompt, width, height, num_steps=9,
+                             seed=42, guidance_scale=None):
+        return await self._proc.run("generate_image", {
+            "prompt": prompt, "width": width, "height": height,
+            "num_steps": num_steps, "seed": seed,
+            "guidance_scale": guidance_scale,
+        })
+
+    async def edit_image(self, *, prompt, image_path, mask_path=None,
+                         keep_subject=False, sam3_url=None,
+                         sam3_prompt="person", keep_mask_b64=None,
+                         worker_token="", strength=0.6, num_steps=9, seed=42,
+                         guidance_scale=None):
+        return await self._proc.run("edit_image", {
+            "prompt": prompt, "image_path": image_path,
+            "mask_path": mask_path, "keep_subject": keep_subject,
+            "sam3_url": sam3_url, "sam3_prompt": sam3_prompt,
+            "keep_mask_b64": keep_mask_b64, "worker_token": worker_token,
+            "strength": strength, "num_steps": num_steps, "seed": seed,
+            "guidance_scale": guidance_scale,
+        })
+
+    async def generate_ic_lora_full_video(self, *, prompt, control_video_path,
+                                          seed, width, height, num_frames, fps,
+                                          output_path,
+                                          conditioning_strength=1.0,
+                                          lora_path="", lora_strength=1.0,
+                                          skip_stage_2=False,
+                                          resolution_factor=2.0):
+        await self._proc.run("generate_ic_lora_full_video", {
+            "prompt": prompt, "control_video_path": control_video_path,
+            "seed": seed, "width": width, "height": height,
+            "num_frames": num_frames, "fps": fps,
+            "output_path": output_path,
+            "conditioning_strength": conditioning_strength,
+            "lora_path": lora_path, "lora_strength": lora_strength,
+            "skip_stage_2": skip_stage_2,
+            "resolution_factor": resolution_factor,
+        })
+        return None
+
+    async def enhance_prompt(self, prompt, image_base64=None, seed=None,
+                             system_prompt=None):
+        return await self._proc.run("enhance_prompt", {
+            "prompt": prompt, "image_base64": image_base64, "seed": seed,
+            "system_prompt": system_prompt,
+        })
+
+    async def clamp_resolution(self, resolution):
+        return await self._proc.run("clamp_resolution", {
+            "resolution": resolution,
+        })
+
+    async def warmup(self, output_path):
+        await self._proc.run("warmup", {"output_path": output_path})
+        return None
+
+
+async def _ensure_engine(target_device: "int | None" = None) -> "_EngineProxy":
+    """Return a loaded engine proxy, spawning the model child if needed.
+
+    ``target_device`` is the CUDA index the caller wants (e.g. /load's body);
+    when None the worker's startup-picked device is used. If a child is already
+    resident on a DIFFERENT device it is stopped and respawned on the requested
+    one (the subprocess model's equivalent of ``set_device``). Idempotent when
+    already loaded on the target device.
+    """
+    global engine
+    dev = target_device if target_device is not None else _chosen_video_device
+    async with _engine_lock:
+        if engine is None:
+            engine = _EngineProxy(dev)
+        elif dev is not None and engine.device_index != dev:
+            logger.info("ltx-worker: relocating model GPU %d -> %d",
+                        engine.device_index, dev)
+            await engine.stop()
+            engine = _EngineProxy(dev)
+        await engine.ensure_loaded()
+        return engine
+
+
+def _build_info_profile(device_index: int):
+    """Build the /info GPU profile WITHOUT creating a CUDA context.
+
+    The engine's authoritative VRAM-aware profile is built inside the GPU child
+    (it may query torch freely). Here we only need display info for /info, so
+    we pin name/VRAM via env overrides and/or nvidia-smi (no torch) and reuse
+    ``build_profile`` by passing BOTH overrides explicitly (which skips its
+    torch query path entirely).
+    """
+    import subprocess
+    name = GPU_NAME
+    vram = GPU_VRAM_GB
+    if not (name and vram):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total",
+                 "--format=csv,noheader,nounits", "-i", str(device_index)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                parts = [p.strip() for p in r.stdout.strip().splitlines()[0].split(",")]
+                if not name:
+                    name = parts[0]
+                if not vram and len(parts) > 1:
+                    try:
+                        vram = float(parts[1]) / 1024.0
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+    if not name:
+        name = "Unknown GPU"
+    if not vram:
+        vram = 0.0
+    return build_profile(device_index, vram, name)
+
+
+async def handle_load(req: web.Request) -> web.Response:
+    """POST /load — spawn + keep the model subprocess resident (warm).
+
+    Reads ``device`` (int CUDA index) from the body. The model now lives in a
+    SEPARATE process (``runner.ltx.engine_cli``), so loading = spawning that
+    child on the requested GPU and waiting for its ready handshake. Relocating
+    to a different card = stop the current child + respawn it on the requested
+    one. This is what lets the scheduler place video workers on ANY free card
+    instead of pinning them to GPU 0; an idle (never-loaded / evicted) worker
+    holds NO GPU because no child is running. Returns 200 + the active device.
     """
     _require_token(req)
-    global engine
     body = {}
     try:
         body = await req.json()
     except Exception:
         body = {}
     # ``model`` is accepted for parity with every other worker's /load; ltx-worker
-    # is SINGLE-ENGINE (one LTX-2.5 video model), so the scheduler's model hint is
+    # is SINGLE-ENGINE (one LTX video model), so the scheduler's model hint is
     # advisory — only the device affects this engine.
     model = body.get("model")
     if model:
         logger.info("ltx-worker /load: model=%s (single-engine; advisory)", model)
+    target = _chosen_video_device
     device = body.get("device")
-    if device is not None and engine is not None:
+    if device is not None:
         try:
             device = int(device)
         except (TypeError, ValueError):
             device = None
-        if device is not None and device >= 0 and engine.device_index != device:
-            logger.info("ltx-worker /load: relocating GPU %d -> %d",
-                        engine.device_index, device)
-            engine.set_device(device)
+        if device is not None and device >= 0:
+            target = device
+    global engine
+    engine = await _ensure_engine(target)
     assert engine is not None
     return web.json_response({
         "loaded": True, "ready": ready, "device": engine.device_index})
 
 
 async def handle_evict(req: web.Request) -> web.Response:
-    """POST /evict — drop all resident pipelines + free GPU memory.
+    """POST /evict — tear the model subprocess down, freeing its CUDA context.
 
     Called by the live-runner before it swaps in another worker's model on the
-    shared GPU. The next /v1/* generation reloads lazily.
+    shared GPU. The GPU model now lives in a SEPARATE process, so eviction =
+    killing that child, which destroys its CUDA primary context entirely (the
+    in-process ``free()``/``empty_cache()`` could only return the caching
+    allocator's pool while the process stayed attached to the GPU with a
+    ~0.5-0.7 GB driver floor). The next /v1/* generation respawns the child
+    lazily.
 
     Like handle_load, an optional JSON body may carry ``{"device": N}``, but
     the ltx-worker is SINGLE-ENGINE today (one global engine owns one card), so
@@ -259,23 +456,23 @@ async def handle_evict(req: web.Request) -> web.Response:
     # Accepted for request/response symmetry with /load; unused (single-engine).
     _ = body.get("device")
     if engine is not None:
-        engine.free()
+        await engine.stop()
+        engine = None
     return web.json_response({"evicted": True})
 
 
 async def _run_generation(fn, *args, **kwargs):
-    """Run a blocking engine generation off the event loop.
+    """Run an engine op off the shared generation, serialized by the lock.
 
-    The engine's generate_* calls are synchronous (GPU-bound), but the LiveRunner
-    heartbeat is an asyncio background task — running generation directly on the
-    loop would starve it and the orchestrator would drop the runner. Dispatch to
-    a worker thread and serialize with the generation lock.
+    The engine's generate_* calls now run in the model SUBPROCESS (the proxy's
+    ``EngineProc.run`` is a JSONL round-trip bound to the event loop, i.e.
+    non-blocking from the aiohttp process's perspective — the LiveRunner
+    heartbeat is an asyncio background task and is never starved). We still
+    serialize with the generation lock so only one generation can be in flight
+    on the single engine at a time.
     """
     async with _generation_lock:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, functools.partial(fn, *args, **kwargs)
-        )
+        return await fn(*args, **kwargs)
 
 
 class _LoraError(Exception):
@@ -387,7 +584,7 @@ async def handle_info(_req: web.Request) -> web.Response:
 async def handle_t2v(req: web.Request) -> web.Response:
     """POST /video-creator/v1/t2v"""
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     prompt = body["prompt"]
     seed = body.get("seed", 42)
     resolution = body.get("resolution", "1080p")
@@ -398,7 +595,7 @@ async def handle_t2v(req: web.Request) -> web.Response:
 
     # Clamp requested resolution to what the GPU can handle, then resolve size
     if resolution in ("540p", "720p", "1080p"):
-        resolution = engine.clamp_resolution(resolution)
+        resolution = await engine.clamp_resolution(resolution)
     res_map = {"540p": (960, 544), "720p": (1280, 704), "1080p": (1920, 1088)}
     w, h = res_map.get(resolution, (1920, 1088))
     if aspect_ratio == "9:16":
@@ -430,7 +627,7 @@ async def handle_t2v(req: web.Request) -> web.Response:
 async def handle_i2v(req: web.Request) -> web.Response:
     """POST /video-creator/v1/i2v"""
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     prompt = body["prompt"]
     image_base64 = body["image_base64"]
     seed = body.get("seed", 42)
@@ -443,7 +640,7 @@ async def handle_i2v(req: web.Request) -> web.Response:
     res_map = {"540p": (960, 544), "720p": (1280, 704), "1080p": (1920, 1088)}
     # Clamp requested resolution to what the GPU can handle
     if resolution in ("540p", "720p", "1080p"):
-        resolution = engine.clamp_resolution(resolution)
+        resolution = await engine.clamp_resolution(resolution)
     w, h = res_map.get(resolution, (1920, 1088))
     if aspect_ratio == "9:16":
         w, h = h, w
@@ -482,7 +679,7 @@ async def handle_a2v(req: web.Request) -> web.Response:
 async def handle_image(req: web.Request) -> web.Response:
     """POST /video-creator/v1/image — text-to-image generation."""
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     prompt = body["prompt"]
     width = body.get("width", 768)
     height = body.get("height", 768)
@@ -533,7 +730,7 @@ async def handle_edit(req: web.Request) -> web.Response:
     - otherwise                 -> whole-frame img2img edit
     """
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     image_b64 = body.get("image")
     if not image_b64:
         return web.json_response({"error": "missing 'image' (base64)"}, status=400)
@@ -605,7 +802,7 @@ async def handle_extend(req: web.Request) -> web.Response:
     Without the flag the plain JSON response is returned (unchanged behaviour).
     """
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     prompt = body["prompt"]
     video_base64 = body["video_base64"]
     extend_frames = body.get("extendFrames", 120)
@@ -654,7 +851,7 @@ async def _run_extend_sse(req: web.Request, prompt: str, video_base64: str,
         "X-Accel-Buffering": "no",
     })
     await resp.prepare(req)
-    assert engine
+    engine = await _ensure_engine()
 
     async def _ev(event: str, data: dict) -> None:
         try:
@@ -713,7 +910,7 @@ async def _run_extend_sse(req: web.Request, prompt: str, video_base64: str,
 async def handle_retake(req: web.Request) -> web.Response:
     """POST /video-creator/v1/retake — regenerate a video segment with new prompt."""
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     prompt = body["prompt"]
     video_base64 = body["video_base64"]
     start_time = body.get("startTime", 0.0)
@@ -847,7 +1044,7 @@ async def handle_suggest_gap_prompt(req: web.Request) -> web.Response:
 async def handle_extract_conditioning(req: web.Request) -> web.Response:
     """POST /video-creator/v1/extract-conditioning — extract conditioning frame from video."""
     body = await req.json()
-    assert engine
+    # Pure CPU (av + OpenCV + PIL) — no GPU engine needed.
     video_base64 = body["video_base64"]
     frame_time = body.get("frame_time", 0.0)
     conditioning_type = body.get("conditioning_type", "canny")
@@ -923,7 +1120,7 @@ async def handle_ic_lora_generate(req: web.Request) -> web.Response:
     Delegates to i2v pipeline using the conditioning frame as input image.
     """
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     prompt = body["prompt"]
     seed = body.get("seed", 42)
     resolution = body.get("resolution", {"width": 1280, "height": 720})
@@ -936,7 +1133,7 @@ async def handle_ic_lora_generate(req: web.Request) -> web.Response:
     else:
         res_map = {"540p": (960, 544), "720p": (1280, 704), "1080p": (1920, 1088)}
         if resolution in ("540p", "720p", "1080p"):
-            resolution = engine.clamp_resolution(resolution)
+            resolution = await engine.clamp_resolution(resolution)
         w, h = res_map.get(resolution, (1280, 704))
 
     w = round(w / 64) * 64
@@ -1081,7 +1278,7 @@ async def handle_ic_lora_restyle(req: web.Request) -> web.Response:
     the pipeline has no IC-LoRA to condition on and the effect is inert.
     """
     body = await req.json()
-    assert engine
+    engine = await _ensure_engine()
     prompt = body["prompt"]
     video_base64 = body["video_base64"]
     conditioning_type = body.get("conditioning_type", "canny")

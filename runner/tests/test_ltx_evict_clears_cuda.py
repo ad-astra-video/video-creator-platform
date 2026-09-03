@@ -36,6 +36,9 @@ class _FakeCuda:
         self.synchronize_calls = []
         self.empty_cache_calls = 0
 
+    def set_device(self, device=None):
+        pass  # _free_vram pins the active device before empty_cache
+
     def synchronize(self, device=None):
         self.synchronize_calls.append(device)
 
@@ -221,6 +224,7 @@ def evict_server(monkeypatch):
         "GPU_VRAM_GB": 0, "HOST": "0.0.0.0", "MODEL_CHECKPOINT": "/models/x",
         "PORT": 8991, "TEXT_ENCODER_ROOT": "/models/gemma", "UPSCALER_PATH": "",
         "WARMUP": False, "IDV2V_WORKER_URL": "http://idv2v-worker:8992",
+        "LIVE_RUNNER_URL": "http://live-runner:8990",
         "worker_token": lambda: "tok",
     }.items():
         setattr(cfg, k, v)
@@ -230,21 +234,23 @@ def evict_server(monkeypatch):
     return server
 
 
-def test_evict_route_calls_free_and_is_idempotent(evict_server):
+def test_evict_route_stops_proxy_and_is_idempotent(evict_server):
     server = evict_server
-    free_calls = {"n": 0}
+    stop_calls = {"n": 0}
 
-    class _Engine:
-        def free(self):
-            free_calls["n"] += 1
+    class _Proxy:
+        device_index = 1
 
-    server.engine = _Engine()
+        async def stop(self):
+            # Killing the model subprocess destroys its CUDA context.
+            stop_calls["n"] += 1
+
+    server.engine = _Proxy()
     asyncio.run(server.handle_evict(_req()))
-    assert free_calls["n"] == 1
-    # Second evict on the SAME engine: still free()s (kept object) — no 500.
+    assert stop_calls["n"] == 1
     # The optional {"device": N} body is parsed and ignored on the single engine.
     asyncio.run(server.handle_evict(_req(device=3)))
-    assert free_calls["n"] == 2
+    assert stop_calls["n"] == 1
     # Response shape preserved: 200 + {"evicted": True}.
     resp = asyncio.run(server.handle_evict(_req()))
     assert resp.status == 200

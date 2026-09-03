@@ -66,6 +66,16 @@ RUN useradd -m runneruser
 WORKDIR /app
 COPY runner/ ./runner/
 
+# The GPU engine runs in a CHILD MODEL SUBPROCESS (runner.ltx.engine_cli) so
+# /evict can destroy the CUDA primary context by killing the child (PyTorch has
+# no in-process teardown). The server spawns `python -m runner.ltx.engine_cli
+# --device N` at /load; COPY runner/ above ships runner/common/ +
+# runner/ltx/engine_cli.py, and /app is on sys.path for `-m`. The parent aiohttp
+# server stays CUDA-free; /evict merely TERMINATES the child. Verify both
+# import at build time so a broken child fails the build.
+RUN python -c "import runner.ltx.engine_cli" \
+    && python -c "import runner.common.engineproc"
+
 RUN mkdir -p /models && chown runneruser:runneruser /models
 USER runneruser
 
