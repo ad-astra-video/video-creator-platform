@@ -103,6 +103,10 @@ RUN /opt/bernini/venv/bin/python /app/runner/idv2v/bernini_progress_patch.py
 # fused kernel) with FA2/SDPA fallback. SageAttention is already in the Bernini
 # venv (inherited from the main venv); this only wires the dispatch.
 RUN /opt/bernini/venv/bin/python /app/runner/idv2v/bernini_sage_patch.py
+# Plan-once long-video: add BerniniPipeline.plan_full + `__call__(plan=...)`.
+# Both are inert unless plan is passed (normal jobs unaffected); the runner
+# chunker will drive them in a follow-up.
+RUN /opt/bernini/venv/bin/python /app/runner/idv2v/bernini_planonce_patch.py
 RUN mkdir -p /models && chown runneruser:runneruser /models
 USER runneruser
 
