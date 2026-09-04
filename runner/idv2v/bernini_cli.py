@@ -294,6 +294,59 @@ def main() -> int:
             logger.info("rzgar 4-step LoRA loaded for turbo toggle (linears=%d patches=%d)",
                         len(tl.linear), len(tl.patch))
 
+    def _run_plan_only(ns: argparse.Namespace, job: dict) -> dict:
+        """Plan-once pre-pass: build the FULL-timeline plan ONCE and save it.
+
+        The same source-driven conditioning is then handed to every 33-frame
+        chunk render via ``__call__(plan=...)`` (they all consume the same
+        global plan), replacing per-chunk re-planning off re-styled anchor
+        frames - the root cause of "edit doesn't follow the source". The plan
+        dict (CPU tensors + offsets) is torch-saved to ``plan_dir/plan.pt``.
+        """
+        try:
+            src = job.get("video")[0] if job.get("video") else None
+            if not src or not os.path.exists(src):
+                return {"ok": False, "error": f"plan_only: source missing: {src}"}
+            plan_dir = job.get("plan_dir") or os.path.dirname(src)
+            num_frames = int(job.get("num_frames") or ns.num_frames)
+            prompt = job.get("prompt") or ""
+            tip = pipeline.model
+            # planner components must be GPU-resident (mirrors __call__ preamble)
+            pipeline.vae.to(device)
+            tip.mllm.to(device=device, dtype=pipeline.weight_dtype)
+            if pipeline.connector is not None:
+                pipeline.connector.to(device=device, dtype=pipeline.weight_dtype)
+            if getattr(tip, "vit_decoder", None) is not None:
+                tip.vit_decoder.to(device=device, dtype=pipeline.weight_dtype)
+            torch.cuda.empty_cache()
+            from bernini.data_utils import VAEVideoTransform
+            vae_transform = VAEVideoTransform(
+                max_image_size=ns.max_image_size, min_image_size=240, image_stride=16)
+            vit_fps = max(int(getattr(ns, "fps", 16) // 8), 1)
+            sample = pipeline.preprocess_inputs(
+                prompt, mllm_model=tip.mllm, vae_model=pipeline.vae,
+                vae_transform=vae_transform, num_frames=num_frames,
+                height=ns.height, width=ns.width, video=src,
+                image=None, images=None, vit_fps=vit_fps, vae_fps=int(getattr(ns, "fps", 16)))
+            pipeline.vae.to("cpu"); torch.cuda.empty_cache()
+            plan = pipeline.plan_full(
+                sample, prompt=prompt, neg_prompt=ns.neg_prompt,
+                num_frames=num_frames, planning_step=ns.planning_step,
+                vit_txt_cfg=ns.vit_txt_cfg, vit_img_cfg=ns.vit_img_cfg,
+                vit_denoising_step=ns.vit_denoising_step,
+                t5_tokenizer=None, weight_dtype=pipeline.weight_dtype)
+            os.makedirs(plan_dir, exist_ok=True)
+            plan_path = os.path.join(plan_dir, "plan.pt")
+            torch.save(plan, plan_path)
+            n_tok = tuple(plan["wotxt_wvit"].shape) if plan.get("wotxt_wvit") is not None else None
+            logger.info("plan-once: full plan (%d frames, %s vit tokens) -> %s",
+                        num_frames, n_tok, plan_path)
+            return {"ok": True, "plan_path": plan_path,
+                    "frames": num_frames, "vit_tokens": n_tok and n_tok[1]}
+        except Exception as exc:  # noqa: BLE001 - report to the manager
+            logger.exception("plan_only failed")
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     def handle(job: dict) -> dict:
         # Under Ulysses SP every rank runs the forward (it must participate in
         # the collectives), but only rank 0 (or the sole rank) writes the
@@ -329,6 +382,33 @@ def main() -> int:
         if not out:
             return {"ok": False, "error": "missing 'output'"}
         _apply_job(ns, job)
+        if job.get("plan_only"):
+            # Plan-once pre-pass: build the FULL-timeline plan once, save it,
+            # and let the manager fan it out to every chunk render.
+            if not hasattr(pipeline, "plan_full"):
+                return {"ok": False, "error": "plan_only: pipeline lacks plan_full"}
+            return _run_plan_only(ns, job)
+        # Plan-once consumption: a pre-computed full-timeline plan (written by
+        # a prior plan_only pass) replaces per-chunk re-planning. The chunk
+        # render is conditioned on the SAME global plan; restyled anchor refs
+        # are dropped as redundant (the plan already encodes cross-chunk
+        # appearance continuity from the source timeline).
+        plan = None
+        _plan_path = job.get("plan_path")
+        if _plan_path:
+            try:
+                if os.path.exists(_plan_path):
+                    _pl = torch.load(_plan_path, map_location="cpu")
+                    _nt = tuple(_pl["wotxt_wvit"].shape) if _pl.get("wotxt_wvit") is not None else None
+                    logger.info("plan-once: render with global plan %s (vit %s)",
+                                _plan_path, _nt)
+                    plan = _pl
+                    job["image"] = None
+                    job["images"] = []
+            except Exception as _exc:  # noqa: BLE001 - fall back to per-chunk plan
+                logger.warning("plan-once: could not load %s (%r); per-chunk plan",
+                               _plan_path, _exc)
+                plan = None
         # Turbo (4-step rzgar LoRA + DPM++2M-SDE sgm_uniform) re-enabled
         # 2026-08-30: the green was NOT the LoRA/sampler/fp8 — it was the
         # scale_shift_table uint8-plain-copy bug in stream_fill (bernini_fp8.py,
@@ -384,6 +464,10 @@ def main() -> int:
                     # anchor (bernini.py omega_img) set them.
                     for _k, _v in (V2V_OMEGA_14B if is_fp8 else V2V_OMEGA_13B).items():
                         common[_k] = _v
+                if plan is not None:
+                    # Plan-once: render conditioned on the precomputed global
+                    # (full-timeline) plan instead of per-chunk re-planning.
+                    common["plan"] = plan
                 try:
                     # Per-step progress_cb is threaded in by the build-time
                     # source patch; if the patch didn't apply upstream, fall

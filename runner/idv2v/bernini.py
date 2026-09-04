@@ -529,6 +529,31 @@ class BerniniManager:
         try:
             self._stage("gen: chunks=%d total=%d fpc=%d src=%s" %
                         (n_chunks, total, frames_per, src))
+            # --- plan-once (14B v2v): plan the FULL timeline once -----------
+            # Structural fix for "edit doesn't follow the source": instead of
+            # each chunk re-planning off its window PLUS re-styled anchor
+            # frames (which pulled the MAR plan back toward the re-styled look),
+            # plan the whole source timeline ONCE from source latents/ViT, then
+            # hand that SAME global plan to every 33-frame chunk via the CLI's
+            # `plan_path` (full `plan=` consumption in __call__). Halfs VRAM
+            # too (peak 26.7 GB vs ~31.7 GB for the anchored path).
+            plan_path: Optional[str] = None
+            _plan_once = ("14" in (self.model or "")) and n_chunks > 1
+            if _plan_once:
+                self._stage("gen: plan-once pre-pass over %d frames ..." % total)
+                _pre = dict(job, plan_only=True, plan_dir=base,
+                            num_frames=total, video=[src])
+                _r = await self._run_one(_pre, timeout)
+                _pp = (_r or {}).get("plan_path")
+                if (_r or {}).get("ok") and _pp and os.path.exists(_pp):
+                    plan_path = _pp
+                    self._stage("gen: plan-once global plan ready: %s" % _pp)
+                else:
+                    # Fall back to the previous per-chunk (anchored) path; the
+                    # plan pre-pass must never take down the whole job.
+                    self._stage("gen: plan-once pre-pass failed (%s); per-chunk plan"
+                                % ((_r or {}).get("error") or "unknown"))
+                    plan_path = None
             prev_out: Optional[str] = None
             prev_frames: int = 0
             global_ref: Optional[str] = None  # chunk-0 frame, persistent identity anchor
@@ -582,7 +607,14 @@ class BerniniManager:
                 sub_job["video"] = [src_k]
                 sub_job["num_frames"] = length
                 sub_job["output"] = out_k
-                if prev_out and prev_frames > 0:
+                if plan_path:
+                    # Plan-once: render this chunk from the SAME global
+                    # (full-timeline) plan, with no re-styled anchor refs - the
+                    # plan itself encodes cross-chunk appearance continuity.
+                    sub_job["plan_path"] = plan_path
+                    sub_job["image"] = None
+                    sub_job["images"] = []
+                elif prev_out and prev_frames > 0:
                     # Anchor appearance to the PREVIOUS chunk's last
                     # CHUNK_REF_FRAMES OUTPUT frames (H3-style continuation
                     # window) so the restyled scene (e.g. the warehouse)
@@ -654,7 +686,8 @@ class BerniniManager:
                 # as a persistent reference for every later chunk (identity /
                 # long-range drift pin). Exported once from chunk 0, then
                 # reused on all k>0 anchors.
-                if global_ref is None and prev_frames > 0 and CHUNK_GLOBAL_ANCHOR:
+                if (global_ref is None and prev_frames > 0 and CHUNK_GLOBAL_ANCHOR
+                        and plan_path is None):
                     try:
                         global_ref = os.path.join(base, "ref_global_000.png")
                         # Use chunk 0's LAST frame as the global identity pin:
