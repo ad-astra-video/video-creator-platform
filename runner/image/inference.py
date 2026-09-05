@@ -439,16 +439,23 @@ class ImageInferenceEngine:
             return self._qwen_edit_inpaint
 
     def _zimage_pipe(self):
-        """Build (once) and return the ZImagePipeline (text-to-image)."""
+        """Build (once) and return the ZImagePipeline (text-to-image).
+
+        Z-Image loads at bf16 (NOT the fp8 from QWEN_DTYPE): the generic
+        diffusers ``from_pretrained`` re-runs transformers' fp8 path on the
+        whole pipeline and fails with ``TypeError: couldn't find storage object
+        Float8_e4m3fnStorage`` (fp8 only works for the Qwen transformer via the
+        dedicated per-component branches above). Z-Image Turbo (~6B) fits bf16
+        on the same card."""
         with self._model_lock:
             if self._zimage is None:
                 import torch
                 from diffusers import ZImagePipeline
-                logger.info("Loading Z-Image from %s (dtype=%s, offload=%s)",
-                            _cfg.ZIMAGE_ROOT, _cfg.QWEN_DTYPE, _cfg.QWEN_OFFLOAD)
+                logger.info("Loading Z-Image from %s (dtype=bf16, offload=%s)",
+                            _cfg.ZIMAGE_ROOT, _cfg.QWEN_OFFLOAD)
                 self._zimage = ZImagePipeline.from_pretrained(
                     _cfg.ZIMAGE_ROOT,
-                    torch_dtype=self._resolve_dtype(torch),
+                    torch_dtype=torch.bfloat16,
                 )
                 self._maybe_offload(self._zimage)
                 self.ready = True
