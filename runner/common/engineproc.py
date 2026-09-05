@@ -194,8 +194,12 @@ class EngineProc:
         """Forward the child's stderr (its logs) into our logger."""
         if self._stderr_q is None or self._loop is None:
             return
+        # Capture the queue once: after a stop() swaps it to None (and the pump
+        # pushes a None EOF sentinel), this task must keep draining the SAME
+        # queue it started with rather than reading the (now-None) attribute.
+        q = self._stderr_q
         while True:
-            raw = await self._stderr_q.get()
+            raw = await q.get()
             if raw is None:
                 return
             text = raw.decode("utf-8", "replace").rstrip()

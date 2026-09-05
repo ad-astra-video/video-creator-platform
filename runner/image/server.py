@@ -51,7 +51,6 @@ from runner.image.config import (
     QWEN_MAX_LAYERS,
     worker_token,
 )
-from runner.image.inference import _decoded_pil as _pil_from_b64
 from runner.image.inference import _pil_to_b64
 from runner.ltx.gpu_profile import build_profile
 
@@ -61,6 +60,50 @@ logger = logging.getLogger(__name__)
 # (edit / layer inputs run up to QWEN_LAYER_MAX_INPUT_SIDE) routinely exceeds.
 # 3 GB matches go-livepeer's declared MaxAIRequestSize and the ltx worker.
 _MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(3 * 1024 ** 3)))
+
+
+def _pil_from_path(path: str):
+    """Load a PIL image from a scratch file the model child wrote, then delete it.
+
+    Mirrors bernini_cli's file-path contract: the child persists its output to
+    disk and the parent reads it back, so the child->parent JSONL pipe only ever
+    carries a small path — never multi-MB base64."""
+    from PIL import Image
+    img = Image.open(path)
+    img.load()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return img
+
+
+def _restore_paths_to_b64(obj):
+    """Undo the child's ``_replace_b64_with_paths``: read each ``*_b64`` field
+    that holds a scratch-file path back into base64 (and delete the file). The
+    /layer + SSE response contracts stay byte-identical to the old base64 wire,
+    while child->parent carried only small paths."""
+    import base64 as _b64
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            if isinstance(v, str) and k.endswith("_b64"):
+                if v and os.path.exists(v):
+                    try:
+                        with open(v, "rb") as f:
+                            obj[k] = _b64.b64encode(f.read()).decode()
+                    except OSError:
+                        pass
+                    try:
+                        os.remove(v)
+                    except OSError:
+                        pass
+                else:
+                    obj[k] = _restore_paths_to_b64(v)
+            else:
+                obj[k] = _restore_paths_to_b64(v)
+    elif isinstance(obj, list):
+        return [_restore_paths_to_b64(x) for x in obj]
+    return obj
 
 # ── Global state ───────────────────────────────────────────
 gpu_profile = None
@@ -175,7 +218,7 @@ class ImageEngineProxy:
             "padding_mask_crop": int(padding_mask_crop or 0),
             "mask_composite": bool(mask_composite), "kw": dict(kw),
         }, progress_cb)
-        return _pil_from_b64(res["image_b64"])
+        return _pil_from_path(res["image_path"])
 
     async def hidream_edit(self, image, prompt, seed=None, keep_original_aspect=True,
                            num_inference_steps=None, quality=None, progress_cb=None,
@@ -186,7 +229,7 @@ class ImageEngineProxy:
             "num_inference_steps": num_inference_steps, "quality": quality,
             "kw": dict(kw),
         }, progress_cb)
-        return _pil_from_b64(res["image_b64"])
+        return _pil_from_path(res["image_path"])
 
     async def hidream_image(self, prompt, width=1024, height=1024, seed=None,
                             num_inference_steps=None, guidance_scale=None,
@@ -197,12 +240,12 @@ class ImageEngineProxy:
             "guidance_scale": guidance_scale, "quality": quality,
             "kw": dict(kw),
         }, progress_cb)
-        return _pil_from_b64(res["image_b64"])
+        return _pil_from_path(res["image_path"])
 
     async def plain_image(self, prompt, **kw):
         res = await self._dispatch(
             "plain_image", {"prompt": prompt, "kw": dict(kw)})
-        return _pil_from_b64(res["image_b64"])
+        return _pil_from_path(res["image_path"])
 
     async def klein_image(self, prompt, seed=123, width=1024, height=1024,
                           num_inference_steps=None, **kw):
@@ -210,7 +253,7 @@ class ImageEngineProxy:
             "prompt": prompt, "seed": seed, "width": width, "height": height,
             "num_inference_steps": num_inference_steps, "kw": dict(kw),
         })
-        return _pil_from_b64(res["image_b64"])
+        return _pil_from_path(res["image_path"])
 
     async def style_frame(self, image, prompt, seed=123, width=None, height=None,
                           num_inference_steps=None):
@@ -219,18 +262,20 @@ class ImageEngineProxy:
             "width": width, "height": height,
             "num_inference_steps": num_inference_steps,
         })
-        return _pil_from_b64(res["image_b64"])
+        return _pil_from_path(res["image_path"])
 
     async def layered_decompose(self, image, layers=None, resolution=None,
                                 preview_only=False, num_inference_steps=None,
                                 progress_cb=None):
-        # The child returns the /layer contract dict already — pass straight
-        # through (no image decode).
-        return await self._dispatch("layered_decompose", {
+        # The child returns the /layer contract dict but wrote each base64 image
+        # to a scratch file (small path wire); read them back so the HTTP/SSE
+        # response contract is byte-identical to the old base64 wire.
+        res = await self._dispatch("layered_decompose", {
             "image": image, "layers": layers, "resolution": resolution,
             "preview_only": bool(preview_only),
             "num_inference_steps": num_inference_steps,
         }, progress_cb)
+        return _restore_paths_to_b64(res)
 
 
 def _child_pythonpath() -> str:

@@ -56,10 +56,52 @@ def _progress2(progress_cb):
 
 
 def _img_result(out: object) -> dict:
-    """Encode a PIL result as the JSON wire wrapper the parent proxy expects."""
-    from runner.image.inference import _pil_to_b64
+    """Persist a PIL result to a scratch PNG and return its path.
 
-    return {"image_b64": _pil_to_b64(out)}
+    The parent aiohttp server reads the file back (and re-encodes it for the
+    HTTP response). The JSONL wire carries just a small path instead of the
+    multi-MB base64 — mirrors bernini_cli's file-path contract and keeps the
+    child->parent pipe small and deterministic."""
+    import os
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="imgr-", suffix=".png")
+    os.close(fd)
+    out.convert("RGB").save(path, format="PNG")
+    return {"image_path": path}
+
+
+def _b64_string_to_path(v: str) -> str:
+    """Decode a PNG-base64 string to a scratch file and return its path."""
+    import base64 as _b64
+    import os
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="imgl-", suffix=".png")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(_b64.b64decode(v))
+        return path
+    except Exception:  # noqa: BLE001 - never hand a broken path to the parent
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return ""
+
+
+def _replace_b64_with_paths(obj):
+    """Walk a JSON-safe dict/list; write every non-empty ``*_b64`` string to a
+    scratch file and replace it with the file path. The parent restores the
+    same fields to base64 by reading the files back (small wire, mirroring
+    bernini_cli's file-path contract). Non-``*_b64`` values pass through."""
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            if isinstance(v, str) and k.endswith("_b64") and v:
+                obj[k] = _b64_string_to_path(v)
+            else:
+                obj[k] = _replace_b64_with_paths(v)
+    elif isinstance(obj, list):
+        return [_replace_b64_with_paths(x) for x in obj]
+    return obj
 
 
 def _handlers(device: int) -> dict:
@@ -148,15 +190,16 @@ def _handlers(device: int) -> dict:
 
     def _layered_decompose(e, args, progress_cb):
         # The engine returns the /layer contract as a JSON-safe dict already
-        # (b64 layers / composite + dims) — pass it straight through.
-        return e.layered_decompose(
+        # (b64 layers / composite + dims). Write each base64 image to a scratch
+        # file and hand the parent a small path-only dict to read back.
+        return _replace_b64_with_paths(e.layered_decompose(
             args["image"],
             layers=args.get("layers"),
             resolution=args.get("resolution"),
             preview_only=bool(args.get("preview_only", False)),
             num_inference_steps=args.get("num_inference_steps"),
             progress_cb=_progress2(progress_cb),
-        )
+        ))
 
     def _klein_resident_device(e, args, progress_cb):
         ed = flux_edit.get_editor()

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import sys
 
 from runner.common import engineproc
@@ -31,6 +33,33 @@ logger = logging.getLogger("video_creator.runner.idv2v.engine")
 # Allow the (multi-minute) diffsynth build / a long clip-stitching denoise.
 LOAD_TIMEOUT = 3600
 INFER_JOB_TIMEOUT = 3600
+
+
+def _load_frame_paths(paths, frame_dir=None):
+    """Read PNG scratch files the child wrote back into PIL frames, then remove
+    the files (and their scratch dir). Mirrors bernini_cli: the child persists
+    its output frames to disk; the parent reads them back for MP4 encoding, so
+    the child->parent pipe only ever carries small paths, never base64."""
+    from PIL import Image
+    frames = []
+    for p in paths:
+        try:
+            im = Image.open(p)
+            im.load()
+            frames.append(im)
+        except Exception:  # noqa: BLE001 - never drop a job over one bad frame
+            logger.warning("idv2v frame read failed: %s", p, exc_info=True)
+        finally:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    if frame_dir:
+        try:
+            shutil.rmtree(frame_dir, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+    return frames
 
 
 def _child_argv(device_index: int) -> list:
@@ -165,5 +194,8 @@ class Idv2vEngine:
 
         res = await self._proc.run("infer_frames", args,
                                    timeout=INFER_JOB_TIMEOUT, progress_cb=_prog)
-        return {"frames": res.get("frames") or [],
+        # The child wrote each frame to a scratch PNG; read them back as PIL for
+        # MP4 encoding and clean the files up.
+        return {"frames": _load_frame_paths(res.get("frames") or [],
+                                            res.get("frame_dir")),
                 "count": res.get("count") or 0}

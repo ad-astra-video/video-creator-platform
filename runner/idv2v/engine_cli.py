@@ -46,6 +46,7 @@ import io
 import logging
 import os
 import sys
+import tempfile
 
 logger = logging.getLogger("video_creator.runner.idv2v.engine_cli")
 
@@ -168,7 +169,17 @@ def _handle_infer_frames(engine, args, progress_cb) -> dict:
         seed=int(args["seed"]),
         progress_cb=_prog,
     )
-    return {"frames": [_pil_to_b64(f) for f in frames], "count": len(frames)}
+    # Persist each generated frame as a PNG scratch file and hand the parent a
+    # small list of paths (mirrors bernini_cli's file-path wire) — the parent
+    # reads them back to encode the MP4, so the child->parent pipe never carries
+    # the frames' base64.
+    out_dir = tempfile.mkdtemp(prefix="idv2vfr-", dir=tempfile.gettempdir())
+    paths = []
+    for i, f in enumerate(frames):
+        p = os.path.join(out_dir, "f%05d.png" % i)
+        f.convert("RGB").save(p, format="PNG")
+        paths.append(p)
+    return {"frame_dir": out_dir, "frames": paths, "count": len(paths)}
 
 
 HANDLERS = {
