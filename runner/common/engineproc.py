@@ -33,7 +33,9 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
+import threading
 import traceback
 from typing import Any, Callable, Dict, Optional
 
@@ -57,46 +59,118 @@ class EngineProc:
         self._startup_timeout = startup_timeout
         self._job_timeout = job_timeout
         self._env_extra = env_extra or {}
-        self._proc: Optional[asyncio.subprocess.Process] = None
-        self._stderr_task: Optional[asyncio.Task] = None
+        # CHILD I/O uses blocking subprocess.Popen in worker threads (piped to
+        # asyncio queues) rather than asyncio's subprocess StreamReader. The
+        # asyncio transport was reading a false EOF on the child's stdout in the
+        # long-running aiohttp server even while the child was alive and its fd 1
+        # was open — a reliable, verified fix here is Popen + a blocking-thread
+        # pump (plain file readline has no asyncio 64 KB line limit and no
+        # transport conn_lost race). Works uniformly for image/ltx/wan children.
+        self._proc: Optional[subprocess.Popen] = None
+        self._pump_threads: list[threading.Thread] = []
+        self._stdout_q: Optional[asyncio.Queue] = None  # bytes lines + None EOF
+        self._stderr_q: Optional[asyncio.Queue] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ready = False
         self._lock = asyncio.Lock()
+
+    # ── blocking-pipe helpers (run in worker threads) ─────────────────────
+    @staticmethod
+    def _pump_reader(stream, loop: asyncio.AbstractEventLoop,
+                     q: asyncio.Queue, label: str) -> None:
+        """Blocking ``readline`` from a Popen pipe -> push bytes/EOF sentinel
+        onto an asyncio queue from a thread."""
+        while True:
+            try:
+                raw = stream.readline()
+            except Exception:  # noqa: BLE001 - stream gone
+                raw = b""
+            if not raw:
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, None)
+                except Exception:  # noqa: BLE001 - loop closed
+                    pass
+                break
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, raw)
+            except Exception:  # noqa: BLE001 - loop closed
+                break
+
+    @staticmethod
+    def _write_job(stream, data: bytes) -> None:
+        stream.write(data)
+        stream.flush()
+
+    @staticmethod
+    def _terminate_and_wait(proc: subprocess.Popen, timeout: float) -> int:
+        if proc.poll() is not None:
+            return proc.returncode
+        proc.terminate()
+        try:
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return proc.wait()
+
+    async def _next_stdout_line(self) -> Optional[bytes]:
+        """Await the next stdout line (bytes) or None on EOF/stopped."""
+        q = self._stdout_q
+        if q is None:
+            return None  # proc stopped/not running -> treat as EOF
+        return await q.get()
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self) -> None:
         """Spawn the child and wait for its ready handshake (idempotent)."""
         async with self._lock:
-            if self._ready and self._proc and self._proc.returncode is None:
-                return
-            logger.info("[%s] spawning model subprocess: %s",
-                        self._label, " ".join(self._argv))
-            self._proc = await asyncio.create_subprocess_exec(
-                *self._argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "PYTHONUNBUFFERED": "1", **self._env_extra},
-            )
-            self._stderr_task = asyncio.create_task(self._drain_stderr())
-            try:
-                await asyncio.wait_for(self._probe_ready(), self._startup_timeout)
-            except asyncio.TimeoutError:
-                await self._stop_unlocked(5)
-                raise EngineProcError(
-                    f"[{self._label}] model subprocess did not become ready "
-                    f"within {self._startup_timeout}s")
-            self._ready = True
-            logger.info("[%s] model subprocess ready (pid=%s)",
-                        self._label, self._proc.pid)
+            await self._ensure_started_unlocked()
+
+    async def _ensure_started_unlocked(self) -> None:
+        """Spawn-ready logic; caller must hold ``self._lock``."""
+        if self._ready and self._proc and self._proc.poll() is None:
+            return
+        logger.info("[%s] spawning model subprocess: %s",
+                    self._label, " ".join(self._argv))
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        self._stdout_q = asyncio.Queue()
+        self._stderr_q = asyncio.Queue()
+        self._proc = subprocess.Popen(
+            self._argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            env={**os.environ, "PYTHONUNBUFFERED": "1", **self._env_extra},
+        )
+        for _stream, _q in (
+            (self._proc.stdout, self._stdout_q),
+            (self._proc.stderr, self._stderr_q),
+        ):
+            _t = threading.Thread(
+                target=self._pump_reader,
+                args=(_stream, loop, _q, self._label), daemon=True)
+            _t.start()
+            self._pump_threads.append(_t)
+        asyncio.create_task(self._drain_stderr())
+        try:
+            await asyncio.wait_for(self._probe_ready(), self._startup_timeout)
+        except asyncio.TimeoutError:
+            await self._stop_unlocked(5)
+            raise EngineProcError(
+                f"[{self._label}] model subprocess did not become ready "
+                f"within {self._startup_timeout}s")
+        self._ready = True
+        logger.info("[%s] model subprocess ready (pid=%s)",
+                    self._label, self._proc.pid)
 
     async def _probe_ready(self) -> None:
         """Consume stdout lines until the child's ready handshake."""
-        proc = self._proc
-        if proc is None or proc.stdout is None:
+        if self._proc is None or self._stdout_q is None:
             raise EngineProcError(f"[{self._label}] subprocess not started")
         while True:
-            raw = await proc.stdout.readline()
-            if not raw:
+            raw = await self._next_stdout_line()
+            if raw is None:
                 raise EngineProcError(
                     f"[{self._label}] model subprocess exited before ready")
             text = raw.decode("utf-8", "replace").strip()
@@ -118,16 +192,12 @@ class EngineProc:
 
     async def _drain_stderr(self) -> None:
         """Forward the child's stderr (its logs) into our logger."""
-        proc = self._proc
-        if proc is None or proc.stderr is None:
+        if self._stderr_q is None or self._loop is None:
             return
         while True:
-            try:
-                raw = await proc.stderr.readline()
-            except Exception:  # noqa: BLE001 - stream closed
-                break
-            if not raw:
-                break
+            raw = await self._stderr_q.get()
+            if raw is None:
+                return
             text = raw.decode("utf-8", "replace").rstrip()
             if text:
                 logger.info("[%s] %s", self._label, text)
@@ -140,35 +210,40 @@ class EngineProc:
     async def _stop_unlocked(self, timeout: float = 15) -> None:
         """Non-lock-acquiring stop; caller must hold ``self._lock``."""
         proc = self._proc
+        if proc is None:
+            self._ready = False
+            return
         self._proc = None
         self._ready = False
-        stderr_task = self._stderr_task
-        self._stderr_task = None
-        if stderr_task is not None:
-            stderr_task.cancel()
-        if proc is not None and proc.returncode is None:
-            logger.info("[%s] evicting model subprocess (pid=%s)",
-                        self._label, proc.pid)
-            proc.terminate()
+        self._stdout_q = None
+        self._stderr_q = None
+        try:
+            if proc.poll() is None:
+                logger.info("[%s] evicting model subprocess (pid=%s)",
+                            self._label, proc.pid)
+                await asyncio.to_thread(self._terminate_and_wait, proc, timeout)
+            else:
+                logger.info("[%s] subprocess already exited (code=%s)",
+                            self._label, proc.returncode)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] error during evict: %s", self._label, exc)
+        # Dissociate child stdio so the pump threads see EOF and exit.
+        for _s in (proc.stdout, proc.stderr, proc.stdin):
             try:
-                await asyncio.wait_for(proc.wait(), timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:  # noqa: BLE001
-                    pass
+                if _s is not None:
+                    _s.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── request/response ───────────────────────────────────────────────────
     async def _drain_stale_stdout(self) -> None:
         """Drop orphaned result lines left by an aborted prior job so they can't
         be misread as the next job's result (mirrors bernini's guard)."""
-        proc = self._proc
-        if proc is None or proc.stdout is None:
+        if self._stdout_q is None:
             return
         for _ in range(64):
             try:
-                raw = await asyncio.wait_for(proc.stdout.readline(), 0.05)
+                raw = await asyncio.wait_for(self._next_stdout_line(), 0.05)
             except asyncio.TimeoutError:
                 return
             except Exception:  # noqa: BLE001 - stream unusable
@@ -186,52 +261,82 @@ class EngineProc:
         """Send one request to the child and return its result.
 
         Raises :class:`EngineProcError` on child failure/timeout (and evicts the
-        child so a wedged state can never linger)."""
-        await self.start()
+        child so a wedged state can never linger). The whole call holds
+        ``self._lock`` so a concurrent :meth:`stop` cannot tear the child's
+        streams out from under an in-flight result read."""
+        async with self._lock:
+            return await self._run_locked(op, args, timeout, progress_cb)
+
+    async def _run_locked(self, op, args, timeout, progress_cb):
+        """Lock-holding body of :meth:`run`; caller must hold ``self._lock``."""
         proc = self._proc
-        if proc is None or proc.stdin is None or proc.stdout is None:
-            raise EngineProcError(f"[{self._label}] subprocess unavailable")
-        await self._drain_stale_stdout()
-        line = json.dumps({"op": op, "args": args or {}},
-                          ensure_ascii=False) + "\n"
-
-        async def _read_result() -> bytes:
-            max_lines = 20000
-            for _ in range(max_lines):
-                raw = await proc.stdout.readline()
-                if not raw:
-                    return raw  # EOF -> caller handles
-                text = raw.decode("utf-8", "replace").strip()
-                if not text:
-                    continue
-                try:
-                    obj = json.loads(text)
-                except json.JSONDecodeError:
-                    logger.info("[%s] skip non-json stdout (%d B) %r",
-                                self._label, len(raw), raw[:120])
-                    continue
-                if isinstance(obj, dict) and obj.get("type") == "progress":
-                    if progress_cb is not None:
-                        try:
-                            progress_cb(obj)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    continue
-                if isinstance(obj, dict) and obj.get("type") == "ready":
-                    continue
-                return raw
-            raise EngineProcError(
-                f"[{self._label}] stdout produced no JSON result after "
-                f"{max_lines} lines (op={op})")
-
         try:
-            proc.stdin.write(line.encode("utf-8"))
-            await proc.stdin.drain()
+            if not (self._ready and proc is not None and proc.poll() is None):
+                await self._ensure_started_unlocked()
+            proc = self._proc
+            if proc is None or proc.stdin is None or self._stdout_q is None:
+                raise EngineProcError(f"[{self._label}] subprocess unavailable")
+            await self._drain_stale_stdout()
+            line = (json.dumps({"op": op, "args": args or {}},
+                               ensure_ascii=False) + "\n").encode("utf-8")
+
+            async def _read_result() -> Optional[bytes]:
+                max_lines = 20000
+                for _ in range(max_lines):
+                    raw = await self._next_stdout_line()
+                    if raw is None:
+                        return raw  # EOF -> caller handles
+                    text = raw.decode("utf-8", "replace").strip()
+                    if not text:
+                        continue
+                    try:
+                        obj = json.loads(text)
+                    except json.JSONDecodeError:
+                        logger.info("[%s] skip non-json stdout (%d B) %r",
+                                    self._label, len(raw), raw[:120])
+                        continue
+                    if isinstance(obj, dict) and obj.get("type") == "progress":
+                        if progress_cb is not None:
+                            try:
+                                progress_cb(obj)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        continue
+                    if isinstance(obj, dict) and obj.get("type") == "ready":
+                        continue
+                    return raw
+                raise EngineProcError(
+                    f"[{self._label}] stdout produced no JSON result after "
+                    f"{max_lines} lines (op={op})")
+
+            await asyncio.to_thread(self._write_job, proc.stdin, line)
             raw = await asyncio.wait_for(
                 _read_result(), timeout or self._job_timeout)
             if not raw:
+                rc = getattr(self._proc, "returncode", None)
+                if rc is None:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(self._proc.wait), 2)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    rc = getattr(self._proc, "returncode", None)
+                mem_info = {}
+                try:
+                    for ln in open("/proc/meminfo"):
+                        k, _, v = ln.partition(":")
+                        mem_info[k] = v.strip()
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.error(
+                    "[%s] child died mid-op (op=%s) returncode=%s signal=%s; "
+                    "host MemAvailable=%s SwapFree=%s",
+                    self._label, op, rc,
+                    (-rc if (rc is not None and rc < 0) else None),
+                    mem_info.get("MemAvailable"), mem_info.get("SwapFree"))
                 raise EngineProcError(
-                    f"[{self._label}] subprocess closed unexpectedly (op={op})")
+                    f"[{self._label}] subprocess closed unexpectedly "
+                    f"(op={op}, returncode={rc})")
             result = json.loads(raw.decode("utf-8"))
             if not result.get("ok"):
                 raise EngineProcError(
@@ -241,7 +346,7 @@ class EngineProc:
             await self._stop_unlocked(5)
             raise EngineProcError(
                 f"[{self._label}] op '{op}' timed out after "
-                f"{timeout or self._job_timeout}s — subprocess evicted") from exc
+                f"{timeout or self._job_timeout}s \u2014 subprocess evicted") from exc
         except EngineProcError:
             # A child-declared error may leave it wedged; evict so the next op
             # gets a fresh, clean process.
@@ -251,6 +356,7 @@ class EngineProc:
             await self._stop_unlocked(5)
             raise EngineProcError(
                 f"[{self._label}] op '{op}' failed: {exc}") from exc
+
 
 
 def make_env(**overrides) -> dict:
