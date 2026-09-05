@@ -307,14 +307,31 @@ class GPUScheduler:
             logger.info("GPU release: %s idle on GPU %d (kept warm)", worker, gpu_id)
             self._cond.notify_all()
 
-    async def reconcile(self, workers_info: dict[str, dict]) -> None:
+    async def reconcile(self, workers_info: dict[str, dict],
+                        in_flight: int | None = None) -> None:
         """Heal the map from each worker's /info (advisory). A worker may report
         a LIST of resident devices (``devices``, multi-resident) or a single
         ``device_in_use`` (back-compat). A slot whose worker is GONE (not in
         the reachable set) is freed even if resident — a live warm model can
         only exist while its process lives, so an unreachable worker can't
-        still be holding VRAM. Gemma's pinned slot is never freed here."""
+        still be holding VRAM. Gemma's pinned slot is never freed here.
+
+        ``in_flight`` = the runner's live active-request count. When it is 0
+        (the runner is idle) any "busy" slot is STALE by definition — "busy"
+        means a request is actively running on that card, and a busy mark with
+        zero requests in flight can only be an orphaned acquire() whose
+        release() never landed (the multi-GPU image wedge). Those are cleared
+        back to idle so the warm card becomes reusable instead of wedging
+        every acquire() into a 600s QueueTimeout. A genuinely-running request
+        always holds ``in_flight`` >= 1, so its busy mark is never touched.
+        ``in_flight`` None (legacy callers) preserves the old behaviour."""
         async with self._cond:
+            if in_flight == 0:
+                for s in self._slots:
+                    if s.state == "busy" and s.resident:
+                        s.state = "idle"
+                        logger.info("GPU reconcile: stale busy -> idle on GPU %d (%s)",
+                                    s.gpu_id, s.worker)
             reachable = set(workers_info)
             for name, info in workers_info.items():
                 devs = info.get("devices")

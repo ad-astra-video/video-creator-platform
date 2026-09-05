@@ -961,7 +961,7 @@ async def _reconcile_from_live_workers() -> None:
         _info = await _fetch_worker_info(_session, _url)
         if _info is not None:
             w_info[_name] = _info
-    await _scheduler.reconcile(w_info)
+    await _scheduler.reconcile(w_info, in_flight=_in_flight)
     _last_worker_reconcile = time.monotonic()
     logger.info("Reconciled GPU map from live workers (up=%s): %s",
                 sorted(w_info), _scheduler.status()["gpus"])
@@ -1141,7 +1141,7 @@ async def _refresh_metadata_loop() -> None:
                         _info = await _fetch_worker_info(_session, _url)
                         if _info is not None:
                             w_info[_name] = _info
-                    await _scheduler.reconcile(w_info)
+                    await _scheduler.reconcile(w_info, in_flight=_in_flight)
                 meta = await _worker_manager.check_health()
                 meta["capabilities"] = CAPABILITIES
                 meta["model_specs"] = _MODEL_SPECS
